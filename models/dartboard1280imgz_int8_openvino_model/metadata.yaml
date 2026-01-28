@@ -1,0 +1,28 @@
+description: Ultralytics YOLO11m model trained on /content/datasets/cal-20/data.yaml
+author: Ultralytics
+date: '2025-12-12T00:14:44.623757'
+version: 8.3.229
+license: AGPL-3.0 License (https://ultralytics.com/license)
+docs: https://docs.ultralytics.com
+stride: 32
+task: detect
+batch: 1
+imgsz:
+- 1280
+- 1280
+names:
+  0: '20'
+  1: '44'
+  2: bull
+  3: cal
+  4: cal1
+  5: cal2
+  6: cal3
+args:
+  batch: 1
+  fraction: 1.0
+  half: false
+  int8: true
+  dynamic: false
+  nms: false
+channels: 3

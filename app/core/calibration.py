@@ -1,19 +1,19 @@
 """
 Dartboard Calibration Module
 
-Handles:
-1. Detecting the dartboard in an image
-2. Computing homography transformation
-3. Drawing scoring zone overlays
-4. Storing calibration for reuse
+Uses YOLO to detect calibration points (wire intersections), 
+then fits ellipses to determine the dartboard geometry.
+
+Based on the original DartDetector approach.
 """
 import cv2
 import numpy as np
 import math
 import base64
-from io import BytesIO
+import os
 from typing import Dict, Any, Optional, Tuple, List
 from dataclasses import dataclass
+from pathlib import Path
 
 from app.core.geometry import (
     DARTBOARD_SEGMENTS,
@@ -25,15 +25,17 @@ from app.core.geometry import (
     DOUBLE_OUTER_RADIUS_MM,
     DARTBOARD_DIAMETER_MM,
     SEGMENT_ANGLE_OFFSET,
-    DEGREES_PER_SEGMENT
 )
 from app.core.scoring import scoring_system
 from app.models.schemas import CameraCalibrationResult, DetectResponse, DartScore, DartPosition
 
+# Get the models directory
+MODELS_DIR = Path(__file__).parent.parent.parent / "models"
+CALIBRATION_MODEL_PATH = MODELS_DIR / "dartboard1280imgz_int8_openvino_model"
+
 
 def decode_image(image_base64: str) -> np.ndarray:
     """Decode base64 image to OpenCV format."""
-    # Handle data URL prefix if present
     if ',' in image_base64:
         image_base64 = image_base64.split(',')[1]
     
@@ -57,30 +59,159 @@ def encode_image(image: np.ndarray, format: str = "png") -> str:
 
 
 @dataclass
-class EllipseParams:
-    """Parameters of a fitted ellipse."""
+class EllipseCalibration:
+    """Stores the calibration ellipses and parameters."""
     center: Tuple[float, float]
-    axes: Tuple[float, float]  # (major, minor) or (width, height)
-    angle: float  # rotation in degrees
+    outer_double_ellipse: Optional[Tuple] = None  # ((cx,cy), (w,h), angle)
+    inner_double_ellipse: Optional[Tuple] = None
+    outer_triple_ellipse: Optional[Tuple] = None
+    inner_triple_ellipse: Optional[Tuple] = None
+    bull_ellipse: Optional[Tuple] = None
+    bullseye_ellipse: Optional[Tuple] = None
+    segment_angles: Optional[List[float]] = None
+    rotation_offset_deg: float = 0.0
+
+
+class YOLOCalibrationDetector:
+    """
+    Uses YOLO to detect dartboard calibration points.
+    
+    Detects:
+    - 'cal': Outer double ring intersection points (wire meets outer ring)
+    - 'cal1': Triple ring intersection points
+    """
+    
+    def __init__(self):
+        self.model = None
+        self.is_initialized = False
+        self._load_model()
+    
+    def _load_model(self):
+        """Load the YOLO calibration model."""
+        try:
+            from ultralytics import YOLO
+            
+            model_path = CALIBRATION_MODEL_PATH
+            if not model_path.exists():
+                print(f"Warning: Calibration model not found at {model_path}")
+                return
+            
+            self.model = YOLO(str(model_path))
+            self.is_initialized = True
+            print(f"Loaded calibration model from {model_path}")
+            
+        except ImportError:
+            print("Warning: ultralytics not installed. YOLO detection disabled.")
+        except Exception as e:
+            print(f"Warning: Failed to load YOLO model: {e}")
+    
+    def detect_calibration_points(
+        self, 
+        image: np.ndarray,
+        confidence_threshold: float = 0.5
+    ) -> Dict[str, List[Tuple[float, float, float]]]:
+        """
+        Detect calibration points in the image.
+        
+        Returns dict with keys 'cal', 'cal1' containing lists of (x, y, confidence).
+        """
+        if not self.is_initialized or self.model is None:
+            return {'cal': [], 'cal1': []}
+        
+        # Resize image to model input size (1280x1280)
+        h, w = image.shape[:2]
+        input_size = 1280
+        
+        # Run inference
+        results = self.model(image, imgsz=input_size, conf=confidence_threshold, verbose=False)
+        
+        points = {'cal': [], 'cal1': [], 'cal2': [], 'cal3': []}
+        
+        for result in results:
+            if result.boxes is None:
+                continue
+                
+            boxes = result.boxes
+            for i in range(len(boxes)):
+                cls_id = int(boxes.cls[i])
+                conf = float(boxes.conf[i])
+                
+                # Get center of bounding box
+                x1, y1, x2, y2 = boxes.xyxy[i].cpu().numpy()
+                cx = (x1 + x2) / 2
+                cy = (y1 + y2) / 2
+                
+                # Map class ID to name
+                # Based on original: tip=0, cal=1, cal1=2
+                if cls_id == 1:
+                    points['cal'].append((cx, cy, conf))
+                elif cls_id == 2:
+                    points['cal1'].append((cx, cy, conf))
+                elif cls_id == 3:
+                    points['cal2'].append((cx, cy, conf))
+                elif cls_id == 4:
+                    points['cal3'].append((cx, cy, conf))
+        
+        return points
+
+
+def fit_ellipse_from_points(points: List[Tuple[float, float, float]], remove_outliers: bool = True) -> Optional[Tuple]:
+    """
+    Fit an ellipse to a set of points.
+    
+    Args:
+        points: List of (x, y, confidence) tuples
+        remove_outliers: Whether to remove outlier points
+        
+    Returns:
+        OpenCV ellipse tuple ((cx, cy), (w, h), angle) or None
+    """
+    if len(points) < 5:
+        return None
+    
+    # Extract x, y coordinates
+    pts = np.array([(p[0], p[1]) for p in points], dtype=np.float32)
+    
+    if remove_outliers and len(pts) > 10:
+        # Simple outlier removal based on distance from centroid
+        centroid = np.mean(pts, axis=0)
+        distances = np.linalg.norm(pts - centroid, axis=1)
+        median_dist = np.median(distances)
+        mask = distances < median_dist * 2
+        pts = pts[mask]
+        
+        if len(pts) < 5:
+            return None
+    
+    try:
+        ellipse = cv2.fitEllipse(pts)
+        return ellipse
+    except cv2.error:
+        return None
+
+
+def estimate_center_from_points(cal_points: List, cal1_points: List) -> Optional[Tuple[float, float]]:
+    """Estimate dartboard center from calibration points."""
+    all_points = [(p[0], p[1]) for p in cal_points + cal1_points]
+    if len(all_points) < 3:
+        return None
+    
+    pts = np.array(all_points, dtype=np.float32)
+    centroid = np.mean(pts, axis=0)
+    return (float(centroid[0]), float(centroid[1]))
 
 
 class DartboardCalibrator:
     """
-    Calibrates camera views of a dartboard using ellipse fitting.
-    
-    The dartboard appears as an ellipse when viewed from an angle.
-    We detect the outer ring, fit an ellipse, and use that to
-    establish the coordinate system.
+    Calibrates camera views of a dartboard using YOLO detection and ellipse fitting.
     """
     
     def __init__(self):
-        # Model dimensions in pixels (for overlay generation)
-        self.model_width = 800
-        self.model_height = 800
-        self.model_center = (self.model_width // 2, self.model_height // 2)
+        self.detector = YOLOCalibrationDetector()
         
-        # Scale: pixels per mm in the model
-        self.model_scale = self.model_height / (DARTBOARD_DIAMETER_MM * 1.1)  # Leave margin
+        # Model dimensions
+        self.image_width = 1280
+        self.image_height = 720
     
     def calibrate(
         self, 
@@ -88,50 +219,72 @@ class DartboardCalibrator:
         image_base64: str
     ) -> CameraCalibrationResult:
         """
-        Calibrate from a dartboard image.
-        
-        Args:
-            camera_id: Unique camera identifier
-            image_base64: Base64 encoded image
-            
-        Returns:
-            CameraCalibrationResult with overlay image
+        Calibrate from a dartboard image using YOLO detection.
         """
         try:
             # Decode image
             image = decode_image(image_base64)
             h, w = image.shape[:2]
             
-            # Detect dartboard (find the outer ring ellipse)
-            ellipse = self._detect_dartboard_ellipse(image)
+            # Detect calibration points using YOLO
+            points = self.detector.detect_calibration_points(image)
             
-            if ellipse is None:
+            cal_points = points.get('cal', [])
+            cal1_points = points.get('cal1', [])
+            
+            print(f"Detected {len(cal_points)} cal points, {len(cal1_points)} cal1 points")
+            
+            if len(cal_points) < 8:
                 return CameraCalibrationResult(
                     camera_id=camera_id,
                     success=False,
-                    error="Could not detect dartboard. Ensure the full board is visible."
+                    error=f"Not enough calibration points detected. Found {len(cal_points)} outer ring points, need at least 8. Ensure full dartboard is visible and well-lit."
                 )
             
-            # Calculate calibration quality based on ellipse properties
-            quality = self._calculate_calibration_quality(ellipse, image.shape)
+            # Fit ellipses to the detected points
+            outer_double_ellipse = fit_ellipse_from_points(cal_points)
+            outer_triple_ellipse = fit_ellipse_from_points(cal1_points) if len(cal1_points) >= 5 else None
             
-            # Detect which segment is at top (for rotation)
-            segment_at_top = self._detect_segment_at_top(image, ellipse)
+            if outer_double_ellipse is None:
+                return CameraCalibrationResult(
+                    camera_id=camera_id,
+                    success=False,
+                    error="Could not fit ellipse to detected points."
+                )
+            
+            # Estimate center
+            center = (outer_double_ellipse[0][0], outer_double_ellipse[0][1])
             
             # Build calibration data
+            ellipse_cal = EllipseCalibration(
+                center=center,
+                outer_double_ellipse=outer_double_ellipse,
+                outer_triple_ellipse=outer_triple_ellipse,
+            )
+            
+            # Estimate inner ellipses based on dartboard proportions
+            ellipse_cal = self._estimate_inner_rings(ellipse_cal)
+            
+            # Calculate quality
+            quality = self._calculate_quality(cal_points, cal1_points, outer_double_ellipse, h, w)
+            
+            # Detect segment at top (TODO: use "20" detection from YOLO)
+            segment_at_top = 20
+            
+            # Build calibration data dict
             calibration_data = {
-                "center": ellipse.center,
-                "axes": ellipse.axes,
-                "angle": ellipse.angle,
+                "center": center,
+                "outer_double_ellipse": outer_double_ellipse,
+                "outer_triple_ellipse": outer_triple_ellipse,
                 "image_size": (w, h),
                 "quality": quality,
                 "segment_at_top": segment_at_top,
-                "pixels_per_mm": self._calculate_pixels_per_mm(ellipse),
-                "rotation_offset": self._calculate_rotation_offset(segment_at_top)
+                "cal_points": cal_points,
+                "cal1_points": cal1_points,
             }
             
             # Generate overlay image
-            overlay = self._draw_calibration_overlay(image, ellipse, segment_at_top)
+            overlay = self._draw_calibration_overlay(image, ellipse_cal, cal_points, cal1_points)
             overlay_base64 = encode_image(overlay)
             
             return CameraCalibrationResult(
@@ -144,11 +297,157 @@ class DartboardCalibrator:
             )
             
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             return CameraCalibrationResult(
                 camera_id=camera_id,
                 success=False,
                 error=str(e)
             )
+    
+    def _estimate_inner_rings(self, cal: EllipseCalibration) -> EllipseCalibration:
+        """Estimate inner ring ellipses based on dartboard proportions."""
+        if cal.outer_double_ellipse is None:
+            return cal
+        
+        (cx, cy), (w, h), angle = cal.outer_double_ellipse
+        
+        # Proportions relative to outer double ring (170mm)
+        ratios = {
+            'inner_double': DOUBLE_INNER_RADIUS_MM / DOUBLE_OUTER_RADIUS_MM,  # 162/170
+            'outer_triple': TRIPLE_OUTER_RADIUS_MM / DOUBLE_OUTER_RADIUS_MM,  # 107/170
+            'inner_triple': TRIPLE_INNER_RADIUS_MM / DOUBLE_OUTER_RADIUS_MM,  # 99/170
+            'bull': OUTER_BULL_RADIUS_MM / DOUBLE_OUTER_RADIUS_MM,            # 15.9/170
+            'bullseye': BULL_RADIUS_MM / DOUBLE_OUTER_RADIUS_MM,              # 6.35/170
+        }
+        
+        cal.inner_double_ellipse = ((cx, cy), (w * ratios['inner_double'], h * ratios['inner_double']), angle)
+        
+        if cal.outer_triple_ellipse is None:
+            cal.outer_triple_ellipse = ((cx, cy), (w * ratios['outer_triple'], h * ratios['outer_triple']), angle)
+        
+        cal.inner_triple_ellipse = ((cx, cy), (w * ratios['inner_triple'], h * ratios['inner_triple']), angle)
+        cal.bull_ellipse = ((cx, cy), (w * ratios['bull'], h * ratios['bull']), angle)
+        cal.bullseye_ellipse = ((cx, cy), (w * ratios['bullseye'], h * ratios['bullseye']), angle)
+        
+        return cal
+    
+    def _calculate_quality(
+        self,
+        cal_points: List,
+        cal1_points: List,
+        ellipse: Tuple,
+        img_h: int,
+        img_w: int
+    ) -> float:
+        """Calculate calibration quality score."""
+        # Factors:
+        # 1. Number of detected points (more = better)
+        # 2. Ellipse circularity (more circular = camera more perpendicular)
+        # 3. Coverage (ellipse size relative to image)
+        
+        point_score = min(1.0, (len(cal_points) + len(cal1_points)) / 40)  # Expect ~40 points
+        
+        (cx, cy), (w, h), angle = ellipse
+        circularity = min(w, h) / max(w, h) if max(w, h) > 0 else 0
+        
+        ellipse_area = math.pi * (w/2) * (h/2)
+        image_area = img_w * img_h
+        coverage = ellipse_area / image_area
+        coverage_score = min(1.0, coverage / 0.3)  # Expect ~30% coverage
+        
+        quality = (point_score * 0.4 + circularity * 0.3 + coverage_score * 0.3)
+        return round(quality, 3)
+    
+    def _draw_calibration_overlay(
+        self,
+        image: np.ndarray,
+        cal: EllipseCalibration,
+        cal_points: List,
+        cal1_points: List
+    ) -> np.ndarray:
+        """Draw dartboard overlay showing detected rings and points."""
+        overlay = image.copy()
+        
+        # Draw detected calibration points
+        for x, y, conf in cal_points:
+            cv2.circle(overlay, (int(x), int(y)), 5, (0, 255, 0), -1)  # Green for outer
+        
+        for x, y, conf in cal1_points:
+            cv2.circle(overlay, (int(x), int(y)), 5, (255, 165, 0), -1)  # Orange for triple
+        
+        # Draw fitted ellipses
+        if cal.outer_double_ellipse:
+            cv2.ellipse(overlay, 
+                       (int(cal.outer_double_ellipse[0][0]), int(cal.outer_double_ellipse[0][1])),
+                       (int(cal.outer_double_ellipse[1][0]/2), int(cal.outer_double_ellipse[1][1]/2)),
+                       cal.outer_double_ellipse[2], 0, 360, (0, 0, 255), 2)
+        
+        if cal.inner_double_ellipse:
+            cv2.ellipse(overlay,
+                       (int(cal.inner_double_ellipse[0][0]), int(cal.inner_double_ellipse[0][1])),
+                       (int(cal.inner_double_ellipse[1][0]/2), int(cal.inner_double_ellipse[1][1]/2)),
+                       cal.inner_double_ellipse[2], 0, 360, (0, 0, 200), 1)
+        
+        if cal.outer_triple_ellipse:
+            cv2.ellipse(overlay,
+                       (int(cal.outer_triple_ellipse[0][0]), int(cal.outer_triple_ellipse[0][1])),
+                       (int(cal.outer_triple_ellipse[1][0]/2), int(cal.outer_triple_ellipse[1][1]/2)),
+                       cal.outer_triple_ellipse[2], 0, 360, (0, 255, 0), 2)
+        
+        if cal.inner_triple_ellipse:
+            cv2.ellipse(overlay,
+                       (int(cal.inner_triple_ellipse[0][0]), int(cal.inner_triple_ellipse[0][1])),
+                       (int(cal.inner_triple_ellipse[1][0]/2), int(cal.inner_triple_ellipse[1][1]/2)),
+                       cal.inner_triple_ellipse[2], 0, 360, (0, 200, 0), 1)
+        
+        if cal.bull_ellipse:
+            cv2.ellipse(overlay,
+                       (int(cal.bull_ellipse[0][0]), int(cal.bull_ellipse[0][1])),
+                       (int(cal.bull_ellipse[1][0]/2), int(cal.bull_ellipse[1][1]/2)),
+                       cal.bull_ellipse[2], 0, 360, (255, 0, 0), 2)
+        
+        if cal.bullseye_ellipse:
+            cv2.ellipse(overlay,
+                       (int(cal.bullseye_ellipse[0][0]), int(cal.bullseye_ellipse[0][1])),
+                       (int(cal.bullseye_ellipse[1][0]/2), int(cal.bullseye_ellipse[1][1]/2)),
+                       cal.bullseye_ellipse[2], 0, 360, (255, 0, 0), -1)
+        
+        # Draw segment lines
+        if cal.outer_double_ellipse:
+            cx, cy = cal.center
+            (_, _), (w, h), angle = cal.outer_double_ellipse
+            outer_r = max(w, h) / 2
+            inner_r = outer_r * (OUTER_BULL_RADIUS_MM / DOUBLE_OUTER_RADIUS_MM)
+            
+            for i in range(20):
+                seg_angle = SEGMENT_ANGLE_OFFSET + (i * math.pi / 10)
+                
+                x_outer = cx + math.cos(seg_angle) * outer_r
+                y_outer = cy + math.sin(seg_angle) * outer_r
+                x_inner = cx + math.cos(seg_angle) * inner_r
+                y_inner = cy + math.sin(seg_angle) * inner_r
+                
+                cv2.line(overlay, (int(x_inner), int(y_inner)), (int(x_outer), int(y_outer)), (255, 255, 255), 1)
+            
+            # Draw segment numbers
+            text_r = outer_r * ((TRIPLE_OUTER_RADIUS_MM + DOUBLE_INNER_RADIUS_MM) / 2 / DOUBLE_OUTER_RADIUS_MM)
+            for i, segment in enumerate(DARTBOARD_SEGMENTS):
+                seg_angle = SEGMENT_ANGLE_OFFSET + (i * math.pi / 10) + (math.pi / 20)
+                x = cx + math.cos(seg_angle) * text_r
+                y = cy + math.sin(seg_angle) * text_r
+                
+                cv2.putText(overlay, str(segment), (int(x)-10, int(y)+5),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
+        
+        # Draw center point
+        cv2.circle(overlay, (int(cal.center[0]), int(cal.center[1])), 8, (0, 0, 255), -1)
+        
+        # Add info text
+        cv2.putText(overlay, f"Cal points: {len(cal_points)} outer, {len(cal1_points)} triple",
+                   (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        
+        return overlay
     
     def detect_dart(
         self,
@@ -156,273 +455,8 @@ class DartboardCalibrator:
         image_base64: str,
         calibration_data: Dict[str, Any]
     ) -> DetectResponse:
-        """
-        Detect dart in an image using stored calibration.
-        
-        For now, this is a placeholder - actual dart tip detection
-        would use motion detection or YOLO models.
-        """
-        # This is where dart detection would happen
-        # For now, return a placeholder indicating the system works
+        """Detect dart in image - placeholder for now."""
         return DetectResponse(
             success=False,
-            error="Dart detection not yet implemented. Use calibration overlay to verify setup."
+            error="Dart detection not yet implemented."
         )
-    
-    def _detect_dartboard_ellipse(self, image: np.ndarray) -> Optional[EllipseParams]:
-        """
-        Detect the dartboard's outer ring as an ellipse.
-        
-        Uses edge detection and ellipse fitting.
-        """
-        # Convert to grayscale
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        
-        # Apply Gaussian blur to reduce noise
-        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-        
-        # Edge detection
-        edges = cv2.Canny(blurred, 50, 150)
-        
-        # Dilate to connect nearby edges
-        kernel = np.ones((3, 3), np.uint8)
-        dilated = cv2.dilate(edges, kernel, iterations=2)
-        
-        # Find contours
-        contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        if not contours:
-            return None
-        
-        # Find the largest contour that could be the dartboard
-        best_ellipse = None
-        best_area = 0
-        
-        for contour in contours:
-            # Need at least 5 points to fit an ellipse
-            if len(contour) < 5:
-                continue
-            
-            # Fit ellipse
-            try:
-                ellipse = cv2.fitEllipse(contour)
-                (cx, cy), (w, h), angle = ellipse
-                
-                # Filter: must be reasonably circular (aspect ratio)
-                aspect = min(w, h) / max(w, h) if max(w, h) > 0 else 0
-                if aspect < 0.5:  # Too elongated
-                    continue
-                
-                # Filter: must be reasonably sized (at least 20% of image)
-                area = math.pi * (w/2) * (h/2)
-                image_area = image.shape[0] * image.shape[1]
-                if area < image_area * 0.05:  # Too small
-                    continue
-                
-                if area > best_area:
-                    best_area = area
-                    best_ellipse = EllipseParams(
-                        center=(cx, cy),
-                        axes=(w, h),
-                        angle=angle
-                    )
-            except cv2.error:
-                continue
-        
-        return best_ellipse
-    
-    def _calculate_calibration_quality(
-        self, 
-        ellipse: EllipseParams, 
-        image_shape: Tuple[int, ...]
-    ) -> float:
-        """
-        Calculate calibration quality score (0-1).
-        
-        Based on:
-        - Ellipse circularity (more circular = better angle)
-        - Size relative to image (larger = more detail)
-        - Center position (centered = better)
-        """
-        h, w = image_shape[:2]
-        
-        # Circularity score (1.0 = perfect circle)
-        aspect = min(ellipse.axes) / max(ellipse.axes) if max(ellipse.axes) > 0 else 0
-        circularity_score = aspect
-        
-        # Size score (prefer dartboard taking up 50-80% of image)
-        ellipse_area = math.pi * (ellipse.axes[0]/2) * (ellipse.axes[1]/2)
-        image_area = w * h
-        coverage = ellipse_area / image_area
-        if coverage < 0.2:
-            size_score = coverage / 0.2  # Too small
-        elif coverage > 0.9:
-            size_score = 1.0 - (coverage - 0.9) / 0.1  # Too large
-        else:
-            size_score = 1.0
-        
-        # Center score (prefer center of image)
-        cx_norm = abs(ellipse.center[0] - w/2) / (w/2)
-        cy_norm = abs(ellipse.center[1] - h/2) / (h/2)
-        center_score = 1.0 - (cx_norm + cy_norm) / 2
-        
-        # Weighted average
-        quality = (circularity_score * 0.4 + size_score * 0.3 + center_score * 0.3)
-        
-        return round(quality, 3)
-    
-    def _detect_segment_at_top(
-        self, 
-        image: np.ndarray, 
-        ellipse: EllipseParams
-    ) -> int:
-        """
-        Detect which segment is at the top (12 o'clock position).
-        
-        For now, assumes 20 is at top (standard orientation).
-        TODO: Use color/pattern detection to find actual orientation.
-        """
-        # Placeholder - would use color analysis to find the 20 segment
-        return 20
-    
-    def _calculate_pixels_per_mm(self, ellipse: EllipseParams) -> float:
-        """Calculate scale factor from ellipse size."""
-        # Average of major/minor axes, divided by known diameter
-        avg_diameter_px = (ellipse.axes[0] + ellipse.axes[1]) / 2
-        return avg_diameter_px / DARTBOARD_DIAMETER_MM
-    
-    def _calculate_rotation_offset(self, segment_at_top: int) -> float:
-        """
-        Calculate rotation offset based on which segment is at top.
-        
-        Returns offset in radians.
-        """
-        if segment_at_top not in DARTBOARD_SEGMENTS:
-            return 0.0
-        
-        # Find index of segment at top
-        idx = DARTBOARD_SEGMENTS.index(segment_at_top)
-        
-        # Each segment is 18 degrees
-        return math.radians(idx * DEGREES_PER_SEGMENT)
-    
-    def _draw_calibration_overlay(
-        self, 
-        image: np.ndarray, 
-        ellipse: EllipseParams,
-        segment_at_top: int = 20
-    ) -> np.ndarray:
-        """
-        Draw dartboard scoring zones overlay on the image.
-        """
-        overlay = image.copy()
-        cx, cy = ellipse.center
-        
-        # Calculate radii in pixels for each ring
-        px_per_mm = self._calculate_pixels_per_mm(ellipse)
-        
-        # Scale factors for ellipse distortion
-        scale_x = ellipse.axes[0] / (DARTBOARD_DIAMETER_MM * px_per_mm)
-        scale_y = ellipse.axes[1] / (DARTBOARD_DIAMETER_MM * px_per_mm)
-        
-        def get_ellipse_axes(radius_mm: float) -> Tuple[int, int]:
-            """Convert mm radius to ellipse axes in pixels."""
-            base_px = radius_mm * px_per_mm * 2  # diameter
-            return (int(base_px * scale_x), int(base_px * scale_y))
-        
-        # Draw rings (outer to inner)
-        rings = [
-            (DOUBLE_OUTER_RADIUS_MM, (0, 0, 255), 2),      # Red - double outer
-            (DOUBLE_INNER_RADIUS_MM, (0, 0, 200), 1),      # Dark red - double inner
-            (TRIPLE_OUTER_RADIUS_MM, (0, 255, 0), 2),      # Green - triple outer
-            (TRIPLE_INNER_RADIUS_MM, (0, 200, 0), 1),      # Dark green - triple inner
-            (OUTER_BULL_RADIUS_MM, (255, 0, 0), 2),        # Blue - outer bull
-            (BULL_RADIUS_MM, (255, 0, 0), -1),             # Blue filled - inner bull
-        ]
-        
-        for radius_mm, color, thickness in rings:
-            axes = get_ellipse_axes(radius_mm)
-            cv2.ellipse(
-                overlay, 
-                (int(cx), int(cy)), 
-                (axes[0]//2, axes[1]//2),
-                ellipse.angle,
-                0, 360,
-                color,
-                thickness
-            )
-        
-        # Draw segment lines
-        rotation_offset = self._calculate_rotation_offset(segment_at_top)
-        
-        for i in range(20):
-            # Angle for this segment boundary (between segments)
-            angle = SEGMENT_ANGLE_OFFSET + (i * math.pi / 10) - rotation_offset
-            
-            # Convert ellipse angle to radians for rotation
-            ellipse_angle_rad = math.radians(ellipse.angle)
-            
-            # Calculate line endpoint on outer ring
-            # Account for ellipse rotation and aspect ratio
-            cos_a = math.cos(angle)
-            sin_a = math.sin(angle)
-            
-            # Apply ellipse transformation
-            outer_r = DOUBLE_OUTER_RADIUS_MM * px_per_mm
-            inner_r = OUTER_BULL_RADIUS_MM * px_per_mm
-            
-            # Simple approximation (for perfect view)
-            x_outer = cx + cos_a * outer_r * scale_x
-            y_outer = cy + sin_a * outer_r * scale_y
-            x_inner = cx + cos_a * inner_r * scale_x
-            y_inner = cy + sin_a * inner_r * scale_y
-            
-            cv2.line(
-                overlay,
-                (int(x_inner), int(y_inner)),
-                (int(x_outer), int(y_outer)),
-                (255, 255, 255),
-                1
-            )
-        
-        # Draw segment numbers
-        for i, segment in enumerate(DARTBOARD_SEGMENTS):
-            # Angle to center of segment
-            angle = SEGMENT_ANGLE_OFFSET + (i * math.pi / 10) + (math.pi / 20) - rotation_offset
-            
-            # Position text between triple and double rings
-            text_r = (TRIPLE_OUTER_RADIUS_MM + DOUBLE_INNER_RADIUS_MM) / 2 * px_per_mm
-            
-            x = cx + math.cos(angle) * text_r * scale_x
-            y = cy + math.sin(angle) * text_r * scale_y
-            
-            # Draw segment number
-            text = str(segment)
-            font_scale = 0.6
-            thickness = 2
-            
-            # Get text size for centering
-            (text_w, text_h), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
-            
-            cv2.putText(
-                overlay,
-                text,
-                (int(x - text_w/2), int(y + text_h/2)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                font_scale,
-                (0, 255, 255),  # Yellow
-                thickness
-            )
-        
-        # Add quality indicator
-        cv2.putText(
-            overlay,
-            f"Calibrated - {segment_at_top} at top",
-            (10, 30),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.8,
-            (0, 255, 0),
-            2
-        )
-        
-        return overlay
