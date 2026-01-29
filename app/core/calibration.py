@@ -455,8 +455,99 @@ class DartboardCalibrator:
         image_base64: str,
         calibration_data: Dict[str, Any]
     ) -> DetectResponse:
-        """Detect dart in image - placeholder for now."""
-        return DetectResponse(
-            success=False,
-            error="Dart detection not yet implemented."
-        )
+        """
+        Detect darts in the image and calculate their scores.
+        
+        Args:
+            camera_id: Camera identifier
+            image_base64: Base64-encoded image
+            calibration_data: Calibration data from previous calibrate() call
+            
+        Returns:
+            DetectResponse with dart positions and scores
+        """
+        try:
+            from app.core.detection import DartTipDetector, score_from_ellipse_calibration
+            
+            # Decode image
+            image = decode_image(image_base64)
+            
+            # Initialize tip detector if needed
+            if not hasattr(self, 'tip_detector'):
+                self.tip_detector = DartTipDetector()
+            
+            if not self.tip_detector.is_initialized:
+                return DetectResponse(
+                    success=False,
+                    error="Tip detection model not loaded."
+                )
+            
+            # Detect dart tips
+            tips = self.tip_detector.detect_tips(image, confidence_threshold=0.5)
+            
+            if not tips:
+                return DetectResponse(
+                    success=True,
+                    darts=[],
+                    message="No darts detected in image."
+                )
+            
+            # Calculate scores for each detected tip
+            darts = []
+            for tip in tips:
+                # Calculate score using ellipse calibration
+                score_result = score_from_ellipse_calibration(
+                    (tip.x, tip.y),
+                    calibration_data
+                )
+                
+                darts.append({
+                    "position": {
+                        "x": tip.x,
+                        "y": tip.y,
+                        "confidence": tip.confidence
+                    },
+                    "score": score_result
+                })
+            
+            # Create overlay image showing detections
+            overlay = image.copy()
+            for dart in darts:
+                pos = dart["position"]
+                score = dart["score"]
+                
+                # Draw tip position
+                cv2.circle(overlay, (int(pos["x"]), int(pos["y"])), 10, (0, 255, 255), -1)
+                cv2.circle(overlay, (int(pos["x"]), int(pos["y"])), 12, (0, 0, 0), 2)
+                
+                # Draw score text
+                score_text = f"{score['score']}"
+                if score['zone'] == 'triple':
+                    score_text = f"T{score['segment']}"
+                elif score['zone'] == 'double':
+                    score_text = f"D{score['segment']}"
+                elif score['zone'] == 'inner_bull':
+                    score_text = "Bull"
+                elif score['zone'] == 'outer_bull':
+                    score_text = "25"
+                
+                cv2.putText(overlay, score_text, 
+                           (int(pos["x"]) + 15, int(pos["y"]) - 10),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+            
+            overlay_base64 = encode_image(overlay)
+            
+            return DetectResponse(
+                success=True,
+                darts=darts,
+                overlay_image=overlay_base64,
+                message=f"Detected {len(darts)} dart(s)."
+            )
+            
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            return DetectResponse(
+                success=False,
+                error=str(e)
+            )

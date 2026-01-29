@@ -181,7 +181,55 @@
     </div>
     
     <div class="section">
-        <h2>2. Stored Calibrations</h2>
+        <h2>2. Detect Darts</h2>
+        
+        <div class="form-group">
+            <label for="detectCameraId">Camera ID (must be calibrated)</label>
+            <select id="detectCameraId">
+                <option value="">-- Select calibrated camera --</option>
+            </select>
+        </div>
+        
+        <div class="form-group">
+            <label>Image Source</label>
+            <div style="display: flex; gap: 10px;">
+                <button onclick="showDetectFileUpload()">📁 Upload File</button>
+                <button onclick="showDetectWebcam()">📷 Use Webcam</button>
+            </div>
+        </div>
+        
+        <div id="detectFileUploadSection" class="form-group">
+            <label for="detectImageFile">Select image with darts</label>
+            <input type="file" id="detectImageFile" accept="image/*" onchange="previewDetectImage(this)">
+        </div>
+        
+        <div id="detectWebcamSection" class="form-group" style="display: none;">
+            <div class="webcam-container">
+                <video id="detectWebcamVideo" autoplay playsinline></video>
+                <button id="detectCaptureBtn" onclick="captureDetectWebcam()">📸 Capture</button>
+            </div>
+        </div>
+        
+        <button onclick="detectDarts()" id="detectBtn">🎯 Detect Darts</button>
+        
+        <div id="detectStatus"></div>
+        
+        <div class="image-container">
+            <div class="image-box">
+                <h3>Input Image</h3>
+                <img id="detectInputImage" src="" alt="Upload an image" style="display: none;">
+            </div>
+            <div class="image-box">
+                <h3>Detection Result</h3>
+                <img id="detectOverlayImage" src="" alt="Detection overlay will appear here" style="display: none;">
+            </div>
+        </div>
+        
+        <div id="scoreResults" style="margin-top: 20px;"></div>
+    </div>
+    
+    <div class="section">
+        <h2>3. Stored Calibrations</h2>
         <button onclick="loadCalibrations()">🔄 Refresh</button>
         <div id="calibrationList" class="calibration-info"></div>
     </div>
@@ -195,7 +243,9 @@
     <script>
         const API_BASE = '/api';
         let currentImageBase64 = null;
+        let detectImageBase64 = null;
         let webcamStream = null;
+        let detectWebcamStream = null;
 
         // === File Upload ===
         function showFileUpload() {
@@ -251,6 +301,61 @@
             document.getElementById('inputImage').src = currentImageBase64;
             document.getElementById('inputImage').style.display = 'block';
             showStatus('calibrateStatus', 'info', 'Image captured from webcam');
+        }
+
+        // === Detection File/Webcam ===
+        function showDetectFileUpload() {
+            document.getElementById('detectFileUploadSection').style.display = 'block';
+            document.getElementById('detectWebcamSection').style.display = 'none';
+            stopDetectWebcam();
+        }
+
+        function showDetectWebcam() {
+            document.getElementById('detectFileUploadSection').style.display = 'none';
+            document.getElementById('detectWebcamSection').style.display = 'block';
+            startDetectWebcam();
+        }
+
+        function previewDetectImage(input) {
+            if (input.files && input.files[0]) {
+                const reader = new FileReader();
+                reader.onload = function(e) {
+                    detectImageBase64 = e.target.result;
+                    document.getElementById('detectInputImage').src = detectImageBase64;
+                    document.getElementById('detectInputImage').style.display = 'block';
+                };
+                reader.readAsDataURL(input.files[0]);
+            }
+        }
+
+        async function startDetectWebcam() {
+            try {
+                detectWebcamStream = await navigator.mediaDevices.getUserMedia({ 
+                    video: { width: 1280, height: 720 } 
+                });
+                document.getElementById('detectWebcamVideo').srcObject = detectWebcamStream;
+            } catch (err) {
+                showStatus('detectStatus', 'error', 'Failed to access webcam: ' + err.message);
+            }
+        }
+
+        function stopDetectWebcam() {
+            if (detectWebcamStream) {
+                detectWebcamStream.getTracks().forEach(track => track.stop());
+                detectWebcamStream = null;
+            }
+        }
+
+        function captureDetectWebcam() {
+            const video = document.getElementById('detectWebcamVideo');
+            const canvas = document.createElement('canvas');
+            canvas.width = video.videoWidth;
+            canvas.height = video.videoHeight;
+            canvas.getContext('2d').drawImage(video, 0, 0);
+            detectImageBase64 = canvas.toDataURL('image/jpeg', 0.9);
+            document.getElementById('detectInputImage').src = detectImageBase64;
+            document.getElementById('detectInputImage').style.display = 'block';
+            showStatus('detectStatus', 'info', 'Image captured from webcam');
         }
 
         // === Calibration ===
@@ -310,6 +415,113 @@
             }
         }
 
+        // === Dart Detection ===
+        async function detectDarts() {
+            const cameraId = document.getElementById('detectCameraId').value;
+            
+            if (!cameraId) {
+                showStatus('detectStatus', 'error', 'Please select a calibrated camera');
+                return;
+            }
+            
+            if (!detectImageBase64) {
+                showStatus('detectStatus', 'error', 'Please upload or capture an image first');
+                return;
+            }
+            
+            const btn = document.getElementById('detectBtn');
+            btn.disabled = true;
+            btn.textContent = 'Detecting...';
+            
+            try {
+                const response = await fetch(`${API_BASE}/detect`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        camera_id: cameraId,
+                        image: detectImageBase64.split(',')[1] // Remove data URL prefix
+                    })
+                });
+                
+                const data = await response.json();
+                
+                if (data.success) {
+                    const dartCount = data.darts ? data.darts.length : 0;
+                    showStatus('detectStatus', 'success', `✅ ${data.message || `Detected ${dartCount} dart(s)`}`);
+                    
+                    // Show overlay image
+                    if (data.overlay_image) {
+                        document.getElementById('detectOverlayImage').src = 'data:image/png;base64,' + data.overlay_image;
+                        document.getElementById('detectOverlayImage').style.display = 'block';
+                    }
+                    
+                    // Show score results
+                    displayScoreResults(data.darts);
+                } else {
+                    showStatus('detectStatus', 'error', '❌ ' + (data.error || 'Detection failed'));
+                }
+            } catch (err) {
+                showStatus('detectStatus', 'error', 'Request failed: ' + err.message);
+            } finally {
+                btn.disabled = false;
+                btn.textContent = '🎯 Detect Darts';
+            }
+        }
+
+        function displayScoreResults(darts) {
+            const container = document.getElementById('scoreResults');
+            
+            if (!darts || darts.length === 0) {
+                container.innerHTML = '<p style="color: #888;">No darts detected.</p>';
+                return;
+            }
+            
+            let totalScore = 0;
+            let html = '<h3 style="color: #00d4ff;">🎯 Score Results</h3>';
+            html += '<div class="calibration-info">';
+            
+            darts.forEach((dart, index) => {
+                const score = dart.score;
+                let scoreDisplay = score.score;
+                let zoneBadge = score.zone;
+                
+                if (score.zone === 'triple') {
+                    scoreDisplay = `T${score.segment} = ${score.score}`;
+                    zoneBadge = '🔴 Triple';
+                } else if (score.zone === 'double') {
+                    scoreDisplay = `D${score.segment} = ${score.score}`;
+                    zoneBadge = '🟢 Double';
+                } else if (score.zone === 'inner_bull') {
+                    scoreDisplay = '🎯 BULL = 50';
+                    zoneBadge = '🎯 Bullseye';
+                } else if (score.zone === 'outer_bull') {
+                    scoreDisplay = '🟡 25';
+                    zoneBadge = '🟡 Outer Bull';
+                } else if (score.zone === 'miss') {
+                    scoreDisplay = '0';
+                    zoneBadge = '❌ Miss';
+                } else {
+                    zoneBadge = `${score.zone}`;
+                }
+                
+                totalScore += score.score;
+                
+                html += `
+                    <div class="calibration-card">
+                        <h4>Dart ${index + 1}</h4>
+                        <p style="font-size: 24px; font-weight: bold; color: #00d4ff;">${scoreDisplay}</p>
+                        <p>${zoneBadge}</p>
+                        <p style="font-size: 11px; color: #888;">Conf: ${(dart.position.confidence * 100).toFixed(1)}%</p>
+                    </div>
+                `;
+            });
+            
+            html += '</div>';
+            html += `<p style="font-size: 20px; margin-top: 15px;"><strong>Total: ${totalScore}</strong></p>`;
+            
+            container.innerHTML = html;
+        }
+
         // === List Calibrations ===
         async function loadCalibrations() {
             try {
@@ -317,6 +529,13 @@
                 const calibrations = await response.json();
                 
                 const container = document.getElementById('calibrationList');
+                const select = document.getElementById('detectCameraId');
+                
+                // Update dropdown
+                select.innerHTML = '<option value="">-- Select calibrated camera --</option>';
+                calibrations.forEach(cal => {
+                    select.innerHTML += `<option value="${cal.camera_id}">${cal.camera_id}</option>`;
+                });
                 
                 if (calibrations.length === 0) {
                     container.innerHTML = '<p style="color: #888;">No calibrations stored yet.</p>';

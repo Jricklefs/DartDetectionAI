@@ -47,6 +47,7 @@ class DartPosition(BaseModel):
     """Detected dart position"""
     x: float
     y: float
+    confidence: Optional[float] = None
 
 
 class DartScore(BaseModel):
@@ -55,15 +56,28 @@ class DartScore(BaseModel):
     multiplier: int = Field(..., description="1=single, 2=double, 3=triple")
     segment: int = Field(..., description="Segment number (1-20, 0 for bull)")
     zone: str = Field(..., description="Zone name: inner_bull, outer_bull, triple, double, single_inner, single_outer, miss")
+    is_bullseye: Optional[bool] = False
+    is_outer_bull: Optional[bool] = False
+
+
+class DetectedDart(BaseModel):
+    """A single detected dart with position and score"""
+    position: Dict[str, Any] = Field(..., description="Dart tip position (x, y, confidence)")
+    score: Dict[str, Any] = Field(..., description="Score info (score, multiplier, segment, zone)")
 
 
 class DetectResponse(BaseModel):
     """Response from dart detection"""
     success: bool
+    darts: Optional[List[DetectedDart]] = Field(None, description="List of detected darts")
+    overlay_image: Optional[str] = Field(None, description="Base64 image with detection overlay")
+    message: Optional[str] = None
+    error: Optional[str] = None
+    
+    # Legacy single-dart fields for backwards compatibility
     dart: Optional[DartScore] = None
     position: Optional[DartPosition] = None
     confidence: Optional[float] = None
-    error: Optional[str] = None
 
 
 # === Calibration Storage ===
