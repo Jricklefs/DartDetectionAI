@@ -3,6 +3,8 @@ Dart Tracker - Stateful dart position tracking.
 
 Maintains state of darts currently on the board, identifies new darts,
 and calculates scores using calibration data.
+
+Supports multiple boards via BoardTrackerManager.
 """
 import math
 import time
@@ -34,6 +36,7 @@ class DartPosition:
 class DetectionResult:
     """Result from a detection request."""
     detection_id: str
+    board_id: str
     timestamp: float
     
     # The new dart (if any)
@@ -58,7 +61,7 @@ class DetectionResult:
 
 class DartTracker:
     """
-    Stateful dart tracker.
+    Stateful dart tracker for a single board.
     
     Maintains list of darts on the board, detects new darts by comparing
     to known positions, and provides scoring.
@@ -67,11 +70,14 @@ class DartTracker:
     # Distance threshold in mm to consider two tips as same dart
     POSITION_TOLERANCE_MM = 15.0
     
-    def __init__(self):
+    def __init__(self, board_id: str):
+        self.board_id = board_id
         self._lock = Lock()
         self._darts: List[DartPosition] = []
         self._next_dart_index = 0
         self._last_detection_id: Optional[str] = None
+        self._created_at = time.time()
+        self._last_activity = time.time()
         
     def reset(self) -> None:
         """Clear all tracked darts (board cleared)."""
@@ -79,6 +85,7 @@ class DartTracker:
             self._darts = []
             self._next_dart_index = 0
             self._last_detection_id = None
+            self._last_activity = time.time()
     
     @property
     def dart_count(self) -> int:
@@ -119,6 +126,8 @@ class DartTracker:
         timestamp = time.time()
         
         with self._lock:
+            self._last_activity = timestamp
+            
             # Group detections by position (cluster nearby tips)
             clusters = self._cluster_detections(detected_tips)
             
@@ -198,6 +207,7 @@ class DartTracker:
             
             return DetectionResult(
                 detection_id=detection_id,
+                board_id=self.board_id,
                 timestamp=timestamp,
                 new_dart=new_dart,
                 all_darts=list(self._darts),
@@ -255,6 +265,7 @@ class DartTracker:
             for i, dart in enumerate(self._darts):
                 if dart.dart_id == dart_id:
                     self._darts.pop(i)
+                    self._last_activity = time.time()
                     return True
             return False
     
@@ -262,6 +273,7 @@ class DartTracker:
         """Get current tracker state for API response."""
         with self._lock:
             return {
+                'board_id': self.board_id,
                 'dart_count': len(self._darts),
                 'darts': [
                     {
@@ -281,5 +293,82 @@ class DartTracker:
             }
 
 
-# Global tracker instance
-dart_tracker = DartTracker()
+class BoardTrackerManager:
+    """
+    Manages DartTracker instances for multiple boards.
+    
+    Each physical dartboard gets its own tracker instance.
+    Trackers are created on-demand and can be cleaned up after inactivity.
+    """
+    
+    # Clean up trackers after 1 hour of inactivity
+    INACTIVE_TIMEOUT_SECONDS = 3600
+    
+    def __init__(self):
+        self._lock = Lock()
+        self._trackers: Dict[str, DartTracker] = {}
+    
+    def get_tracker(self, board_id: str) -> DartTracker:
+        """Get or create a tracker for the given board."""
+        with self._lock:
+            if board_id not in self._trackers:
+                self._trackers[board_id] = DartTracker(board_id)
+            return self._trackers[board_id]
+    
+    def reset_board(self, board_id: str) -> bool:
+        """Reset the tracker for a board (clear darts)."""
+        with self._lock:
+            if board_id in self._trackers:
+                self._trackers[board_id].reset()
+                return True
+            return False
+    
+    def remove_board(self, board_id: str) -> bool:
+        """Remove a board's tracker entirely."""
+        with self._lock:
+            if board_id in self._trackers:
+                del self._trackers[board_id]
+                return True
+            return False
+    
+    def list_boards(self) -> List[Dict[str, Any]]:
+        """List all active boards."""
+        with self._lock:
+            return [
+                {
+                    'board_id': board_id,
+                    'dart_count': tracker.dart_count,
+                    'created_at': tracker._created_at,
+                    'last_activity': tracker._last_activity
+                }
+                for board_id, tracker in self._trackers.items()
+            ]
+    
+    def cleanup_inactive(self) -> List[str]:
+        """Remove trackers that have been inactive too long."""
+        now = time.time()
+        removed = []
+        
+        with self._lock:
+            inactive_boards = [
+                board_id
+                for board_id, tracker in self._trackers.items()
+                if now - tracker._last_activity > self.INACTIVE_TIMEOUT_SECONDS
+            ]
+            
+            for board_id in inactive_boards:
+                del self._trackers[board_id]
+                removed.append(board_id)
+        
+        return removed
+    
+    def get_state(self, board_id: str) -> Optional[Dict[str, Any]]:
+        """Get state for a specific board."""
+        with self._lock:
+            if board_id in self._trackers:
+                return self._trackers[board_id].get_state()
+            return None
+
+
+# Global manager instance
+tracker_manager = BoardTrackerManager()

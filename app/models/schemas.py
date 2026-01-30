@@ -35,7 +35,7 @@ class CalibrateResponse(BaseModel):
     results: List[CameraCalibrationResult]
 
 
-# === Detection (Multi-camera, stateful) ===
+# === Detection (Multi-camera, stateful, board-scoped) ===
 
 class CameraDetection(BaseModel):
     """Detection from a single camera"""
@@ -45,6 +45,7 @@ class CameraDetection(BaseModel):
 
 class MultiDetectRequest(BaseModel):
     """Request to detect darts from multiple cameras"""
+    board_id: str = Field(..., description="Unique identifier for the physical dartboard")
     cameras: List[CameraDetection] = Field(..., description="Images from each camera")
 
 
@@ -81,6 +82,7 @@ class ConsensusResult(BaseModel):
 class MultiDetectResponse(BaseModel):
     """Response from multi-camera detection"""
     detection_id: str
+    board_id: str
     timestamp: float
     
     # The new dart if one was detected
@@ -101,10 +103,24 @@ class MultiDetectResponse(BaseModel):
 
 
 class TrackerState(BaseModel):
-    """Current state of the dart tracker"""
+    """Current state of the dart tracker for a board"""
+    board_id: str
     dart_count: int
     darts: List[DartInfo]
     last_detection_id: Optional[str] = None
+
+
+class BoardInfo(BaseModel):
+    """Info about an active board"""
+    board_id: str
+    dart_count: int
+    created_at: float
+    last_activity: float
+
+
+class BoardListResponse(BaseModel):
+    """Response listing all active boards"""
+    boards: List[BoardInfo]
 
 
 # === Legacy single-camera detection ===

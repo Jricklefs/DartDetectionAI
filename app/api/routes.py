@@ -3,10 +3,10 @@ API Routes for DartDetectionAI
 
 Provides endpoints for:
 - Camera calibration
-- Multi-camera dart detection with stateful tracking
-- Dart tracker state management
+- Multi-camera dart detection with stateful tracking (board-scoped)
+- Board management
 """
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from typing import List
 
 from app.models.schemas import (
@@ -21,11 +21,13 @@ from app.models.schemas import (
     DartInfo,
     CameraResult,
     ConsensusResult,
-    TrackerState
+    TrackerState,
+    BoardInfo,
+    BoardListResponse
 )
 from app.core.calibration import DartboardCalibrator
 from app.core.storage import calibration_store
-from app.core.dart_tracker import dart_tracker, DartPosition
+from app.core.dart_tracker import tracker_manager
 from app.core.scoring import scoring_system
 
 router = APIRouter()
@@ -82,12 +84,15 @@ async def delete_calibration(camera_id: str):
     raise HTTPException(status_code=404, detail=f"Camera '{camera_id}' not found")
 
 
-# === Multi-Camera Detection with Tracking ===
+# === Multi-Camera Detection with Board-Scoped Tracking ===
 
 @router.post("/detect/multi", response_model=MultiDetectResponse)
 async def detect_multi_camera(request: MultiDetectRequest):
     """
     Detect darts from multiple cameras with stateful tracking.
+    
+    Each board_id gets its own tracker. State is maintained between calls
+    until POST /detect/reset is called.
     
     - Runs YOLO on each camera image to find dart tips
     - Clusters tips from different cameras viewing same dart
@@ -95,8 +100,11 @@ async def detect_multi_camera(request: MultiDetectRequest):
     - Calculates score using calibration data
     - Returns new dart and full board state
     
-    Call POST /detect/reset when board is cleared.
+    Call POST /detect/reset?board_id=xxx when board is cleared.
     """
+    board_id = request.board_id
+    tracker = tracker_manager.get_tracker(board_id)
+    
     detected_tips = []
     camera_results = []
     
@@ -143,8 +151,8 @@ async def detect_multi_camera(request: MultiDetectRequest):
                 tips=[{"error": str(e)}]
             ))
     
-    # Process through dart tracker
-    result = dart_tracker.process_detection(
+    # Process through board-specific tracker
+    result = tracker.process_detection(
         detected_tips=detected_tips,
         scoring_func=lambda x, y: scoring_system.score_from_dartboard_coords(x, y)
     )
@@ -187,6 +195,7 @@ async def detect_multi_camera(request: MultiDetectRequest):
     
     return MultiDetectResponse(
         detection_id=result.detection_id,
+        board_id=board_id,
         timestamp=result.timestamp,
         new_dart=new_dart_info,
         all_darts=all_darts_info,
@@ -198,25 +207,29 @@ async def detect_multi_camera(request: MultiDetectRequest):
 
 
 @router.post("/detect/reset")
-async def reset_tracker():
+async def reset_tracker(board_id: str = Query(..., description="Board ID to reset")):
     """
-    Reset the dart tracker (board cleared).
+    Reset the dart tracker for a board (board cleared).
     
     Call this when darts are removed from the board.
     """
-    dart_tracker.reset()
-    return {"message": "Dart tracker reset", "dart_count": 0}
+    tracker_manager.reset_board(board_id)
+    return {"message": f"Board '{board_id}' reset", "dart_count": 0}
 
 
 @router.get("/detect/state", response_model=TrackerState)
-async def get_tracker_state():
+async def get_tracker_state(board_id: str = Query(..., description="Board ID")):
     """
-    Get current dart tracker state.
+    Get current dart tracker state for a board.
     
     Returns all darts currently tracked on the board.
     """
-    state = dart_tracker.get_state()
+    state = tracker_manager.get_state(board_id)
+    if state is None:
+        raise HTTPException(status_code=404, detail=f"Board '{board_id}' not found")
+    
     return TrackerState(
+        board_id=state['board_id'],
         dart_count=state['dart_count'],
         darts=[
             DartInfo(
@@ -237,14 +250,51 @@ async def get_tracker_state():
     )
 
 
+@router.get("/boards", response_model=BoardListResponse)
+async def list_boards():
+    """
+    List all active boards with trackers.
+    """
+    boards = tracker_manager.list_boards()
+    return BoardListResponse(
+        boards=[
+            BoardInfo(
+                board_id=b['board_id'],
+                dart_count=b['dart_count'],
+                created_at=b['created_at'],
+                last_activity=b['last_activity']
+            )
+            for b in boards
+        ]
+    )
+
+
+@router.delete("/board/{board_id}")
+async def remove_board(board_id: str):
+    """
+    Remove a board's tracker entirely.
+    """
+    if tracker_manager.remove_board(board_id):
+        return {"message": f"Board '{board_id}' removed"}
+    raise HTTPException(status_code=404, detail=f"Board '{board_id}' not found")
+
+
 @router.delete("/detect/dart/{dart_id}")
-async def remove_dart(dart_id: str):
+async def remove_dart(
+    dart_id: str,
+    board_id: str = Query(..., description="Board ID")
+):
     """
-    Remove a specific dart (e.g., it fell out).
+    Remove a specific dart from a board (e.g., it fell out).
     """
-    if dart_tracker.remove_dart(dart_id):
-        return {"message": f"Dart '{dart_id}' removed", "dart_count": dart_tracker.dart_count}
-    raise HTTPException(status_code=404, detail=f"Dart '{dart_id}' not found")
+    state = tracker_manager.get_state(board_id)
+    if state is None:
+        raise HTTPException(status_code=404, detail=f"Board '{board_id}' not found")
+    
+    tracker = tracker_manager.get_tracker(board_id)
+    if tracker.remove_dart(dart_id):
+        return {"message": f"Dart '{dart_id}' removed", "dart_count": tracker.dart_count}
+    raise HTTPException(status_code=404, detail=f"Dart '{dart_id}' not found on board '{board_id}'")
 
 
 # === Legacy Single-Camera Detection ===
