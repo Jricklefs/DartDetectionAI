@@ -737,6 +737,125 @@ class DartboardCalibrator:
         
         return overlay
     
+    def detect_tips(
+        self,
+        camera_id: str,
+        image_base64: str,
+        calibration_data: Dict[str, Any],
+        confidence_threshold: float = 0.5
+    ) -> List[Dict[str, Any]]:
+        """
+        Detect dart tips in an image using YOLO.
+        
+        Args:
+            camera_id: Camera identifier
+            image_base64: Base64-encoded image
+            calibration_data: Calibration data
+            confidence_threshold: Minimum confidence
+            
+        Returns:
+            List of detected tips with pixel and mm coordinates
+        """
+        try:
+            from app.core.detection import DartTipDetector
+            
+            # Decode image
+            image = decode_image(image_base64)
+            
+            # Initialize tip detector if needed
+            if not hasattr(self, 'tip_detector'):
+                self.tip_detector = DartTipDetector()
+            
+            if not self.tip_detector.is_initialized:
+                return []
+            
+            # Detect dart tips
+            tips = self.tip_detector.detect_tips(image, confidence_threshold=confidence_threshold)
+            
+            results = []
+            for tip in tips:
+                # Convert pixel to dartboard coordinates
+                x_mm, y_mm = self.pixel_to_dartboard(tip.x, tip.y, calibration_data)
+                
+                results.append({
+                    'x_px': tip.x,
+                    'y_px': tip.y,
+                    'x_mm': x_mm,
+                    'y_mm': y_mm,
+                    'confidence': tip.confidence
+                })
+            
+            return results
+            
+        except Exception as e:
+            print(f"Error detecting tips: {e}")
+            return []
+    
+    def pixel_to_dartboard(
+        self,
+        x_px: float,
+        y_px: float,
+        calibration_data: Dict[str, Any]
+    ) -> Tuple[float, float]:
+        """
+        Convert pixel coordinates to dartboard mm coordinates.
+        
+        Uses the calibration ellipses to estimate scale and perspective.
+        
+        Args:
+            x_px: X pixel coordinate
+            y_px: Y pixel coordinate
+            calibration_data: Calibration data from calibrate()
+            
+        Returns:
+            (x_mm, y_mm) in dartboard coordinates (0,0 = center)
+        """
+        center = calibration_data.get('center', (0, 0))
+        outer_double = calibration_data.get('outer_double_ellipse')
+        
+        if not outer_double:
+            # Fallback: assume 1 pixel = 1mm offset from center
+            return (x_px - center[0], y_px - center[1])
+        
+        # Calculate relative position from center in pixels
+        dx_px = x_px - center[0]
+        dy_px = y_px - center[1]
+        
+        # Get ellipse parameters
+        (ecx, ecy), (ew, eh), angle = outer_double
+        
+        # Convert angle to radians
+        angle_rad = math.radians(-angle)
+        cos_a = math.cos(angle_rad)
+        sin_a = math.sin(angle_rad)
+        
+        # Rotate to align with ellipse axes
+        dx_rot = dx_px * cos_a - dy_px * sin_a
+        dy_rot = dx_px * sin_a + dy_px * cos_a
+        
+        # Scale by ellipse semi-axes to get normalized position
+        # Then scale to dartboard mm (outer double = 170mm radius)
+        a = ew / 2  # semi-major axis in pixels
+        b = eh / 2  # semi-minor axis in pixels
+        
+        if a > 0 and b > 0:
+            # Scale each axis by dartboard radius / ellipse radius
+            x_mm = (dx_rot / a) * DOUBLE_OUTER_RADIUS_MM
+            y_mm = (dy_rot / b) * DOUBLE_OUTER_RADIUS_MM
+        else:
+            x_mm = dx_px
+            y_mm = dy_px
+        
+        # Rotate back
+        angle_rad = math.radians(angle)
+        cos_a = math.cos(angle_rad)
+        sin_a = math.sin(angle_rad)
+        
+        x_final = x_mm * cos_a - y_mm * sin_a
+        y_final = x_mm * sin_a + y_mm * cos_a
+        
+        return (x_final, y_final)
+    
     def detect_dart(
         self,
         camera_id: str,
