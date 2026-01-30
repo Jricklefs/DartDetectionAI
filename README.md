@@ -1,131 +1,117 @@
-# DartDetectionAI
+# DartDetect API
 
-Standalone dartboard detection and scoring API service.
+**Stateless dart detection as a service.**
 
-## Overview
+Send dartboard images → Get dart tip positions and scores.
 
-A modular dart detection system that:
-1. **Calibrates** cameras by analyzing dartboard images and storing the transformation matrix
-2. **Detects** dart positions in subsequent images using the stored calibration
-3. **Scores** darts by mapping detected positions to dartboard segments
+## Features
 
-## Architecture
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                      API Service                             │
-├─────────────────────────────────────────────────────────────┤
-│  POST /calibrate     - Calibrate camera(s) from images      │
-│  POST /detect        - Detect dart and return score         │
-│  GET  /calibrations  - List stored calibrations             │
-│  DELETE /calibration/{camera_id} - Remove calibration       │
-└─────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────┐
-│                    Core Detection Engine                     │
-├─────────────────────────────────────────────────────────────┤
-│  calibration.py   - Dartboard detection & homography        │
-│  scoring.py       - Segment/zone calculation                │
-│  geometry.py      - Dartboard constants & math              │
-│  storage.py       - In-memory calibration storage           │
-└─────────────────────────────────────────────────────────────┘
-```
+- 🎯 **Multi-camera support** — Combine views for better accuracy
+- 📐 **Automatic calibration** — Detect dartboard from any angle
+- ⚡ **Fast inference** — GPU-accelerated YOLO models
+- 🔑 **API key authentication** — Per-customer access control
+- 📊 **Usage tracking** — Monitor API calls per key
 
 ## API Endpoints
 
-### POST /calibrate
-Calibrate one or more cameras.
+### Calibration
 
-**Request:**
-```json
+```http
+POST /v1/calibrate
+Authorization: Bearer <api_key>
+
 {
   "cameras": [
+    {"camera_id": "cam1", "image": "base64..."}
+  ]
+}
+```
+
+Stores calibration data associated with your API key. Returns overlay image showing detected zones.
+
+### Detection
+
+```http
+POST /v1/detect
+Authorization: Bearer <api_key>
+
+{
+  "cameras": [
+    {"camera_id": "cam1", "image": "base64..."},
+    {"camera_id": "cam2", "image": "base64..."}
+  ]
+}
+```
+
+Returns all detected dart tips with positions and scores:
+
+```json
+{
+  "request_id": "req_abc123",
+  "processing_ms": 42,
+  "tips": [
     {
-      "camera_id": "cam1",
-      "image": "<base64 encoded image>"
+      "x_mm": 0.0,
+      "y_mm": -99.5,
+      "segment": 20,
+      "multiplier": 3,
+      "zone": "triple",
+      "score": 60,
+      "confidence": 0.94,
+      "cameras_seen": ["cam1", "cam2"]
     }
   ]
 }
 ```
 
-**Response:**
-```json
-{
-  "results": [
-    {
-      "camera_id": "cam1",
-      "success": true,
-      "quality": 0.95,
-      "overlay_image": "<base64 encoded image with grid overlay>",
-      "segment_at_top": 20
-    }
-  ]
-}
+### Calibration Management
+
+```http
+GET /v1/calibrations              # List your calibrations
+DELETE /v1/calibrations/{cam_id}  # Delete a calibration
 ```
 
-### POST /detect
-Detect dart position and calculate score.
+## Quick Start
 
-**Request:**
-```json
-{
-  "camera_id": "cam1",
-  "image": "<base64 encoded image>"
-}
-```
-
-**Response:**
-```json
-{
-  "success": true,
-  "dart": {
-    "position": {"x": 123, "y": 456},
-    "score": 60,
-    "multiplier": 3,
-    "segment": 20,
-    "zone": "triple"
-  }
-}
-```
-
-## Development
+### Self-Hosted
 
 ```bash
-# Install dependencies
+# Clone
+git clone https://github.com/Jricklefs/DartDetectAPI.git
+cd DartDetectAPI
+
+# Setup
+python -m venv .venv
+.venv/Scripts/activate  # Windows
 pip install -r requirements.txt
 
-# Run API server
-python -m uvicorn app.main:app --reload --port 8000
-
-# Run tests
-pytest
+# Run
+uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
-## Project Structure
+### Docker
 
+```bash
+docker run -p 8000:8000 -e API_KEYS=your_key_here dartdetect/api
 ```
-DartDetectionAI/
-├── app/
-│   ├── __init__.py
-│   ├── main.py           # FastAPI app entry point
-│   ├── api/
-│   │   ├── __init__.py
-│   │   └── routes.py     # API endpoints
-│   ├── core/
-│   │   ├── __init__.py
-│   │   ├── calibration.py    # Dartboard calibration
-│   │   ├── detection.py      # Dart tip detection
-│   │   ├── scoring.py        # Score calculation
-│   │   ├── geometry.py       # Dartboard geometry constants
-│   │   └── storage.py        # Calibration storage
-│   └── models/
-│       ├── __init__.py
-│       └── schemas.py    # Pydantic models
-├── tests/
-│   └── ...
-├── ui/                   # Minimal test UI
-│   └── index.html
-├── requirements.txt
-└── README.md
-```
+
+## Models
+
+Place YOLO models in the `models/` directory:
+- `dartboard_calibration/` — Detects calibration points (wire intersections)
+- `dart_tips/` — Detects dart tip positions
+
+## Configuration
+
+Environment variables:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `API_KEYS` | (none) | Comma-separated valid API keys |
+| `REQUIRE_AUTH` | `true` | Set to `false` for local dev |
+| `MAX_IMAGE_SIZE` | `10485760` | Max image size in bytes (10MB) |
+| `MODEL_DEVICE` | `auto` | `cpu`, `cuda`, or `auto` |
+
+## License
+
+Commercial license required for production use. Contact for pricing.

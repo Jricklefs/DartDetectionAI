@@ -1,13 +1,14 @@
 """
-API Routes for DartDetectionAI
+DartDetect API Routes
 
-Provides endpoints for:
-- Camera calibration
-- Multi-camera dart detection with stateful tracking (board-scoped)
-- Board management
+Stateless dart detection API with API key authentication.
 """
-from fastapi import APIRouter, HTTPException, Query
-from typing import List
+import os
+import time
+import uuid
+import math
+from fastapi import APIRouter, HTTPException, Depends, Header
+from typing import List, Optional
 
 from app.models.schemas import (
     CalibrateRequest,
@@ -15,35 +16,74 @@ from app.models.schemas import (
     CameraCalibrationResult,
     DetectRequest,
     DetectResponse,
+    DetectedTip,
+    CameraDetectionResult,
     CalibrationInfo,
-    MultiDetectRequest,
-    MultiDetectResponse,
-    DartInfo,
-    CameraResult,
-    ConsensusResult,
-    TrackerState,
-    BoardInfo,
-    BoardListResponse
+    HealthResponse,
 )
 from app.core.calibration import DartboardCalibrator
 from app.core.storage import calibration_store
-from app.core.dart_tracker import tracker_manager
 from app.core.scoring import scoring_system
 
 router = APIRouter()
+
+# Configuration
+REQUIRE_AUTH = os.getenv("REQUIRE_AUTH", "true").lower() == "true"
+API_KEYS = set(os.getenv("API_KEYS", "").split(",")) if os.getenv("API_KEYS") else set()
 
 # Shared calibrator instance
 calibrator = DartboardCalibrator()
 
 
+# === Authentication ===
+
+async def verify_api_key(authorization: Optional[str] = Header(None)) -> str:
+    """Verify API key from Authorization header."""
+    if not REQUIRE_AUTH:
+        return "local"
+    
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Missing Authorization header")
+    
+    # Expect "Bearer <key>"
+    parts = authorization.split()
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        raise HTTPException(status_code=401, detail="Invalid Authorization format. Use: Bearer <api_key>")
+    
+    api_key = parts[1]
+    
+    if api_key not in API_KEYS:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    
+    return api_key
+
+
+# === Health ===
+
+@router.get("/health", response_model=HealthResponse)
+async def health():
+    """Health check endpoint (no auth required)."""
+    return HealthResponse(
+        status="healthy",
+        version="1.0.0",
+        models_loaded=calibrator.detector.is_initialized if calibrator.detector else False,
+        calibrations_count=len(calibration_store.list_all())
+    )
+
+
 # === Calibration Endpoints ===
 
-@router.post("/calibrate", response_model=CalibrateResponse)
-async def calibrate_cameras(request: CalibrateRequest):
+@router.post("/v1/calibrate", response_model=CalibrateResponse)
+async def calibrate_cameras(
+    request: CalibrateRequest,
+    api_key: str = Depends(verify_api_key)
+):
     """
-    Calibrate one or more cameras from dartboard images.
+    Calibrate cameras from dartboard images.
     
-    Returns overlay images showing the detected coordinate system.
+    - Send images of the dartboard (no darts)
+    - Returns overlay images showing detected zones
+    - Calibration is stored for future detection requests
     """
     results = []
     
@@ -54,11 +94,19 @@ async def calibrate_cameras(request: CalibrateRequest):
                 image_base64=camera.image
             )
             
-            # Store successful calibration
+            # Store successful calibration (keyed by api_key + camera_id)
             if result.success:
-                calibration_store.save(camera.camera_id, result.calibration_data)
+                storage_key = f"{api_key}:{camera.camera_id}"
+                calibration_store.save(storage_key, result.calibration_data)
             
-            results.append(result)
+            results.append(CameraCalibrationResult(
+                camera_id=camera.camera_id,
+                success=result.success,
+                quality=result.quality,
+                overlay_image=result.overlay_image,
+                segment_at_top=result.segment_at_top,
+                error=result.error
+            ))
             
         except Exception as e:
             results.append(CameraCalibrationResult(
@@ -70,257 +118,205 @@ async def calibrate_cameras(request: CalibrateRequest):
     return CalibrateResponse(results=results)
 
 
-@router.get("/calibrations", response_model=List[CalibrationInfo])
-async def list_calibrations():
-    """List all stored camera calibrations."""
-    return calibration_store.list_all()
+@router.get("/v1/calibrations", response_model=List[CalibrationInfo])
+async def list_calibrations(api_key: str = Depends(verify_api_key)):
+    """List calibrations for this API key."""
+    all_cals = calibration_store.list_all()
+    # Filter to this API key's calibrations
+    prefix = f"{api_key}:"
+    return [
+        CalibrationInfo(
+            camera_id=c.camera_id.replace(prefix, ""),
+            created_at=c.created_at,
+            quality=c.quality,
+            segment_at_top=c.segment_at_top
+        )
+        for c in all_cals
+        if c.camera_id.startswith(prefix)
+    ]
 
 
-@router.delete("/calibration/{camera_id}")
-async def delete_calibration(camera_id: str):
+@router.delete("/v1/calibrations/{camera_id}")
+async def delete_calibration(
+    camera_id: str,
+    api_key: str = Depends(verify_api_key)
+):
     """Delete a camera's calibration."""
-    if calibration_store.delete(camera_id):
+    storage_key = f"{api_key}:{camera_id}"
+    if calibration_store.delete(storage_key):
         return {"message": f"Calibration for '{camera_id}' deleted"}
     raise HTTPException(status_code=404, detail=f"Camera '{camera_id}' not found")
 
 
-# === Multi-Camera Detection with Board-Scoped Tracking ===
+# === Detection Endpoint (Stateless) ===
 
-@router.post("/detect/multi", response_model=MultiDetectResponse)
-async def detect_multi_camera(request: MultiDetectRequest):
+@router.post("/v1/detect", response_model=DetectResponse)
+async def detect_tips(
+    request: DetectRequest,
+    api_key: str = Depends(verify_api_key)
+):
     """
-    Detect darts from multiple cameras with stateful tracking.
+    Detect dart tips in images.
     
-    Each board_id gets its own tracker. State is maintained between calls
-    until POST /detect/reset is called.
-    
-    - Runs YOLO on each camera image to find dart tips
-    - Clusters tips from different cameras viewing same dart
-    - Compares to known dart positions to identify NEW darts
-    - Calculates score using calibration data
-    - Returns new dart and full board state
-    
-    Call POST /detect/reset?board_id=xxx when board is cleared.
+    - Send images from calibrated cameras
+    - Returns ALL detected dart tips with positions and scores
+    - Stateless - no memory of previous requests
+    - Caller is responsible for tracking which darts are new
     """
-    board_id = request.board_id
-    tracker = tracker_manager.get_tracker(board_id)
+    start_time = time.time()
+    request_id = str(uuid.uuid4())[:12]
     
-    detected_tips = []
+    all_tips = []  # Raw tips from each camera
     camera_results = []
     
     for cam in request.cameras:
-        # Check calibration
-        calibration_data = calibration_store.get(cam.camera_id)
+        # Get calibration for this camera
+        storage_key = f"{api_key}:{cam.camera_id}"
+        calibration_data = calibration_store.get(storage_key)
+        
         if calibration_data is None:
-            camera_results.append(CameraResult(
+            camera_results.append(CameraDetectionResult(
                 camera_id=cam.camera_id,
                 tips_detected=0,
-                tips=[]
+                error=f"Camera not calibrated. Call /v1/calibrate first."
             ))
             continue
         
         try:
-            # Run YOLO detection on this camera's image
+            # Detect tips in this image
             tips = calibrator.detect_tips(
                 camera_id=cam.camera_id,
                 image_base64=cam.image,
                 calibration_data=calibration_data
             )
             
-            # Convert pixel coords to dartboard mm coords
+            # Add camera_id to each tip
             for tip in tips:
                 tip['camera_id'] = cam.camera_id
-                # Transform using calibration
-                if 'x_mm' not in tip:
-                    tip['x_mm'], tip['y_mm'] = calibrator.pixel_to_dartboard(
-                        tip['x_px'], tip['y_px'],
-                        calibration_data
-                    )
-                detected_tips.append(tip)
+                all_tips.append(tip)
             
-            camera_results.append(CameraResult(
+            camera_results.append(CameraDetectionResult(
                 camera_id=cam.camera_id,
-                tips_detected=len(tips),
-                tips=tips
+                tips_detected=len(tips)
             ))
             
         except Exception as e:
-            camera_results.append(CameraResult(
+            camera_results.append(CameraDetectionResult(
                 camera_id=cam.camera_id,
                 tips_detected=0,
-                tips=[{"error": str(e)}]
+                error=str(e)
             ))
     
-    # Process through board-specific tracker
-    result = tracker.process_detection(
-        detected_tips=detected_tips,
-        scoring_func=lambda x, y: scoring_system.score_from_dartboard_coords(x, y)
-    )
+    # Cluster tips from multiple cameras (same dart seen by different cameras)
+    clustered_tips = cluster_tips(all_tips)
     
-    # Build response
-    new_dart_info = None
-    if result.new_dart:
-        new_dart_info = DartInfo(
-            dart_id=result.new_dart.dart_id,
-            dart_index=result.new_dart.dart_index,
-            segment=result.new_dart.segment,
-            multiplier=result.new_dart.multiplier,
-            score=result.new_dart.score,
-            zone=result.new_dart.zone,
-            confidence=result.new_dart.confidence,
-            x_mm=result.new_dart.x_mm,
-            y_mm=result.new_dart.y_mm,
-            is_new=True
-        )
-    
-    all_darts_info = [
-        DartInfo(
-            dart_id=d.dart_id,
-            dart_index=d.dart_index,
-            segment=d.segment,
-            multiplier=d.multiplier,
-            score=d.score,
-            zone=d.zone,
-            confidence=d.confidence,
-            x_mm=d.x_mm,
-            y_mm=d.y_mm,
-            is_new=(result.new_dart and d.dart_id == result.new_dart.dart_id)
-        )
-        for d in result.all_darts
-    ]
-    
-    consensus = None
-    if result.consensus:
-        consensus = ConsensusResult(**result.consensus)
-    
-    return MultiDetectResponse(
-        detection_id=result.detection_id,
-        board_id=board_id,
-        timestamp=result.timestamp,
-        new_dart=new_dart_info,
-        all_darts=all_darts_info,
-        consensus=consensus,
-        camera_results=camera_results,
-        dart_count=result.dart_count,
-        board_cleared=result.board_cleared
-    )
-
-
-@router.post("/detect/reset")
-async def reset_tracker(board_id: str = Query(..., description="Board ID to reset")):
-    """
-    Reset the dart tracker for a board (board cleared).
-    
-    Call this when darts are removed from the board.
-    """
-    tracker_manager.reset_board(board_id)
-    return {"message": f"Board '{board_id}' reset", "dart_count": 0}
-
-
-@router.get("/detect/state", response_model=TrackerState)
-async def get_tracker_state(board_id: str = Query(..., description="Board ID")):
-    """
-    Get current dart tracker state for a board.
-    
-    Returns all darts currently tracked on the board.
-    """
-    state = tracker_manager.get_state(board_id)
-    if state is None:
-        raise HTTPException(status_code=404, detail=f"Board '{board_id}' not found")
-    
-    return TrackerState(
-        board_id=state['board_id'],
-        dart_count=state['dart_count'],
-        darts=[
-            DartInfo(
-                dart_id=d['dart_id'],
-                dart_index=d['dart_index'],
-                segment=d['segment'],
-                multiplier=d['multiplier'],
-                score=d['score'],
-                zone=d['zone'],
-                confidence=d['confidence'],
-                x_mm=d['x_mm'],
-                y_mm=d['y_mm'],
-                is_new=False
-            )
-            for d in state['darts']
-        ],
-        last_detection_id=state['last_detection_id']
-    )
-
-
-@router.get("/boards", response_model=BoardListResponse)
-async def list_boards():
-    """
-    List all active boards with trackers.
-    """
-    boards = tracker_manager.list_boards()
-    return BoardListResponse(
-        boards=[
-            BoardInfo(
-                board_id=b['board_id'],
-                dart_count=b['dart_count'],
-                created_at=b['created_at'],
-                last_activity=b['last_activity']
-            )
-            for b in boards
-        ]
-    )
-
-
-@router.delete("/board/{board_id}")
-async def remove_board(board_id: str):
-    """
-    Remove a board's tracker entirely.
-    """
-    if tracker_manager.remove_board(board_id):
-        return {"message": f"Board '{board_id}' removed"}
-    raise HTTPException(status_code=404, detail=f"Board '{board_id}' not found")
-
-
-@router.delete("/detect/dart/{dart_id}")
-async def remove_dart(
-    dart_id: str,
-    board_id: str = Query(..., description="Board ID")
-):
-    """
-    Remove a specific dart from a board (e.g., it fell out).
-    """
-    state = tracker_manager.get_state(board_id)
-    if state is None:
-        raise HTTPException(status_code=404, detail=f"Board '{board_id}' not found")
-    
-    tracker = tracker_manager.get_tracker(board_id)
-    if tracker.remove_dart(dart_id):
-        return {"message": f"Dart '{dart_id}' removed", "dart_count": tracker.dart_count}
-    raise HTTPException(status_code=404, detail=f"Dart '{dart_id}' not found on board '{board_id}'")
-
-
-# === Legacy Single-Camera Detection ===
-
-@router.post("/detect", response_model=DetectResponse)
-async def detect_dart(request: DetectRequest):
-    """
-    Detect dart position in an image and calculate the score.
-    
-    Legacy single-camera endpoint. Use /detect/multi for multi-camera with tracking.
-    """
-    # Check if camera is calibrated
-    calibration_data = calibration_store.get(request.camera_id)
-    if calibration_data is None:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Camera '{request.camera_id}' is not calibrated. Call /calibrate first."
-        )
-    
-    try:
-        result = calibrator.detect_dart(
-            camera_id=request.camera_id,
-            image_base64=request.image,
-            calibration_data=calibration_data
-        )
-        return result
+    # Calculate scores for each clustered tip
+    detected_tips = []
+    for cluster in clustered_tips:
+        # Average position from all cameras that saw this tip
+        avg_x = sum(t['x_mm'] for t in cluster) / len(cluster)
+        avg_y = sum(t['y_mm'] for t in cluster) / len(cluster)
+        avg_conf = sum(t['confidence'] for t in cluster) / len(cluster)
+        cameras_seen = list(set(t['camera_id'] for t in cluster))
         
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        # Calculate score
+        score_info = scoring_system.score_from_dartboard_coords(avg_x, avg_y)
+        
+        detected_tips.append(DetectedTip(
+            x_mm=round(avg_x, 2),
+            y_mm=round(avg_y, 2),
+            segment=score_info.get('segment', 0),
+            multiplier=score_info.get('multiplier', 1),
+            zone=score_info.get('zone', 'miss'),
+            score=score_info.get('score', 0),
+            confidence=round(avg_conf, 3),
+            cameras_seen=cameras_seen
+        ))
+    
+    processing_ms = int((time.time() - start_time) * 1000)
+    
+    return DetectResponse(
+        request_id=request_id,
+        processing_ms=processing_ms,
+        tips=detected_tips,
+        camera_results=camera_results
+    )
+
+
+def cluster_tips(
+    tips: List[dict],
+    cluster_threshold_mm: float = 20.0
+) -> List[List[dict]]:
+    """
+    Cluster nearby tips (same dart seen by multiple cameras).
+    
+    Simple greedy clustering.
+    """
+    if not tips:
+        return []
+    
+    clusters = []
+    used = set()
+    
+    for i, tip in enumerate(tips):
+        if i in used:
+            continue
+        
+        cluster = [tip]
+        used.add(i)
+        
+        for j, other in enumerate(tips):
+            if j in used:
+                continue
+            
+            # Check distance
+            dist = math.sqrt(
+                (tip['x_mm'] - other['x_mm'])**2 +
+                (tip['y_mm'] - other['y_mm'])**2
+            )
+            
+            if dist < cluster_threshold_mm:
+                cluster.append(other)
+                used.add(j)
+        
+        clusters.append(cluster)
+    
+    return clusters
+
+
+# === Legacy routes for backwards compatibility ===
+
+@router.post("/api/calibrate", response_model=CalibrateResponse, include_in_schema=False)
+async def legacy_calibrate(request: CalibrateRequest):
+    """Legacy endpoint - no auth required."""
+    # Use 'local' as the API key for legacy requests
+    results = []
+    for camera in request.cameras:
+        try:
+            result = calibrator.calibrate(
+                camera_id=camera.camera_id,
+                image_base64=camera.image
+            )
+            if result.success:
+                calibration_store.save(camera.camera_id, result.calibration_data)
+            results.append(CameraCalibrationResult(
+                camera_id=camera.camera_id,
+                success=result.success,
+                quality=result.quality,
+                overlay_image=result.overlay_image,
+                segment_at_top=result.segment_at_top,
+                error=result.error
+            ))
+        except Exception as e:
+            results.append(CameraCalibrationResult(
+                camera_id=camera.camera_id,
+                success=False,
+                error=str(e)
+            ))
+    return CalibrateResponse(results=results)
+
+
+@router.get("/api/calibrations", include_in_schema=False)
+async def legacy_list_calibrations():
+    """Legacy endpoint."""
+    return calibration_store.list_all()

@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Quick test of the Detection API components.
+DartDetect API - Component Tests
 """
 import sys
 import os
 
-# Add parent to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 
 def test_yolo_models():
     """Test that YOLO models load correctly."""
@@ -116,12 +116,12 @@ def test_scoring():
         assert result['zone'] in ['inner_bull', 'bullseye'], f"Expected bullseye, got {result['zone']}"
         print("✓ Bullseye scoring works")
         
-        # Test triple 20 area (roughly 100mm up from center)
+        # Test triple 20 area
         result = scoring_system.score_from_dartboard_coords(0, -100)
         print(f"Top area (0,-100mm): {result}")
         print("✓ Outer scoring works")
         
-        # Test miss (way outside)
+        # Test miss
         result = scoring_system.score_from_dartboard_coords(200, 200)
         print(f"Far outside (200,200mm): {result}")
         print("✓ Miss detection works")
@@ -135,77 +135,32 @@ def test_scoring():
     return True
 
 
-def test_tracker():
-    """Test the dart tracker."""
+def test_api_stateless():
+    """Test that API is stateless."""
     print("\n" + "=" * 60)
-    print("Testing Dart Tracker")
+    print("Testing Stateless Design")
     print("=" * 60)
     
     try:
-        from app.core.dart_tracker import tracker_manager
-        from app.core.scoring import scoring_system
+        from app.api.routes import cluster_tips
         
-        # Get a tracker for test board
-        tracker = tracker_manager.get_tracker("test-board")
-        print(f"✓ Created tracker for 'test-board'")
-        
-        # Simulate a detection
-        fake_tips = [
-            {'camera_id': 'cam1', 'x_mm': 0, 'y_mm': -100, 'confidence': 0.95, 'x_px': 500, 'y_px': 300},
-            {'camera_id': 'cam2', 'x_mm': 2, 'y_mm': -98, 'confidence': 0.92, 'x_px': 510, 'y_px': 305},
+        # Test tip clustering
+        tips = [
+            {'x_mm': 0, 'y_mm': -100, 'confidence': 0.95, 'camera_id': 'cam1'},
+            {'x_mm': 2, 'y_mm': -98, 'confidence': 0.92, 'camera_id': 'cam2'},
+            {'x_mm': 50, 'y_mm': 50, 'confidence': 0.88, 'camera_id': 'cam1'},
         ]
         
-        result = tracker.process_detection(
-            detected_tips=fake_tips,
-            scoring_func=lambda x, y: scoring_system.score_from_dartboard_coords(x, y)
-        )
+        clusters = cluster_tips(tips)
+        print(f"Input: 3 tips from 2 cameras")
+        print(f"Output: {len(clusters)} clusters")
         
-        print(f"✓ Processed detection")
-        print(f"  Detection ID: {result.detection_id}")
-        print(f"  New dart: {result.new_dart}")
-        print(f"  Dart count: {result.dart_count}")
+        assert len(clusters) == 2, f"Expected 2 clusters, got {len(clusters)}"
+        print("✓ Tip clustering works (same dart from multiple cameras grouped)")
         
-        # Process again - should NOT create new dart (same position)
-        result2 = tracker.process_detection(
-            detected_tips=fake_tips,
-            scoring_func=lambda x, y: scoring_system.score_from_dartboard_coords(x, y)
-        )
-        
-        if result2.new_dart is None:
-            print("✓ Correctly identified existing dart (no new dart)")
-        else:
-            print("✗ Incorrectly created new dart for same position")
-            return False
-        
-        # Add a different dart
-        fake_tips_2 = [
-            {'camera_id': 'cam1', 'x_mm': 50, 'y_mm': 50, 'confidence': 0.90, 'x_px': 600, 'y_px': 400},
-        ]
-        
-        result3 = tracker.process_detection(
-            detected_tips=fake_tips + fake_tips_2,  # Both darts visible
-            scoring_func=lambda x, y: scoring_system.score_from_dartboard_coords(x, y)
-        )
-        
-        if result3.new_dart is not None:
-            print(f"✓ Detected new dart: {result3.new_dart.score} points")
-        else:
-            print("✗ Failed to detect new dart")
-            return False
-        
-        print(f"  Total darts on board: {result3.dart_count}")
-        
-        # Test reset
-        tracker.reset()
-        if tracker.dart_count == 0:
-            print("✓ Board reset works")
-        else:
-            print("✗ Reset failed")
-            return False
-        
-        # Clean up
-        tracker_manager.remove_board("test-board")
-        print("✓ Board removed")
+        # Verify first cluster has 2 tips (same dart)
+        assert len(clusters[0]) == 2, "First cluster should have 2 tips"
+        print("✓ Multi-camera consensus working")
         
     except Exception as e:
         print(f"✗ Error: {e}")
@@ -219,7 +174,7 @@ def test_tracker():
 def main():
     """Run all tests."""
     print("\n" + "=" * 60)
-    print("DART DETECTION API - COMPONENT TESTS")
+    print("DARTDETECT API - COMPONENT TESTS")
     print("=" * 60)
     
     results = []
@@ -228,7 +183,7 @@ def main():
     results.append(("Calibration Detector", test_calibration_detector()))
     results.append(("Tip Detector", test_tip_detector()))
     results.append(("Scoring System", test_scoring()))
-    results.append(("Dart Tracker", test_tracker()))
+    results.append(("Stateless Design", test_api_stateless()))
     
     print("\n" + "=" * 60)
     print("SUMMARY")
