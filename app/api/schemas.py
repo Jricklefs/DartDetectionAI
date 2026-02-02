@@ -12,11 +12,8 @@ from datetime import datetime
 
 class CameraImage(BaseModel):
     """Single camera image"""
-    camera_id: str = Field(..., alias="cameraId", description="Unique identifier for this camera")
+    camera_id: str = Field(..., description="Unique identifier for this camera")
     image: str = Field(..., description="Base64 encoded image data")
-    
-    class Config:
-        populate_by_name = True
 
 
 class CalibrateRequest(BaseModel):

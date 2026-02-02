@@ -622,31 +622,31 @@ class DartboardCalibrator:
             cv2.ellipse(overlay, 
                        (int(cal.outer_double_ellipse[0][0]), int(cal.outer_double_ellipse[0][1])),
                        (int(cal.outer_double_ellipse[1][0]/2), int(cal.outer_double_ellipse[1][1]/2)),
-                       cal.outer_double_ellipse[2], 0, 360, (0, 0, 255), 3)
+                       cal.outer_double_ellipse[2], 0, 360, (255, 0, 255), 2)
         
         if cal.inner_double_ellipse:
             cv2.ellipse(overlay,
                        (int(cal.inner_double_ellipse[0][0]), int(cal.inner_double_ellipse[0][1])),
                        (int(cal.inner_double_ellipse[1][0]/2), int(cal.inner_double_ellipse[1][1]/2)),
-                       cal.inner_double_ellipse[2], 0, 360, (0, 0, 200), 2)
+                       cal.inner_double_ellipse[2], 0, 360, (255, 255, 0), 1)
         
         if cal.outer_triple_ellipse:
             cv2.ellipse(overlay,
                        (int(cal.outer_triple_ellipse[0][0]), int(cal.outer_triple_ellipse[0][1])),
                        (int(cal.outer_triple_ellipse[1][0]/2), int(cal.outer_triple_ellipse[1][1]/2)),
-                       cal.outer_triple_ellipse[2], 0, 360, (0, 255, 0), 3)
+                       cal.outer_triple_ellipse[2], 0, 360, (0, 255, 0), 2)
         
         if cal.inner_triple_ellipse:
             cv2.ellipse(overlay,
                        (int(cal.inner_triple_ellipse[0][0]), int(cal.inner_triple_ellipse[0][1])),
                        (int(cal.inner_triple_ellipse[1][0]/2), int(cal.inner_triple_ellipse[1][1]/2)),
-                       cal.inner_triple_ellipse[2], 0, 360, (0, 200, 0), 2)
+                       cal.inner_triple_ellipse[2], 0, 360, (0, 255, 0), 1)
         
         if cal.bull_ellipse:
             cv2.ellipse(overlay,
                        (int(cal.bull_ellipse[0][0]), int(cal.bull_ellipse[0][1])),
                        (int(cal.bull_ellipse[1][0]/2), int(cal.bull_ellipse[1][1]/2)),
-                       cal.bull_ellipse[2], 0, 360, (255, 0, 0), 2)
+                       cal.bull_ellipse[2], 0, 360, (255, 0, 0), 1)
         
         if cal.bullseye_ellipse:
             cv2.ellipse(overlay,
@@ -654,19 +654,8 @@ class DartboardCalibrator:
                        (int(cal.bullseye_ellipse[1][0]/2), int(cal.bullseye_ellipse[1][1]/2)),
                        cal.bullseye_ellipse[2], 0, 360, (255, 0, 255), -1)
         
-        # Draw detected calibration points
-        for x, y, conf in cal_points:
-            cv2.circle(overlay, (int(x), int(y)), 5, (0, 0, 255), -1)
-        for x, y, conf in cal3_points:
-            cv2.circle(overlay, (int(x), int(y)), 5, (0, 0, 180), -1)
-        for x, y, conf in cal1_points:
-            cv2.circle(overlay, (int(x), int(y)), 5, (0, 255, 0), -1)
-        for x, y, conf in cal2_points:
-            cv2.circle(overlay, (int(x), int(y)), 5, (0, 180, 0), -1)
-        for x, y, conf in bull_points:
-            cv2.circle(overlay, (int(x), int(y)), 8, (255, 255, 0), -1)
-        for x, y, conf in twenty_points:
-            cv2.circle(overlay, (int(x), int(y)), 10, (255, 255, 0), 2)
+        # Calibration point dots removed for cleaner overlay
+        # (Detection points are used for fitting but not displayed)
         
         # Draw center marker
         cv2.drawMarker(overlay, (int(cal.center[0]), int(cal.center[1])), 
@@ -690,9 +679,9 @@ class DartboardCalibrator:
         # Draw segment numbers using simple angular positioning
         # This is more reliable than trying to match detected boundary lines
         if cal.outer_double_ellipse:
-            # Create text ellipse slightly outside the double ring
-            text_w = cal.outer_double_ellipse[1][0] * 1.12
-            text_h = cal.outer_double_ellipse[1][1] * 1.12
+            # Create text ellipse in the middle of the number ring area (between outer double and board edge)
+            text_w = cal.outer_double_ellipse[1][0] * 1.08
+            text_h = cal.outer_double_ellipse[1][1] * 1.08
             text_ellipse = (cal.outer_double_ellipse[0], (text_w, text_h), cal.outer_double_ellipse[2])
             
             # Standard dartboard: 20 at top, segments go clockwise
@@ -735,8 +724,10 @@ class DartboardCalibrator:
                 
                 text_str = str(seg)
                 (tw, th), _ = cv2.getTextSize(text_str, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+                # Bright green for 20, white for all others
+                text_color = (0, 255, 0) if seg == 20 else (255, 255, 255)
                 cv2.putText(overlay, text_str, (text_pt[0] - tw//2, text_pt[1] + th//2),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, text_color, 2)
         
         # Add info text
         total_points = len(cal_points) + len(cal1_points) + len(cal2_points) + len(cal3_points)
