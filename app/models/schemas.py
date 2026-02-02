@@ -50,6 +50,7 @@ class CalibrationInfo(BaseModel):
 class DetectRequest(BaseModel):
     """Request to detect dart tips in images"""
     cameras: List[CameraImage] = Field(..., description="Images from calibrated cameras")
+    rotation_offset_degrees: Optional[float] = Field(None, description="Board rotation offset in degrees (20 segment angle)")
 
 
 class DetectedTip(BaseModel):
@@ -105,4 +106,4 @@ class DartScore(BaseModel):
     segment: int  
     multiplier: int  
     zone: str  
-    score: int 
+    score: int

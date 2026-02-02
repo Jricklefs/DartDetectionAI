@@ -219,8 +219,9 @@ async def detect_tips(
         avg_conf = sum(t['confidence'] for t in cluster) / len(cluster)
         cameras_seen = list(set(t['camera_id'] for t in cluster))
         
-        # Calculate score
-        score_info = scoring_system.score_from_dartboard_coords(avg_x, avg_y)
+        # Calculate score with rotation offset from Mark 20
+        rotation_rad = (request.rotation_offset_degrees or 0.0) * (3.14159265 / 180.0)
+        score_info = scoring_system.score_from_dartboard_coords(avg_x, avg_y, rotation_rad)
         
         detected_tips.append(DetectedTip(
             x_mm=round(avg_x, 2),
