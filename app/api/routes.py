@@ -148,6 +148,79 @@ async def delete_calibration(
     raise HTTPException(status_code=404, detail=f"Camera '{camera_id}' not found")
 
 
+@router.post("/v1/calibrations/{camera_id}/mark20")
+async def mark_segment_20(
+    camera_id: str,
+    x: float,
+    y: float,
+    api_key: str = Depends(verify_api_key)
+):
+    """
+    Mark where segment 20 is located on the calibration overlay.
+    
+    - x, y: Normalized coordinates (0-1) where user clicked on overlay image
+    - Updates segment_20_index and regenerates overlay with correct labels
+    """
+    storage_key = f"{api_key}:{camera_id}"
+    calibration_data = calibration_store.get(storage_key)
+    
+    if calibration_data is None:
+        raise HTTPException(status_code=404, detail=f"Camera '{camera_id}' not calibrated")
+    
+    # Get center and segment angles from calibration
+    center = calibration_data.get('center')
+    segment_angles = calibration_data.get('segment_angles', [])
+    image_size = calibration_data.get('image_size', (640, 480))
+    
+    if not center or len(segment_angles) < 20:
+        raise HTTPException(status_code=400, detail="Calibration data incomplete - please recalibrate")
+    
+    # Convert normalized coordinates to pixel coordinates
+    px = x * image_size[0]
+    py = y * image_size[1]
+    
+    # Calculate angle from center to clicked point
+    dx = px - center[0]
+    dy = py - center[1]
+    click_angle = math.atan2(dy, dx)
+    
+    # Normalize angle to 0-2pi
+    if click_angle < 0:
+        click_angle += 2 * math.pi
+    
+    # Find which segment the click falls into
+    normalized_angles = sorted([a if a >= 0 else a + 2 * math.pi for a in segment_angles])
+    
+    segment_20_index = 0
+    for i, angle in enumerate(normalized_angles):
+        next_angle = normalized_angles[(i + 1) % len(normalized_angles)]
+        if next_angle < angle:
+            next_angle += 2 * math.pi
+        
+        check_angle = click_angle
+        if check_angle < angle:
+            check_angle += 2 * math.pi
+        
+        if angle <= check_angle < next_angle:
+            segment_20_index = i
+            break
+    
+    # Update calibration data
+    calibration_data['segment_20_index'] = segment_20_index
+    calibration_store.save(storage_key, calibration_data)
+    
+    # Calculate the angle where 20 is (for DartGame API to store)
+    twenty_angle_rad = normalized_angles[segment_20_index]
+    twenty_angle_deg = math.degrees(twenty_angle_rad)
+    
+    return {
+        "camera_id": camera_id,
+        "segment_20_index": segment_20_index,
+        "twenty_angle": twenty_angle_deg,
+        "message": "Segment 20 marked successfully. Overlay labels will update on next calibration display."
+    }
+
+
 # === Detection Endpoint (Stateless) ===
 
 @router.post("/v1/detect", response_model=DetectResponse)
@@ -315,6 +388,57 @@ async def legacy_calibrate(request: CalibrateRequest):
                 error=str(e)
             ))
     return CalibrateResponse(results=results)
+
+
+@router.post("/api/calibrations/{camera_id}/mark20", include_in_schema=False)
+async def legacy_mark_segment_20(camera_id: str, x: float, y: float):
+    """Legacy Mark 20 endpoint - no auth required."""
+    calibration_data = calibration_store.get(camera_id)
+    
+    if calibration_data is None:
+        raise HTTPException(status_code=404, detail=f"Camera '{camera_id}' not calibrated")
+    
+    center = calibration_data.get('center')
+    segment_angles = calibration_data.get('segment_angles', [])
+    image_size = calibration_data.get('image_size', (640, 480))
+    
+    if not center or len(segment_angles) < 20:
+        raise HTTPException(status_code=400, detail="Calibration data incomplete")
+    
+    px = x * image_size[0]
+    py = y * image_size[1]
+    
+    dx = px - center[0]
+    dy = py - center[1]
+    click_angle = math.atan2(dy, dx)
+    if click_angle < 0:
+        click_angle += 2 * math.pi
+    
+    normalized_angles = sorted([a if a >= 0 else a + 2 * math.pi for a in segment_angles])
+    
+    segment_20_index = 0
+    for i, angle in enumerate(normalized_angles):
+        next_angle = normalized_angles[(i + 1) % len(normalized_angles)]
+        if next_angle < angle:
+            next_angle += 2 * math.pi
+        check_angle = click_angle
+        if check_angle < angle:
+            check_angle += 2 * math.pi
+        if angle <= check_angle < next_angle:
+            segment_20_index = i
+            break
+    
+    calibration_data['segment_20_index'] = segment_20_index
+    calibration_store.save(camera_id, calibration_data)
+    
+    twenty_angle_rad = normalized_angles[segment_20_index]
+    twenty_angle_deg = math.degrees(twenty_angle_rad)
+    
+    return {
+        "camera_id": camera_id,
+        "segment_20_index": segment_20_index,
+        "twenty_angle": twenty_angle_deg
+    }
 
 
 @router.get("/api/calibrations", include_in_schema=False)
