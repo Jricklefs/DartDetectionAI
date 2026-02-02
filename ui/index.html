@@ -135,6 +135,51 @@
 </head>
 <body>
     <h1>🎯 DartDetectionAI Test UI</h1>
+
+    <div class="section">
+        <h2>0. Focus Camera</h2>
+        <p style="color: #888; margin-bottom: 15px;">Adjust your camera's focus ring while watching the score. Aim for 70+ before calibrating.</p>
+        
+        <div class="form-group">
+            <label for="focusCameraSelect">Select Camera</label>
+            <select id="focusCameraSelect" onchange="updateFocusCamera()">
+                <option value="">-- Select Camera --</option>
+            </select>
+        </div>
+        
+        <div style="display: flex; gap: 10px; margin-bottom: 15px;">
+            <button id="startFocusBtn" onclick="startFocusCheck()">▶️ Start Focus Check</button>
+            <button id="stopFocusBtn" onclick="stopFocusCheck()" style="display:none; background: #e74c3c;">⏹️ Stop</button>
+        </div>
+        
+        <div style="display: grid; grid-template-columns: 1fr 300px; gap: 20px;">
+            <div class="image-box">
+                <h3>Live Preview</h3>
+                <img id="focusPreview" src="" alt="Start focus check to see preview" style="display:none; max-width:100%;">
+                <p id="focusPlaceholder" style="color:#666; padding: 50px;">Select a camera and click Start</p>
+            </div>
+            <div style="background: #0f3460; border-radius: 8px; padding: 20px; text-align: center;">
+                <div style="font-size: 64px; font-weight: bold;" id="focusScoreValue">--</div>
+                <div style="color: #888;">Focus Score</div>
+                <div id="focusQualityBadge" style="display:none; margin-top:10px; padding: 8px 16px; border-radius: 20px; font-weight: bold;"></div>
+                
+                <div style="margin-top: 20px; text-align: left;">
+                    <div style="margin-bottom: 10px;">
+                        <div style="display:flex; justify-content:space-between; font-size:12px;"><span>Laplacian</span><span id="focusLapVal">--</span></div>
+                        <div style="height:6px; background:#1a1a2e; border-radius:3px;"><div id="focusLapBar" style="height:100%; width:0%; background:#3498db; border-radius:3px;"></div></div>
+                    </div>
+                    <div style="margin-bottom: 10px;">
+                        <div style="display:flex; justify-content:space-between; font-size:12px;"><span>Tenengrad</span><span id="focusTenVal">--</span></div>
+                        <div style="height:6px; background:#1a1a2e; border-radius:3px;"><div id="focusTenBar" style="height:100%; width:0%; background:#9b59b6; border-radius:3px;"></div></div>
+                    </div>
+                </div>
+                
+                <div id="focusRecommendation" style="margin-top:15px; padding:10px; background:#1a1a2e; border-radius:5px; font-size:13px;">
+                    Aim for 70+ before calibrating
+                </div>
+            </div>
+        </div>
+    </div>
     
     <div class="section">
         <h2>1. Calibrate Camera</h2>
@@ -584,6 +629,69 @@
             el.className = 'status ' + type;
             el.textContent = message;
         }
+
+                // === Focus Tool ===
+        let focusInterval = null;
+        let focusCameraIndex = null;
+
+        async function loadFocusCameras() {
+            try {
+                const res = await fetch("/cameras");
+                const data = await res.json();
+                const select = document.getElementById("focusCameraSelect");
+                select.innerHTML = "<option value=''>-- Select Camera --</option>";
+                if (data.cameras) {
+                    data.cameras.forEach(cam => {
+                        select.innerHTML += "<option value='" + cam.index + "'>Camera " + cam.index + " (" + cam.width + "x" + cam.height + ")</option>";
+                    });
+                }
+            } catch(e) { console.error("Failed to load cameras", e); }
+        }
+
+        function updateFocusCamera() {
+            focusCameraIndex = document.getElementById("focusCameraSelect").value;
+        }
+
+        function startFocusCheck() {
+            if (!focusCameraIndex) { alert("Select a camera first"); return; }
+            document.getElementById("startFocusBtn").style.display = "none";
+            document.getElementById("stopFocusBtn").style.display = "inline-block";
+            document.getElementById("focusPlaceholder").style.display = "none";
+            document.getElementById("focusPreview").style.display = "block";
+            updateFocusFrame();
+            focusInterval = setInterval(updateFocusFrame, 500);
+        }
+
+        function stopFocusCheck() {
+            if (focusInterval) { clearInterval(focusInterval); focusInterval = null; }
+            document.getElementById("startFocusBtn").style.display = "inline-block";
+            document.getElementById("stopFocusBtn").style.display = "none";
+        }
+
+        async function updateFocusFrame() {
+            if (!focusCameraIndex) return;
+            try {
+                const res = await fetch("/cameras/" + focusCameraIndex + "/focus");
+                if (!res.ok) throw new Error("Focus failed");
+                const data = await res.json();
+                const f = data.focus;
+                document.getElementById("focusScoreValue").textContent = Math.round(f.combined_score);
+                document.getElementById("focusScoreValue").style.color = f.combined_score >= 70 ? "#27ae60" : f.combined_score >= 40 ? "#f39c12" : "#e74c3c";
+                const badge = document.getElementById("focusQualityBadge");
+                badge.style.display = "inline-block";
+                badge.textContent = f.quality.toUpperCase();
+                badge.style.background = f.quality === "excellent" ? "#27ae60" : f.quality === "good" ? "#2ecc71" : f.quality === "fair" ? "#f39c12" : "#e74c3c";
+                document.getElementById("focusLapBar").style.width = Math.min(100, f.laplacian / 20) + "%";
+                document.getElementById("focusTenBar").style.width = Math.min(100, f.tenengrad / 200) + "%";
+                document.getElementById("focusLapVal").textContent = Math.round(f.laplacian);
+                document.getElementById("focusTenVal").textContent = Math.round(f.tenengrad);
+                document.getElementById("focusRecommendation").textContent = data.recommendation;
+                document.getElementById("focusPreview").src = "/cameras/" + focusCameraIndex + "/focus/stream?t=" + Date.now();
+            } catch(e) { console.error("Focus error", e); }
+        }
+
+        loadFocusCameras();
+
 
         // Initial load
         loadCalibrations();

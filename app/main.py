@@ -7,6 +7,7 @@ import os
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pathlib import Path
 
 from app.api.routes import router
@@ -48,10 +49,26 @@ app.add_middleware(
 # Include API routes
 app.include_router(router)
 
+# Static files directory
+static_path = Path(__file__).parent / "static"
+
 # Serve test UI (only for development)
 ui_path = Path(__file__).parent.parent / "ui"
 if ui_path.exists():
     app.mount("/ui", StaticFiles(directory=str(ui_path), html=True), name="ui")
+
+# Serve static files
+if static_path.exists():
+    app.mount("/static", StaticFiles(directory=str(static_path), html=True), name="static")
+
+
+@app.get("/focus")
+async def focus_helper():
+    """Camera focus helper tool."""
+    focus_file = static_path / "focus.html"
+    if focus_file.exists():
+        return FileResponse(focus_file)
+    return {"error": "Focus helper not found"}
 
 
 @app.get("/")
@@ -61,5 +78,6 @@ async def root():
         "name": API_TITLE,
         "version": API_VERSION,
         "docs": "/docs",
-        "health": "/health"
+        "health": "/health",
+        "focus_helper": "/focus"
     }

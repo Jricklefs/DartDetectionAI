@@ -1,0 +1,342 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Camera Focus Helper - DartDetect</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #1a1a2e;
+            color: #eee;
+            min-height: 100vh;
+            padding: 20px;
+        }
+        .container { max-width: 1200px; margin: 0 auto; }
+        h1 { text-align: center; margin-bottom: 20px; color: #4ecdc4; }
+        
+        .controls {
+            display: flex;
+            gap: 15px;
+            margin-bottom: 20px;
+            flex-wrap: wrap;
+            justify-content: center;
+            align-items: center;
+        }
+        select, button {
+            padding: 10px 20px;
+            font-size: 16px;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+        }
+        select { background: #2d2d44; color: #fff; }
+        button { background: #4ecdc4; color: #1a1a2e; font-weight: bold; }
+        button:hover { background: #3dbdb5; }
+        button.stop { background: #e74c3c; color: #fff; }
+        button:disabled { opacity: 0.5; cursor: not-allowed; }
+        
+        .main-content {
+            display: grid;
+            grid-template-columns: 1fr 350px;
+            gap: 20px;
+        }
+        @media (max-width: 900px) {
+            .main-content { grid-template-columns: 1fr; }
+        }
+        
+        .video-container {
+            background: #2d2d44;
+            border-radius: 12px;
+            overflow: hidden;
+            position: relative;
+        }
+        #focusFrame {
+            width: 100%;
+            height: auto;
+            display: block;
+        }
+        .no-camera {
+            padding: 100px 20px;
+            text-align: center;
+            color: #888;
+        }
+        
+        .metrics-panel {
+            background: #2d2d44;
+            border-radius: 12px;
+            padding: 20px;
+        }
+        .score-display {
+            text-align: center;
+            margin-bottom: 25px;
+        }
+        .score-value {
+            font-size: 72px;
+            font-weight: bold;
+            line-height: 1;
+        }
+        .score-label { font-size: 18px; color: #888; margin-top: 5px; }
+        .quality-badge {
+            display: inline-block;
+            padding: 8px 20px;
+            border-radius: 20px;
+            font-weight: bold;
+            margin-top: 10px;
+        }
+        .quality-excellent { background: #27ae60; }
+        .quality-good { background: #2ecc71; }
+        .quality-fair { background: #f39c12; }
+        .quality-poor { background: #e74c3c; }
+        
+        .metric-bars { margin-top: 20px; }
+        .metric {
+            margin-bottom: 15px;
+        }
+        .metric-header {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 5px;
+            font-size: 14px;
+        }
+        .metric-bar {
+            height: 8px;
+            background: #1a1a2e;
+            border-radius: 4px;
+            overflow: hidden;
+        }
+        .metric-fill {
+            height: 100%;
+            border-radius: 4px;
+            transition: width 0.3s ease;
+        }
+        .metric-fill.laplacian { background: #3498db; }
+        .metric-fill.tenengrad { background: #9b59b6; }
+        .metric-fill.brenner { background: #e67e22; }
+        
+        .recommendation {
+            margin-top: 25px;
+            padding: 15px;
+            background: #1a1a2e;
+            border-radius: 8px;
+            text-align: center;
+            font-size: 14px;
+            line-height: 1.5;
+        }
+        
+        .instructions {
+            margin-top: 20px;
+            padding: 20px;
+            background: #2d2d44;
+            border-radius: 12px;
+        }
+        .instructions h3 { margin-bottom: 10px; color: #4ecdc4; }
+        .instructions ol { padding-left: 20px; }
+        .instructions li { margin-bottom: 8px; line-height: 1.5; }
+        
+        .status {
+            text-align: center;
+            padding: 10px;
+            font-size: 14px;
+            color: #888;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>📷 Camera Focus Helper</h1>
+        
+        <div class="controls">
+            <select id="cameraSelect">
+                <option value="">Select Camera...</option>
+            </select>
+            <button id="startBtn" onclick="startFocus()">Start Focus Check</button>
+            <button id="stopBtn" class="stop" onclick="stopFocus()" style="display:none;">Stop</button>
+        </div>
+        
+        <div class="main-content">
+            <div class="video-container">
+                <img id="focusFrame" style="display:none;" />
+                <div id="noCamera" class="no-camera">
+                    <p>Select a camera and click "Start Focus Check"</p>
+                    <p style="margin-top:10px;font-size:14px;">Adjust your camera's focus ring while watching the score</p>
+                </div>
+            </div>
+            
+            <div class="metrics-panel">
+                <div class="score-display">
+                    <div class="score-value" id="scoreValue">--</div>
+                    <div class="score-label">Focus Score</div>
+                    <div class="quality-badge" id="qualityBadge" style="display:none;">--</div>
+                </div>
+                
+                <div class="metric-bars">
+                    <div class="metric">
+                        <div class="metric-header">
+                            <span>Laplacian (Edge Sharpness)</span>
+                            <span id="lapValue">--</span>
+                        </div>
+                        <div class="metric-bar">
+                            <div class="metric-fill laplacian" id="lapBar" style="width:0%"></div>
+                        </div>
+                    </div>
+                    <div class="metric">
+                        <div class="metric-header">
+                            <span>Tenengrad (Gradient)</span>
+                            <span id="tenValue">--</span>
+                        </div>
+                        <div class="metric-bar">
+                            <div class="metric-fill tenengrad" id="tenBar" style="width:0%"></div>
+                        </div>
+                    </div>
+                    <div class="metric">
+                        <div class="metric-header">
+                            <span>Brenner</span>
+                            <span id="breValue">--</span>
+                        </div>
+                        <div class="metric-bar">
+                            <div class="metric-fill brenner" id="breBar" style="width:0%"></div>
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="recommendation" id="recommendation">
+                    Aim for a focus score of 70+ before calibrating
+                </div>
+            </div>
+        </div>
+        
+        <div class="instructions">
+            <h3>How to Focus Your Camera</h3>
+            <ol>
+                <li>Point your camera at the dartboard</li>
+                <li>Click "Start Focus Check" to begin live monitoring</li>
+                <li>Slowly rotate the focus ring on your camera lens</li>
+                <li>Watch the score - stop when it peaks (aim for 70+)</li>
+                <li>The dartboard wires should look sharp, not blurry</li>
+                <li>Once focused, proceed to calibration</li>
+            </ol>
+        </div>
+        
+        <div class="status" id="status"></div>
+    </div>
+
+    <script>
+        let focusInterval = null;
+        let currentCamera = null;
+        const API_BASE = '';  // Same origin
+        
+        async function loadCameras() {
+            try {
+                const res = await fetch(`${API_BASE}/cameras`);
+                const data = await res.json();
+                const select = document.getElementById('cameraSelect');
+                select.innerHTML = '<option value="">Select Camera...</option>';
+                
+                if (data.cameras && data.cameras.length > 0) {
+                    data.cameras.forEach(cam => {
+                        const opt = document.createElement('option');
+                        opt.value = cam.index;
+                        opt.textContent = `Camera ${cam.index} (${cam.width}x${cam.height})`;
+                        select.appendChild(opt);
+                    });
+                } else {
+                    const opt = document.createElement('option');
+                    opt.value = "";
+                    opt.textContent = "No cameras found";
+                    opt.disabled = true;
+                    select.appendChild(opt);
+                }
+            } catch (e) {
+                console.error('Failed to load cameras:', e);
+                document.getElementById('status').textContent = 'Error loading cameras';
+            }
+        }
+        
+        function startFocus() {
+            const select = document.getElementById('cameraSelect');
+            const camIndex = select.value;
+            if (!camIndex) {
+                alert('Please select a camera first');
+                return;
+            }
+            
+            currentCamera = camIndex;
+            document.getElementById('startBtn').style.display = 'none';
+            document.getElementById('stopBtn').style.display = 'inline-block';
+            document.getElementById('noCamera').style.display = 'none';
+            document.getElementById('focusFrame').style.display = 'block';
+            
+            updateFocus();
+            focusInterval = setInterval(updateFocus, 500);  // Update 2x per second
+        }
+        
+        function stopFocus() {
+            if (focusInterval) {
+                clearInterval(focusInterval);
+                focusInterval = null;
+            }
+            document.getElementById('startBtn').style.display = 'inline-block';
+            document.getElementById('stopBtn').style.display = 'none';
+        }
+        
+        async function updateFocus() {
+            if (!currentCamera) return;
+            
+            try {
+                // Get metrics
+                const res = await fetch(`${API_BASE}/cameras/${currentCamera}/focus`);
+                if (!res.ok) throw new Error('Failed to get focus');
+                const data = await res.json();
+                
+                const focus = data.focus;
+                
+                // Update score
+                document.getElementById('scoreValue').textContent = Math.round(focus.combined_score);
+                document.getElementById('scoreValue').style.color = getScoreColor(focus.combined_score);
+                
+                // Update quality badge
+                const badge = document.getElementById('qualityBadge');
+                badge.style.display = 'inline-block';
+                badge.textContent = focus.quality.toUpperCase();
+                badge.className = 'quality-badge quality-' + focus.quality;
+                
+                // Update metric bars (normalize to 0-100%)
+                const lapNorm = Math.min(100, (focus.laplacian / 2000) * 100);
+                const tenNorm = Math.min(100, (focus.tenengrad / 20000) * 100);
+                const breNorm = Math.min(100, (focus.brenner / 5000) * 100);
+                
+                document.getElementById('lapBar').style.width = lapNorm + '%';
+                document.getElementById('tenBar').style.width = tenNorm + '%';
+                document.getElementById('breBar').style.width = breNorm + '%';
+                
+                document.getElementById('lapValue').textContent = Math.round(focus.laplacian);
+                document.getElementById('tenValue').textContent = Math.round(focus.tenengrad);
+                document.getElementById('breValue').textContent = Math.round(focus.brenner);
+                
+                // Update recommendation
+                document.getElementById('recommendation').textContent = data.recommendation;
+                
+                // Update frame with overlay
+                const frame = document.getElementById('focusFrame');
+                frame.src = `${API_BASE}/cameras/${currentCamera}/focus/stream?t=${Date.now()}`;
+                
+            } catch (e) {
+                console.error('Focus update error:', e);
+                document.getElementById('status').textContent = 'Error: ' + e.message;
+            }
+        }
+        
+        function getScoreColor(score) {
+            if (score >= 75) return '#27ae60';
+            if (score >= 50) return '#2ecc71';
+            if (score >= 25) return '#f39c12';
+            return '#e74c3c';
+        }
+        
+        // Load cameras on page load
+        loadCameras();
+    </script>
+</body>
+</html>

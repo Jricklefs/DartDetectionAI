@@ -29,6 +29,7 @@ class CameraCalibrationResult(BaseModel):
     overlay_image: Optional[str] = Field(None, description="Base64 image with overlay")
     segment_at_top: Optional[int] = Field(None, description="Segment at 12 o'clock")
     error: Optional[str] = None
+    calibration_data: Optional[dict] = Field(None, description="Calibration data for storage")
 
 
 class CalibrateResponse(BaseModel):
@@ -68,6 +69,7 @@ class CameraDetectionResult(BaseModel):
     camera_id: str
     tips_detected: int
     error: Optional[str] = None
+    calibration_data: Optional[dict] = Field(None, description="Calibration data for storage")
 
 
 class DetectResponse(BaseModel):
@@ -94,3 +96,13 @@ class UsageInfo(BaseModel):
     requests_today: int
     requests_total: int
     last_request: Optional[datetime] = None
+  
+class DartPosition(BaseModel):  
+    x_mm: float  
+    y_mm: float  
+  
+class DartScore(BaseModel):  
+    segment: int  
+    multiplier: int  
+    zone: str  
+    score: int 

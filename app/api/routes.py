@@ -28,7 +28,7 @@ from app.core.scoring import scoring_system
 router = APIRouter()
 
 # Configuration
-REQUIRE_AUTH = os.getenv("REQUIRE_AUTH", "true").lower() == "true"
+REQUIRE_AUTH = os.getenv("REQUIRE_AUTH", "false").lower() == "true"
 API_KEYS = set(os.getenv("API_KEYS", "").split(",")) if os.getenv("API_KEYS") else set()
 
 # Shared calibrator instance
@@ -320,3 +320,166 @@ async def legacy_calibrate(request: CalibrateRequest):
 async def legacy_list_calibrations():
     """Legacy endpoint."""
     return calibration_store.list_all()
+ 
+
+# === Camera Endpoints ===
+
+@router.get("/cameras")
+async def list_cameras():
+    """List available cameras on this machine."""
+    import cv2
+    cameras = []
+    for i in range(5):
+        cap = cv2.VideoCapture(i, cv2.CAP_DSHOW)
+        if cap.isOpened():
+            ret, _ = cap.read()
+            cameras.append({
+                "index": i,
+                "camera_id": f"cam{i}",
+                "connected": ret,
+                "width": int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
+                "height": int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            })
+            cap.release()
+    return {"cameras": cameras}
+
+
+@router.get("/cameras/{camera_index}/frame")
+async def get_camera_frame(camera_index: int):
+    """Capture a frame from the specified camera."""
+    import cv2
+    from fastapi.responses import Response
+    
+    cap = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
+    if not cap.isOpened():
+        raise HTTPException(status_code=404, detail=f"Camera {camera_index} not found")
+    
+    ret, frame = cap.read()
+    cap.release()
+    
+    if not ret:
+        raise HTTPException(status_code=500, detail="Failed to capture frame")
+    
+    _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    return Response(content=buffer.tobytes(), media_type="image/jpeg")
+
+
+@router.get("/cameras/{camera_index}/snapshot")
+async def get_camera_snapshot_base64(camera_index: int):
+    """Capture a frame and return as base64 (for calibration)."""
+    import cv2
+    import base64
+    
+    cap = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
+    if not cap.isOpened():
+        raise HTTPException(status_code=404, detail=f"Camera {camera_index} not found")
+    
+    ret, frame = cap.read()
+    cap.release()
+    
+    if not ret:
+        raise HTTPException(status_code=500, detail="Failed to capture frame")
+    
+    _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    b64 = base64.b64encode(buffer).decode('utf-8')
+    
+    return {
+        "camera_id": f"cam{camera_index}",
+        "image": b64,
+        "width": frame.shape[1],
+        "height": frame.shape[0]
+    }
+
+# === Focus Tool Endpoints ===
+
+@router.get("/cameras/{camera_index}/focus")
+async def get_focus_score(
+    camera_index: int,
+    center_x: Optional[int] = None,
+    center_y: Optional[int] = None,
+    roi_size: int = 400
+):
+    """
+    Get focus quality score for a camera.
+    
+    Returns metrics to help adjust camera focus before calibration.
+    Higher scores = better focus. Aim for 70+ before calibrating.
+    
+    Args:
+        camera_index: Camera index (0, 1, 2, etc.)
+        center_x: X coordinate of focus area (defaults to center)
+        center_y: Y coordinate of focus area (defaults to center)
+        roi_size: Size of region to analyze (default 400px)
+    """
+    import cv2
+    from app.core.focus_tool import calculate_focus_score
+    
+    cap = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
+    if not cap.isOpened():
+        raise HTTPException(status_code=404, detail=f"Camera {camera_index} not found")
+    
+    ret, frame = cap.read()
+    cap.release()
+    
+    if not ret:
+        raise HTTPException(status_code=500, detail="Failed to capture frame")
+    
+    center = None
+    if center_x is not None and center_y is not None:
+        center = (center_x, center_y)
+    
+    metrics = calculate_focus_score(frame, center=center, roi_size=roi_size)
+    
+    return {
+        "camera_id": f"cam{camera_index}",
+        "focus": metrics.to_dict(),
+        "recommendation": get_focus_recommendation(metrics.combined_score)
+    }
+
+
+@router.get("/cameras/{camera_index}/focus/stream")
+async def get_focus_frame(
+    camera_index: int,
+    center_x: Optional[int] = None,
+    center_y: Optional[int] = None,
+    roi_size: int = 400
+):
+    """
+    Get a single frame with focus overlay for UI display.
+    Returns JPEG image with focus score visualization.
+    """
+    import cv2
+    from fastapi.responses import Response
+    from app.core.focus_tool import calculate_focus_score, draw_focus_overlay
+    
+    cap = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
+    if not cap.isOpened():
+        raise HTTPException(status_code=404, detail=f"Camera {camera_index} not found")
+    
+    ret, frame = cap.read()
+    cap.release()
+    
+    if not ret:
+        raise HTTPException(status_code=500, detail="Failed to capture frame")
+    
+    center = None
+    if center_x is not None and center_y is not None:
+        center = (center_x, center_y)
+    
+    metrics = calculate_focus_score(frame, center=center, roi_size=roi_size)
+    overlay_frame = draw_focus_overlay(frame, metrics, center=center, roi_size=roi_size)
+    
+    _, buffer = cv2.imencode('.jpg', overlay_frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    return Response(content=buffer.tobytes(), media_type="image/jpeg")
+
+
+def get_focus_recommendation(score: float) -> str:
+    """Get actionable recommendation based on focus score."""
+    if score >= 75:
+        return "Excellent focus! Ready to calibrate."
+    elif score >= 50:
+        return "Good focus. You can calibrate, but try adjusting for better results."
+    elif score >= 25:
+        return "Fair focus. Adjust the camera lens for sharper image."
+    else:
+        return "Poor focus. Rotate the focus ring on your camera lens until the dartboard wires are sharp."
