@@ -687,48 +687,56 @@ class DartboardCalibrator:
                 
                 cv2.line(overlay, inner_pt, outer_pt, (255, 255, 255), 1)
         
-        # Draw segment numbers
-        if cal.outer_double_ellipse and cal.outer_triple_ellipse and len(cal.segment_angles) >= 20:
-            # Text ellipse between outer_double and outer_triple
-            text_w = (cal.outer_double_ellipse[1][0] + cal.outer_triple_ellipse[1][0]) / 2
-            text_h = (cal.outer_double_ellipse[1][1] + cal.outer_triple_ellipse[1][1]) / 2
-            text_center = (
-                (cal.outer_double_ellipse[0][0] + cal.outer_triple_ellipse[0][0]) / 2,
-                (cal.outer_double_ellipse[0][1] + cal.outer_triple_ellipse[0][1]) / 2
-            )
-            text_ellipse = (text_center, (text_w, text_h), cal.outer_double_ellipse[2])
+        # Draw segment numbers using simple angular positioning
+        # This is more reliable than trying to match detected boundary lines
+        if cal.outer_double_ellipse:
+            # Create text ellipse slightly outside the double ring
+            text_w = cal.outer_double_ellipse[1][0] * 1.12
+            text_h = cal.outer_double_ellipse[1][1] * 1.12
+            text_ellipse = (cal.outer_double_ellipse[0], (text_w, text_h), cal.outer_double_ellipse[2])
             
-            def normalize_angle(a):
-                while a < 0:
-                    a += 2 * math.pi
-                while a >= 2 * math.pi:
-                    a -= 2 * math.pi
-                return a
+            # Standard dartboard: 20 at top, segments go clockwise
+            # In image coordinates: up is negative Y, so top is -π/2 radians
+            # segment_20_index tells us how many segments clockwise from the first detected boundary
+            # But for simplicity, we'll use the rotation_offset_deg if available
             
-            sorted_angles = sorted([normalize_angle(a) for a in cal.segment_angles])
+            # Each segment spans 18 degrees (π/10 radians)
+            segment_span = math.pi / 10  # 18 degrees
             
-            for i, seg in enumerate(DARTBOARD_SEGMENTS):
-                boundary_index = (cal.segment_20_index + i) % len(sorted_angles)
-                
-                a1 = sorted_angles[boundary_index]
-                a2 = sorted_angles[(boundary_index + 1) % len(sorted_angles)]
-                
+            # Calculate base angle for segment 20
+            # If we have segment_20_index and segment_angles, use that
+            # Otherwise default to top (-π/2)
+            if len(cal.segment_angles) >= 20:
+                sorted_angles = sorted([a if a >= 0 else a + 2*math.pi for a in cal.segment_angles])
+                # segment_20_index points to the boundary BEFORE segment 20
+                idx = cal.segment_20_index % len(sorted_angles)
+                a1 = sorted_angles[idx]
+                a2 = sorted_angles[(idx + 1) % len(sorted_angles)]
                 if a2 < a1:
                     a2 += 2 * math.pi
-                mid_angle = (a1 + a2) / 2
-                if mid_angle >= 2 * math.pi:
+                base_angle_20 = (a1 + a2) / 2  # Middle of segment 20
+            else:
+                # Default: 20 at top
+                base_angle_20 = -math.pi / 2
+            
+            for i, seg in enumerate(DARTBOARD_SEGMENTS):
+                # Each segment is 18 degrees clockwise from the previous
+                mid_angle = base_angle_20 + i * segment_span
+                
+                # Normalize
+                while mid_angle > math.pi:
                     mid_angle -= 2 * math.pi
-                if mid_angle > math.pi:
-                    mid_angle -= 2 * math.pi
+                while mid_angle < -math.pi:
+                    mid_angle += 2 * math.pi
                 
                 dx = math.cos(mid_angle)
                 dy = math.sin(mid_angle)
                 text_pt = line_ellipse_intersection(cal.center, (dx, dy), text_ellipse)
                 
                 text_str = str(seg)
-                (tw, th), _ = cv2.getTextSize(text_str, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
+                (tw, th), _ = cv2.getTextSize(text_str, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
                 cv2.putText(overlay, text_str, (text_pt[0] - tw//2, text_pt[1] + th//2),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
         
         # Add info text
         total_points = len(cal_points) + len(cal1_points) + len(cal2_points) + len(cal3_points)
