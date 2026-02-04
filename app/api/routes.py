@@ -12,6 +12,8 @@ import math
 import json
 import logging
 import threading
+from datetime import datetime
+from pathlib import Path
 from fastapi import APIRouter, HTTPException, Depends, Header, Request
 from typing import List, Optional, Dict, Any, Tuple
 from pydantic import BaseModel
@@ -36,6 +38,60 @@ logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger("dartdetect.routes")
 
 router = APIRouter()
+
+# === Training Data Capture ===
+# Set to True to save images for future model training
+CAPTURE_TRAINING_DATA = os.environ.get("DARTDETECT_CAPTURE_TRAINING", "false").lower() == "true"
+TRAINING_DATA_DIR = Path(os.environ.get("DARTDETECT_TRAINING_DIR", "C:/Users/clawd/DartDetectionAI/training_data"))
+
+def save_training_data(camera_id: str, image_base64: str, segment: int, multiplier: int, 
+                       tip_x: float, tip_y: float, confidence: float, zone: str):
+    """Save image and label for future model training."""
+    if not CAPTURE_TRAINING_DATA:
+        return
+    
+    try:
+        # Create date-based directory
+        date_dir = TRAINING_DATA_DIR / datetime.now().strftime("%Y-%m-%d")
+        date_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Generate unique filename
+        timestamp = datetime.now().strftime("%H%M%S_%f")
+        zone_prefix = {"single_inner": "S", "single_outer": "S", "double": "D", "triple": "T", 
+                       "inner_bull": "BULL", "outer_bull": "BULL25"}.get(zone, "X")
+        
+        if segment == 0:
+            label = zone_prefix  # Bull or Bull25
+        else:
+            label = f"{zone_prefix}{segment}"  # e.g., T20, D16, S5
+        
+        base_name = f"{camera_id}_{label}_{timestamp}"
+        
+        # Save image
+        img_path = date_dir / f"{base_name}.jpg"
+        img_data = base64.b64decode(image_base64.split(',')[-1] if ',' in image_base64 else image_base64)
+        with open(img_path, 'wb') as f:
+            f.write(img_data)
+        
+        # Save metadata
+        meta_path = date_dir / f"{base_name}.json"
+        metadata = {
+            "camera_id": camera_id,
+            "segment": segment,
+            "multiplier": multiplier,
+            "zone": zone,
+            "tip_x": tip_x,
+            "tip_y": tip_y,
+            "confidence": confidence,
+            "timestamp": datetime.now().isoformat(),
+            "label": label
+        }
+        with open(meta_path, 'w') as f:
+            json.dump(metadata, f, indent=2)
+        
+        logger.debug(f"[TRAINING] Saved {base_name}")
+    except Exception as e:
+        logger.warning(f"[TRAINING] Failed to save training data: {e}")
 
 # === Mask Cache for Differential Detection ===
 # Like Machine Darts: 0=background, 76=new dart, 152=old dart
@@ -555,6 +611,18 @@ async def health():
     )
 
 
+@router.post("/v1/warmup")
+async def warmup_model():
+    """Keep the tip detection model warm by running a dummy inference."""
+    try:
+        if calibrator.tip_detector and calibrator.tip_detector.is_initialized:
+            calibrator.tip_detector.warmup()
+            return {"status": "ok", "message": "Model warmed up"}
+        return {"status": "error", "message": "Tip detector not initialized"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
 # === Raw Request Logger for debugging ===
 
 @router.post("/v1/detect-debug")
@@ -741,6 +809,18 @@ async def detect_tips(
                 tip['score'] = score_info.get('score', 0)
                 all_tips.append(tip)
                 
+                # Save training data if enabled
+                save_training_data(
+                    camera_id=cam.camera_id,
+                    image_base64=cam.image,
+                    segment=tip['segment'],
+                    multiplier=tip['multiplier'],
+                    tip_x=tip.get('x_px', 0),
+                    tip_y=tip.get('y_px', 0),
+                    confidence=tip.get('confidence', 0),
+                    zone=tip['zone']
+                )
+                
                 logger.info(f"[DETECT] Tip: segment={tip['segment']}, multiplier={tip['multiplier']}, score={tip['score']}, conf={tip.get('confidence', 0):.3f}")
             
             camera_results.append(CameraResult(
@@ -784,7 +864,7 @@ async def detect_tips(
     
     # Clear result summary
     if detected_tips:
-        result_summary = ", ".join([f"{t.get('segment', '?')}x{t.get('multiplier', 1)}={t.get('score', 0)}" for t in detected_tips])
+        result_summary = ", ".join([f"{t.segment}x{t.multiplier}={t.score}" for t in detected_tips])
         logger.info(f"")
         logger.info(f">>> RESULT: DART {dart_number} = {result_summary} ({processing_ms}ms)")
         logger.info(f"{'='*60}")
@@ -1048,3 +1128,82 @@ async def clear_board_cache(request: dict):
     clear_cache(board_id)
     logger.info(f"[CLEAR] Cleared cache for board {board_id}")
     return {"message": f"Cache cleared for board {board_id}"}
+
+
+@router.get("/v1/training/status")
+async def get_training_status():
+    """Get training data capture status."""
+    global CAPTURE_TRAINING_DATA
+    return {
+        "enabled": CAPTURE_TRAINING_DATA,
+        "directory": str(TRAINING_DATA_DIR)
+    }
+
+
+@router.post("/v1/training/enable")
+async def enable_training_capture(request: dict = {}):
+    """Enable training data capture."""
+    global CAPTURE_TRAINING_DATA
+    CAPTURE_TRAINING_DATA = True
+    logger.info("[TRAINING] Data capture ENABLED")
+    return {"enabled": True, "directory": str(TRAINING_DATA_DIR)}
+
+
+@router.post("/v1/training/disable")
+async def disable_training_capture():
+    """Disable training data capture."""
+    global CAPTURE_TRAINING_DATA
+    CAPTURE_TRAINING_DATA = False
+    logger.info("[TRAINING] Data capture DISABLED")
+    return {"enabled": False}
+
+
+# === Focus Tool ===
+from app.core.focus_tool import calculate_focus_score
+
+
+class FocusRequest(BaseModel):
+    """Request for focus measurement."""
+    camera_id: str
+    image: str  # base64 encoded image
+    center_x: Optional[float] = None  # Optional center override
+    center_y: Optional[float] = None
+
+
+@router.post("/v1/focus")
+async def measure_focus(request: FocusRequest):
+    """
+    Measure camera focus quality using Siemens star metrics.
+    Returns a score 0-100 and quality rating.
+    Higher score = better focus.
+    """
+    try:
+        # Decode image - handle data URI and fix padding
+        image_data = request.image.split(',')[-1] if ',' in request.image else request.image
+        # Fix base64 padding if needed
+        padding = 4 - len(image_data) % 4
+        if padding != 4:
+            image_data += '=' * padding
+        img_data = base64.b64decode(image_data)
+        nparr = np.frombuffer(img_data, np.uint8)
+        frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        
+        if frame is None:
+            raise HTTPException(status_code=400, detail="Failed to decode image")
+        
+        # Optional center override
+        center = None
+        if request.center_x is not None and request.center_y is not None:
+            center = (int(request.center_x), int(request.center_y))
+        
+        # Calculate focus score
+        result = calculate_focus_score(frame, center=center)
+        result["camera_id"] = request.camera_id
+        
+        logger.info(f"[FOCUS] Camera {request.camera_id}: score={result['score']}, quality={result['quality']}")
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"[FOCUS] Error measuring focus: {e}")
+        raise HTTPException(status_code=500, detail=str(e))

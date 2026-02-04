@@ -409,6 +409,15 @@ class DartboardCalibrator:
     
     def __init__(self):
         self.detector = YOLOCalibrationDetector()
+        # Pre-load tip detector so first dart detection is fast
+        try:
+            from app.core.detection import DartTipDetector
+            print("Loading tip detector...")
+            self.tip_detector = DartTipDetector()
+            print(f"Tip detector pre-loaded: {self.tip_detector.is_initialized}")
+        except Exception as e:
+            print(f"Warning: Failed to pre-load tip detector: {e}")
+            self.tip_detector = None
     
     def calibrate(
         self, 

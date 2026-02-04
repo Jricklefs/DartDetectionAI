@@ -4,6 +4,10 @@ Dart Tip Detection Module
 Uses YOLO pose estimation to detect dart tips in images.
 Based on the original DartDetector approach.
 """
+import os
+# Set OpenVINO to optimize for latency (keeps model warm)
+os.environ.setdefault('OPENVINO_TPUT_MODE', 'LATENCY')
+
 import cv2
 import numpy as np
 import math
@@ -36,7 +40,7 @@ TIP_MODEL_PATHS = {
 }
 
 # Use the best model (requires ultralytics 8.4+)
-DEFAULT_TIP_MODEL = "best"
+DEFAULT_TIP_MODEL = "default"
 
 # YOLO class IDs (from original code)
 CLASS_TIP = 0  # Dart tip
@@ -73,12 +77,85 @@ class DartTipDetector:
         self.is_initialized = False
         self.is_pose_model = False
         self.image_size = 1280  # Default size
+        self._last_inference_time = 0
+        self._warmup_interval = 3  # Run inference every 3 seconds to keep model hot
+        self._warmup_thread = None
+        self._stop_warmup = False
+        self._warmup_image = None  # Store a calibration image for warmups
+        self._warmup_counter = 0
         self._load_model()
+        self._start_background_warmup()
+    
+    def set_warmup_image(self, image: np.ndarray):
+        """Set a real camera image to use for warmups instead of dummy."""
+        self._warmup_image = image.copy()
+        print(f"Warmup image set: {image.shape}")
+    
+    def _fetch_camera_snapshot(self):
+        """Try to fetch a live camera snapshot for warmup."""
+        try:
+            import requests
+            import base64
+            resp = requests.get("http://localhost:8001/cameras/0/snapshot", timeout=2)
+            if resp.ok:
+                data = resp.json()
+                img_b64 = data.get('image', '')
+                if img_b64:
+                    img_bytes = base64.b64decode(img_b64)
+                    nparr = np.frombuffer(img_bytes, np.uint8)
+                    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                    if img is not None:
+                        return img
+        except Exception:
+            pass
+        return None
+    
+    def _start_background_warmup(self):
+        """Start background thread to keep model warm using real camera images."""
+        import threading
+        
+        def warmup_loop():
+            import time
+            dummy_img = np.zeros((640, 640, 3), dtype=np.uint8)
+            
+            while not self._stop_warmup:
+                try:
+                    if self.is_initialized and self.model is not None:
+                        # Only warmup if no recent inference
+                        if time.time() - self._last_inference_time > self._warmup_interval:
+                            # Try to get a real image
+                            warmup_img = None
+                            
+                            # Option 1: Use stored warmup image
+                            if self._warmup_image is not None:
+                                warmup_img = self._warmup_image
+                            # Option 2: Fetch live camera snapshot (every 10th warmup)
+                            elif self._warmup_counter % 10 == 0:
+                                warmup_img = self._fetch_camera_snapshot()
+                                if warmup_img is not None:
+                                    self._warmup_image = warmup_img  # Cache it
+                            
+                            # Fallback to dummy
+                            if warmup_img is None:
+                                warmup_img = dummy_img
+                            
+                            # Run inference
+                            _ = self.model(warmup_img, imgsz=self.image_size, verbose=False)
+                            self._last_inference_time = time.time()
+                            self._warmup_counter += 1
+                except Exception as e:
+                    pass
+                time.sleep(2)  # Check every 2 seconds
+        
+        self._warmup_thread = threading.Thread(target=warmup_loop, daemon=True)
+        self._warmup_thread.start()
+        print("Background warmup thread started (uses real camera images)")
     
     def _load_model(self):
         """Load the YOLO tip detection model."""
         try:
             from ultralytics import YOLO
+            import numpy as np
             
             model_path = TIP_MODEL_PATHS.get(self.model_name, TIP_MODEL_PATHS["default"])
             if not model_path.exists():
@@ -99,6 +176,12 @@ class DartTipDetector:
             
             print(f"Loaded tip model from {model_path} (pose={self.is_pose_model})")
             
+            # Warmup inference - run a dummy image through to initialize OpenVINO
+            print("Warming up model...")
+            dummy_img = np.zeros((640, 640, 3), dtype=np.uint8)
+            _ = self.model(dummy_img, imgsz=self.image_size, verbose=False)
+            print("Model warmup complete")
+            
         except ImportError:
             print("Warning: ultralytics not installed. Tip detection disabled.")
         except Exception as e:
@@ -118,6 +201,22 @@ class DartTipDetector:
             pass
         return False
     
+    def warmup(self):
+        """Run a warmup inference to keep the model hot."""
+        if not self.is_initialized or self.model is None:
+            return
+        
+        import time
+        dummy_img = np.zeros((640, 640, 3), dtype=np.uint8)
+        _ = self.model(dummy_img, imgsz=self.image_size, verbose=False)
+        self._last_inference_time = time.time()
+    
+    def maybe_warmup(self):
+        """Warmup if model has been idle too long."""
+        import time
+        if time.time() - self._last_inference_time > self._warmup_interval:
+            self.warmup()
+    
     def detect_tips(
         self, 
         image: np.ndarray,
@@ -135,6 +234,13 @@ class DartTipDetector:
         """
         if not self.is_initialized or self.model is None:
             return []
+        
+        import time
+        self._last_inference_time = time.time()
+        
+        # Cache this image for warmups (real camera image is better than dummy)
+        if self._warmup_image is None and image is not None:
+            self._warmup_image = image.copy()
         
         # Run inference
         results = self.model(
