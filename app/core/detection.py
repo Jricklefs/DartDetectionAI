@@ -30,9 +30,13 @@ MODELS_DIR = Path(__file__).parent.parent.parent / "models"
 # Available tip detection models
 TIP_MODEL_PATHS = {
     "default": MODELS_DIR / "posenano27122025_int8_openvino_model",
-    "rect": MODELS_DIR / "tippose25012026_rect_openvino_model",
+    "best": MODELS_DIR / "26tippose27012026_int8_openvino_model",  # Newer YOLO26n-pose model (Jan 2026)
+    "rect": MODELS_DIR / "best_openvino_736x1280_fp16_openvino_model",  # Non-square 736x1280
     "square": MODELS_DIR / "tippose25012026_square_openvino_model",
 }
+
+# Use the best model (requires ultralytics 8.4+)
+DEFAULT_TIP_MODEL = "best"
 
 # YOLO class IDs (from original code)
 CLASS_TIP = 0  # Dart tip
@@ -57,12 +61,12 @@ class DartTipDetector:
     Pose models provide more accurate tip positioning via keypoints.
     """
     
-    def __init__(self, model_name: str = "default"):
+    def __init__(self, model_name: str = DEFAULT_TIP_MODEL):
         """
         Initialize detector with specified model.
         
         Args:
-            model_name: One of "default", "rect", "square"
+            model_name: One of "default", "best", "rect", "square"
         """
         self.model = None
         self.model_name = model_name
@@ -81,11 +85,13 @@ class DartTipDetector:
                 print(f"Warning: Tip model not found at {model_path}")
                 return
             
-            self.model = YOLO(str(model_path))
-            self.is_initialized = True
-            
-            # Check if this is a pose model by looking at metadata
+            # Check if this is a pose model BEFORE loading
             self.is_pose_model = self._check_if_pose_model(model_path)
+            
+            # Load with explicit task to avoid auto-detection issues
+            task = "pose" if self.is_pose_model else "detect"
+            self.model = YOLO(str(model_path), task=task)
+            self.is_initialized = True
             
             # Adjust image size for rect models
             if "rect" in self.model_name:
@@ -156,21 +162,23 @@ class DartTipDetector:
                 
                 conf = float(boxes.conf[i])
                 
-                # Get bounding box center
+                # Get bounding box
                 x1, y1, x2, y2 = boxes.xyxy[i].cpu().numpy()
+                
+                # Default to box center
                 cx = (x1 + x2) / 2
                 cy = (y1 + y2) / 2
                 
-                # If pose model, use keypoints for more accurate tip position
+                # Prefer keypoint if available with good confidence
                 kp = None
                 if self.is_pose_model and keypoints is not None:
                     try:
                         kp_data = keypoints[i].data.cpu().numpy()
                         if len(kp_data) > 0:
-                            # First keypoint is typically the tip
-                            # Shape is (num_keypoints, 3) where 3 = (x, y, conf)
                             tip_kp = kp_data[0][0]  # First keypoint
-                            if len(tip_kp) >= 2 and tip_kp[0] > 0 and tip_kp[1] > 0:
+                            kp_conf = tip_kp[2] if len(tip_kp) > 2 else 0
+                            # Use keypoint if confident and valid
+                            if kp_conf > 0.5 and tip_kp[0] > 0 and tip_kp[1] > 0:
                                 cx, cy = tip_kp[0], tip_kp[1]
                             kp = kp_data[0]
                     except Exception as e:
@@ -213,7 +221,7 @@ def calculate_score_from_pixel_position(
     dx = tip_x - cx
     dy = tip_y - cy
     pixel_distance = math.sqrt(dx * dx + dy * dy)
-    angle = math.atan2(dy, dx)
+    angle = math.atan2(dy, dx)  # Angle in radians
     
     # Get the outer double ellipse to calculate scale
     outer_double = calibration_data.get("outer_double_ellipse")
@@ -224,13 +232,25 @@ def calculate_score_from_pixel_position(
     # outer_double format: ((cx, cy), (width, height), angle)
     ellipse_center, (ew, eh), ellipse_angle = outer_double
     
-    # Calculate the effective radius at this angle (accounting for ellipse shape)
-    # For a proper solution, we'd use the ellipse equation
-    # For MVP, use average radius
-    avg_outer_radius_px = (ew + eh) / 4  # /4 because ew, eh are diameters
+    # Calculate the radius of the ellipse at this specific angle
+    # This accounts for perspective distortion
+    a = ew / 2  # semi-major axis
+    b = eh / 2  # semi-minor axis
     
-    # Scale factor: pixels to mm
-    scale = DOUBLE_OUTER_RADIUS_MM / avg_outer_radius_px if avg_outer_radius_px > 0 else 1.0
+    # Adjust angle for ellipse rotation
+    theta = angle - math.radians(ellipse_angle)
+    
+    # Ellipse radius at angle theta: r = ab / sqrt((b*cos(θ))² + (a*sin(θ))²)
+    cos_t = math.cos(theta)
+    sin_t = math.sin(theta)
+    
+    if a > 0 and b > 0:
+        ellipse_radius_at_angle = (a * b) / math.sqrt((b * cos_t)**2 + (a * sin_t)**2)
+    else:
+        ellipse_radius_at_angle = (a + b) / 2  # fallback to average
+    
+    # Scale factor: pixels to mm (at this specific angle)
+    scale = DOUBLE_OUTER_RADIUS_MM / ellipse_radius_at_angle if ellipse_radius_at_angle > 0 else 1.0
     
     # Convert pixel distance to mm
     distance_mm = pixel_distance * scale
@@ -329,24 +349,51 @@ def score_from_ellipse_calibration(
             "is_outer_bull": True
         }
     
-    # Get segment from angle
+    # Get segment from angle using boundary lookup
     cx, cy = center
     dx = point[0] - cx
     dy = point[1] - cy
     angle = math.atan2(dy, dx)
     
-    # Get rotation offset
-    rotation_offset = calibration_data.get("rotation_offset_rad", 0.0)
+    segment_angles = calibration_data.get("segment_angles", [])
+    segment_20_index = calibration_data.get("segment_20_index", 0)
     
-    # Calculate segment
-    adjusted = angle - SEGMENT_ANGLE_OFFSET + rotation_offset
-    while adjusted < 0:
-        adjusted += 2 * math.pi
-    while adjusted >= 2 * math.pi:
-        adjusted -= 2 * math.pi
-    
-    segment_index = int((adjusted / (2 * math.pi)) * 20) % 20
-    segment = DARTBOARD_SEGMENTS[segment_index]
+    if len(segment_angles) == 20 and 0 <= segment_20_index < 20:
+        # Find which boundary interval contains this angle
+        found_idx = 0
+        for i in range(20):
+            a1 = segment_angles[i]
+            a2 = segment_angles[(i + 1) % 20]
+            
+            if a2 > a1:  # normal case
+                if a1 <= angle < a2:
+                    found_idx = i
+                    break
+            else:  # wraps around (a2 < a1, crosses ±π boundary)
+                if angle >= a1 or angle < a2:
+                    found_idx = i
+                    break
+        
+        # Convert boundary index to segment
+        # segment_20_index points to where segment 20 starts
+        # DARTBOARD_SEGMENTS[0] = 20, [1] = 1, [2] = 18, etc (clockwise)
+        relative_idx = (found_idx - segment_20_index) % 20
+        segment = DARTBOARD_SEGMENTS[relative_idx]
+        
+        print(f"[SCORE] angle={math.degrees(angle):.1f}°, found_idx={found_idx}, seg20_idx={segment_20_index}, relative={relative_idx}, segment={segment}")
+    else:
+        # Fallback if no segment_angles
+        rotation_offset = calibration_data.get("rotation_offset_rad", 0.0)
+        adjusted_angle = (angle - SEGMENT_ANGLE_OFFSET) + rotation_offset
+        while adjusted_angle < 0:
+            adjusted_angle += 2 * math.pi
+        while adjusted_angle >= 2 * math.pi:
+            adjusted_angle -= 2 * math.pi
+        segment_index = int((adjusted_angle / (2 * math.pi)) * 20)
+        if segment_index >= 20:
+            segment_index = 0
+        segment = DARTBOARD_SEGMENTS[segment_index]
+        print(f"[SCORE] FALLBACK: angle={math.degrees(angle):.1f}°, segment={segment}")
     
     # Check ellipses from outside to inside
     outer_double = calibration_data.get("outer_double_ellipse")

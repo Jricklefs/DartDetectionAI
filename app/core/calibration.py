@@ -33,7 +33,9 @@ from app.models.schemas import CameraCalibrationResult, DetectResponse, DartScor
 
 # Get the models directory
 MODELS_DIR = Path(__file__).parent.parent.parent / "models"
+# Calibration model - use the proven one
 CALIBRATION_MODEL_PATH = MODELS_DIR / "dartboard1280imgz_int8_openvino_model"
+CALIBRATION_IMAGE_SIZE = 1280  # Square input
 
 
 def decode_image(image_base64: str) -> np.ndarray:
@@ -180,16 +182,24 @@ class YOLOCalibrationDetector:
         Detect calibration points in the image.
         
         Returns dict with keys for each class containing lists of (x, y, confidence).
+        
+        Model class mapping (dartboard1280imgz):
+        - 0: '20' - segment 20 marker
+        - 2: bull
+        - 3: cal - outer double ring
+        - 4: cal1 - outer triple ring
+        - 5: cal2 - inner triple ring
+        - 6: cal3 - inner double ring
         """
         if not self.is_initialized or self.model is None:
             return {'cal': [], 'cal1': [], 'cal2': [], 'cal3': [], 'bull': [], 'twenty': []}
         
         # Run inference
-        results = self.model(image, imgsz=1280, conf=confidence_threshold, verbose=False)
+        results = self.model(image, imgsz=CALIBRATION_IMAGE_SIZE, conf=confidence_threshold, verbose=False)
         
         points = {
             'twenty': [],   # Class 0 - segment 20 marker
-            'bull': [],     # Class 2 - bullseye
+            'bull': [],     # Class 2 - bullseye (old model)
             'cal': [],      # Class 3 - outer double ring
             'cal1': [],     # Class 4 - outer triple ring
             'cal2': [],     # Class 5 - inner triple ring
@@ -210,7 +220,7 @@ class YOLOCalibrationDetector:
                 cx = float((x1 + x2) / 2)
                 cy = float((y1 + y2) / 2)
                 
-                # Map class ID to key
+                # Map class ID to key (old model: 0=20, 2=bull, 3=cal, 4=cal1, 5=cal2, 6=cal3)
                 if cls_id == 0:
                     points['twenty'].append((cx, cy, conf))
                 elif cls_id == 2:
@@ -335,45 +345,61 @@ def find_segment_20_index(
     Args:
         twenty_points: Detected "20" marker points
         center: Dartboard center
-        segment_angles: List of segment boundary angles
+        segment_angles: List of segment boundary angles (in original order)
         
     Returns:
-        Index of the segment boundary that starts segment 20
+        Index into segment_angles where segment 20 starts
     """
-    if not twenty_points or len(segment_angles) < 20:
+    if len(segment_angles) < 20:
         return 0
     
-    # Get angle to the detected "20" marker
-    dx = twenty_points[0][0] - center[0]
-    dy = twenty_points[0][1] - center[1]
-    angle_to_20 = math.atan2(dy, dx)
-    
-    def normalize_angle(a):
-        while a < 0:
-            a += 2 * math.pi
-        while a >= 2 * math.pi:
-            a -= 2 * math.pi
-        return a
-    
-    angle_to_20_norm = normalize_angle(angle_to_20)
-    sorted_angles = [normalize_angle(a) for a in segment_angles]
-    sorted_indices = sorted(range(len(sorted_angles)), key=lambda i: sorted_angles[i])
-    sorted_angles = [sorted_angles[i] for i in sorted_indices]
-    
-    # Find which segment the 20 falls into
-    for i in range(len(sorted_angles)):
-        a1 = sorted_angles[i]
-        a2 = sorted_angles[(i + 1) % len(sorted_angles)]
-        
-        if a2 < a1:
-            # Segment crosses 0
-            if angle_to_20_norm >= a1 or angle_to_20_norm < a2:
-                return i
+    if twenty_points and len(twenty_points) > 0:
+        # Use detected "20" marker position
+        # If multiple points, use the one with highest confidence or average them
+        if len(twenty_points) > 1:
+            # Average all detected 20 marker positions
+            avg_x = sum(p[0] for p in twenty_points) / len(twenty_points)
+            avg_y = sum(p[1] for p in twenty_points) / len(twenty_points)
+            dx = avg_x - center[0]
+            dy = avg_y - center[1]
+            print(f"[CAL] Averaging {len(twenty_points)} detected 20 markers")
         else:
-            if a1 <= angle_to_20_norm < a2:
-                return i
+            dx = twenty_points[0][0] - center[0]
+            dy = twenty_points[0][1] - center[1]
+        
+        angle_to_20 = math.atan2(dy, dx)
+        print(f"[CAL] 20 marker at angle {math.degrees(angle_to_20):.1f}A�")
+    else:
+        # FALLBACK: Assume 20 is at the top of the image (-90A� in image coords)
+        angle_to_20 = -math.pi / 2  # -90 degrees
+        print(f"[CAL] No 20 marker detected, assuming 20 at top (-90A�)")
     
-    return 0
+    # The "20" marker is painted inside segment 20, so find which segment contains it
+    # Find index i where segment_angles[i] <= angle_to_20 < segment_angles[i+1]
+    # That means segment_angles[i] is the START boundary of the segment containing "20"
+    
+    # Normalize angle_to_20 to be in the same range as segment_angles
+    # segment_angles are typically -pi to pi
+    
+    best_idx = 0
+    
+    for i in range(len(segment_angles)):
+        a1 = segment_angles[i]
+        a2 = segment_angles[(i + 1) % len(segment_angles)]
+        
+        # Handle wrap-around
+        if a2 < a1:
+            # Segment spans across -pi/pi boundary
+            if angle_to_20 >= a1 or angle_to_20 < a2:
+                best_idx = i
+                break
+        else:
+            if a1 <= angle_to_20 < a2:
+                best_idx = i
+                break
+    
+    print(f"[CAL] Found 20 in segment starting at index {best_idx}: segment_angles[{best_idx}]={math.degrees(segment_angles[best_idx]):.1f}A�")
+    return best_idx
 
 
 class DartboardCalibrator:
@@ -444,8 +470,39 @@ class DartboardCalibrator:
             all_ring_points = cal_points + cal1_points + cal2_points + cal3_points
             segment_angles = cluster_angles_to_segment_boundaries(all_ring_points, center)
             
-            # Find segment 20 index
+            # Find segment 20 index and calculate rotation offset
             segment_20_index = find_segment_20_index(twenty_points, center, segment_angles)
+            
+            # Calculate rotation_offset_deg - should be the angle to the CENTER of segment 20
+            # The simplest and most reliable approach: use the detected "20" marker directly
+            # The "20" is painted at the center of segment 20, which is exactly what we need
+            if twenty_points and len(twenty_points) > 0:
+                # Use detected "20" marker position directly
+                if len(twenty_points) > 1:
+                    avg_x = sum(p[0] for p in twenty_points) / len(twenty_points)
+                    avg_y = sum(p[1] for p in twenty_points) / len(twenty_points)
+                    dx = avg_x - center[0]
+                    dy = avg_y - center[1]
+                else:
+                    dx = twenty_points[0][0] - center[0]
+                    dy = twenty_points[0][1] - center[1]
+                
+                angle_to_20_rad = math.atan2(dy, dx)
+                rotation_offset_deg = math.degrees(angle_to_20_rad)
+                if rotation_offset_deg < 0:
+                    rotation_offset_deg += 360
+                print(f"[CAL] 20 marker detected at {rotation_offset_deg:.1f}° - using as rotation_offset")
+            elif len(segment_angles) >= 20 and 0 <= segment_20_index < 20:
+                # Fallback: use wire boundary + 9° to estimate center
+                boundary_rad = segment_angles[segment_20_index]
+                boundary_deg = math.degrees(boundary_rad)
+                if boundary_deg < 0:
+                    boundary_deg += 360
+                rotation_offset_deg = (boundary_deg + 9) % 360
+                print(f"[CAL] No 20 marker, using boundary {segment_20_index} + 9° = {rotation_offset_deg:.1f}°")
+            else:
+                rotation_offset_deg = 0.0
+                print("[CAL] No 20 marker or segment_angles, defaulting rotation_offset=0")
             
             # Build calibration data
             ellipse_cal = EllipseCalibration(
@@ -481,6 +538,7 @@ class DartboardCalibrator:
                 "bullseye_ellipse": ellipse_cal.bullseye_ellipse,
                 "segment_angles": segment_angles,
                 "segment_20_index": segment_20_index,
+                "rotation_offset_deg": rotation_offset_deg,
                 "image_size": (w, h),
                 "quality": quality,
                 "segment_at_top": segment_at_top,
@@ -490,7 +548,8 @@ class DartboardCalibrator:
             overlay = self._draw_calibration_overlay(
                 image, ellipse_cal, 
                 cal_points, cal1_points, cal2_points, cal3_points,
-                bull_points, twenty_points
+                bull_points, twenty_points,
+                rotation_offset_deg
             )
             overlay_base64 = encode_image(overlay)
             
@@ -545,7 +604,7 @@ class DartboardCalibrator:
         if not cal.segment_angles or len(cal.segment_angles) < 20:
             return 20
         
-        # Angle pointing up (12 o'clock) is -π/2
+        # Angle pointing up (12 o'clock) is -I?/2
         top_angle = -math.pi / 2
         
         def normalize_angle(a):
@@ -612,7 +671,8 @@ class DartboardCalibrator:
         cal2_points: List,
         cal3_points: List,
         bull_points: List,
-        twenty_points: List
+        twenty_points: List,
+        rotation_offset_deg: float = 0.0
     ) -> np.ndarray:
         """Draw dartboard overlay showing detected rings, points, and segment labels."""
         overlay = image.copy()
@@ -661,7 +721,7 @@ class DartboardCalibrator:
         cv2.drawMarker(overlay, (int(cal.center[0]), int(cal.center[1])), 
                        (0, 255, 255), cv2.MARKER_CROSS, 20, 2)
         
-        # Draw segment lines using perspective-correct intersection
+        # Draw segment boundary lines from bull to outer double ring
         if cal.outer_double_ellipse and cal.segment_angles and len(cal.segment_angles) >= 10:
             for angle in cal.segment_angles:
                 dx = math.cos(angle)
@@ -669,54 +729,45 @@ class DartboardCalibrator:
                 
                 outer_pt = line_ellipse_intersection(cal.center, (dx, dy), cal.outer_double_ellipse)
                 
+                # Draw from center (or bull edge if available) to outer double
                 if cal.bull_ellipse:
                     inner_pt = line_ellipse_intersection(cal.center, (dx, dy), cal.bull_ellipse)
                 else:
-                    inner_pt = (int(cal.center[0] + dx * 15), int(cal.center[1] + dy * 15))
+                    inner_pt = (int(cal.center[0]), int(cal.center[1]))
                 
-                cv2.line(overlay, inner_pt, outer_pt, (255, 255, 255), 1)
+                # White lines, thickness 2 for visibility
+                cv2.line(overlay, inner_pt, outer_pt, (255, 255, 255), 2)
         
-        # Draw segment numbers using simple angular positioning
-        # This is more reliable than trying to match detected boundary lines
-        if cal.outer_double_ellipse:
-            # Create text ellipse in the middle of the number ring area (between outer double and board edge)
-            text_w = cal.outer_double_ellipse[1][0] * 1.08
-            text_h = cal.outer_double_ellipse[1][1] * 1.08
+        # Draw segment numbers using the ACTUAL detected boundary angles
+        # Place each number at the midpoint between its two boundary lines, projected outward
+        if cal.outer_double_ellipse and cal.segment_angles and len(cal.segment_angles) >= 20:
+            # Create text ellipse further out - at 1.18x the outer double ellipse
+            text_w = cal.outer_double_ellipse[1][0] * 1.18
+            text_h = cal.outer_double_ellipse[1][1] * 1.18
             text_ellipse = (cal.outer_double_ellipse[0], (text_w, text_h), cal.outer_double_ellipse[2])
             
-            # Standard dartboard: 20 at top, segments go clockwise
-            # In image coordinates: up is negative Y, so top is -π/2 radians
-            # segment_20_index tells us how many segments clockwise from the first detected boundary
-            # But for simplicity, we'll use the rotation_offset_deg if available
-            
-            # Each segment spans 18 degrees (π/10 radians)
-            segment_span = math.pi / 10  # 18 degrees
-            
-            # Calculate base angle for segment 20
-            # If we have segment_20_index and segment_angles, use that
-            # Otherwise default to top (-π/2)
-            if len(cal.segment_angles) >= 20:
-                sorted_angles = sorted([a if a >= 0 else a + 2*math.pi for a in cal.segment_angles])
-                # segment_20_index points to the boundary BEFORE segment 20
-                idx = cal.segment_20_index % len(sorted_angles)
-                a1 = sorted_angles[idx]
-                a2 = sorted_angles[(idx + 1) % len(sorted_angles)]
-                if a2 < a1:
-                    a2 += 2 * math.pi
-                base_angle_20 = (a1 + a2) / 2  # Middle of segment 20
-            else:
-                # Default: 20 at top
-                base_angle_20 = -math.pi / 2
+            # Use segment_angles directly - they are already sorted and segment_20_index
+            # is an index into this array
+            segment_angles = cal.segment_angles
+            idx_20 = cal.segment_20_index % len(segment_angles)
             
             for i, seg in enumerate(DARTBOARD_SEGMENTS):
-                # Each segment is 18 degrees clockwise from the previous
-                mid_angle = base_angle_20 + i * segment_span
+                # segment_20_index is where segment 20 starts
+                # DARTBOARD_SEGMENTS[0] = 20, [1] = 1, [2] = 18, etc.
+                idx_start = (idx_20 + i) % len(segment_angles)
+                idx_end = (idx_20 + i + 1) % len(segment_angles)
                 
-                # Normalize
-                while mid_angle > math.pi:
-                    mid_angle -= 2 * math.pi
-                while mid_angle < -math.pi:
-                    mid_angle += 2 * math.pi
+                a1 = segment_angles[idx_start]
+                a2 = segment_angles[idx_end]
+                
+                # Handle wrap-around for midpoint calculation
+                if a2 < a1:
+                    # Wraps around from +I? to -I?
+                    mid_angle = (a1 + (a2 + 2 * math.pi)) / 2
+                    if mid_angle > math.pi:
+                        mid_angle -= 2 * math.pi
+                else:
+                    mid_angle = (a1 + a2) / 2
                 
                 dx = math.cos(mid_angle)
                 dy = math.sin(mid_angle)
@@ -724,10 +775,57 @@ class DartboardCalibrator:
                 
                 text_str = str(seg)
                 (tw, th), _ = cv2.getTextSize(text_str, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+                
+                # Draw text with black outline for readability
+                text_x = text_pt[0] - tw//2
+                text_y = text_pt[1] + th//2
+                # Black outline (draw in 8 directions)
+                for ox, oy in [(-1,-1), (-1,0), (-1,1), (0,-1), (0,1), (1,-1), (1,0), (1,1)]:
+                    cv2.putText(overlay, text_str, (text_x + ox, text_y + oy),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
                 # Bright green for 20, white for all others
                 text_color = (0, 255, 0) if seg == 20 else (255, 255, 255)
-                cv2.putText(overlay, text_str, (text_pt[0] - tw//2, text_pt[1] + th//2),
+                cv2.putText(overlay, text_str, (text_x, text_y),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, text_color, 2)
+        
+        # Draw segment 20 as a filled cyan wedge (semi-transparent)
+        # Use the actual detected segment boundaries for segment 20
+        if cal.outer_double_ellipse and cal.bull_ellipse and cal.segment_angles and len(cal.segment_angles) >= 20:
+            idx_20 = cal.segment_20_index % len(cal.segment_angles)
+            idx_20_end = (idx_20 + 1) % len(cal.segment_angles)
+            
+            # Get the actual boundary angles for segment 20
+            angle_start_rad = cal.segment_angles[idx_20]
+            angle_end_rad = cal.segment_angles[idx_20_end]
+            
+            # Handle wrap-around
+            if angle_end_rad < angle_start_rad:
+                angle_end_rad += 2 * math.pi
+            
+            # Create a polygon for the segment 20 wedge
+            num_arc_points = 20
+            wedge_points = []
+            
+            # Outer arc (from angle_start to angle_end)
+            for i in range(num_arc_points + 1):
+                angle = angle_start_rad + (angle_end_rad - angle_start_rad) * i / num_arc_points
+                dx, dy = math.cos(angle), math.sin(angle)
+                pt = line_ellipse_intersection(cal.center, (dx, dy), cal.outer_double_ellipse)
+                wedge_points.append(pt)
+            
+            # Inner arc (from angle_end back to angle_start) - use bull ellipse
+            for i in range(num_arc_points, -1, -1):
+                angle = angle_start_rad + (angle_end_rad - angle_start_rad) * i / num_arc_points
+                dx, dy = math.cos(angle), math.sin(angle)
+                pt = line_ellipse_intersection(cal.center, (dx, dy), cal.bull_ellipse)
+                wedge_points.append(pt)
+            
+            # Draw filled polygon with transparency
+            wedge_array = np.array(wedge_points, dtype=np.int32)
+            overlay_layer = overlay.copy()
+            cv2.fillPoly(overlay_layer, [wedge_array], (255, 255, 0))  # Cyan in BGR
+            # Blend with 40% opacity
+            cv2.addWeighted(overlay_layer, 0.4, overlay, 0.6, 0, overlay)
         
         # Add info text
         total_points = len(cal_points) + len(cal1_points) + len(cal2_points) + len(cal3_points)
