@@ -32,12 +32,105 @@ from app.core.geometry import (
     DOUBLE_INNER_RADIUS_MM,
     DOUBLE_OUTER_RADIUS_MM
 )
+import requests as http_requests  # Renamed to avoid conflict with FastAPI request
 
 # Setup logging
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger("dartdetect.routes")
 
+# Centralized logging endpoint
+DARTGAME_API_URL = os.environ.get("DARTGAME_URL", "http://localhost:5000")
+
+def log_to_api(level: str, category: str, message: str, data: dict = None, game_id: str = None):
+    """Send log entry to centralized DartGame API logging endpoint."""
+    try:
+        payload = {
+            "source": "DartDetect",
+            "level": level,
+            "category": category,
+            "message": message,
+            "data": json.dumps(data) if data else None,
+            "gameId": game_id
+        }
+        http_requests.post(f"{DARTGAME_API_URL}/api/logs", json=payload, timeout=0.5)
+    except Exception:
+        pass  # Don't let logging failures break detection
+
 router = APIRouter()
+
+# === Debug Image Saving ===
+DEBUG_IMAGES_ENABLED = os.environ.get("DARTDETECT_DEBUG_IMAGES", "true").lower() == "true"
+DEBUG_IMAGES_DIR = Path(os.environ.get("DARTDETECT_DEBUG_DIR", "C:/Users/clawd/DartImages"))
+
+def save_debug_image(request_id: str, dart_number: int, camera_id: str, 
+                     image: np.ndarray, all_tips: List[dict], selected_tip: dict = None,
+                     known_darts: List[dict] = None, new_centroid: tuple = None) -> Optional[np.ndarray]:
+    """
+    Save debug image with all tips marked.
+    - Green circle: selected tip (the one we're scoring)
+    - Red circles: other detected tips
+    - Blue circles: known dart locations (source of truth)
+    - Yellow X: NEW region centroid
+    
+    Returns the debug image for benchmark storage.
+    """
+    debug_img = None
+    
+    try:
+        # Make a copy to draw on
+        debug_img = image.copy()
+        
+        # Draw known dart locations (blue)
+        if known_darts:
+            for kd in known_darts:
+                x, y = int(kd.get('x', 0)), int(kd.get('y', 0))
+                cv2.circle(debug_img, (x, y), 15, (255, 0, 0), 2)  # Blue
+                cv2.putText(debug_img, f"D{kd.get('dart_number', '?')}", (x+10, y-10), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
+        
+        # Draw NEW region centroid (yellow X)
+        if new_centroid:
+            cx, cy = int(new_centroid[0]), int(new_centroid[1])
+            cv2.drawMarker(debug_img, (cx, cy), (0, 255, 255), cv2.MARKER_CROSS, 20, 2)
+            cv2.putText(debug_img, "NEW", (cx+10, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+        
+        # Draw all tips (red = not selected, green = selected)
+        for tip in all_tips:
+            tx, ty = int(tip.get('x_px', 0)), int(tip.get('y_px', 0))
+            conf = tip.get('confidence', 0)
+            
+            is_selected = (selected_tip and 
+                          abs(tip.get('x_px', 0) - selected_tip.get('x_px', 0)) < 1 and
+                          abs(tip.get('y_px', 0) - selected_tip.get('y_px', 0)) < 1)
+            
+            if is_selected:
+                color = (0, 255, 0)  # Green
+                cv2.circle(debug_img, (tx, ty), 12, color, 3)
+                cv2.putText(debug_img, f"SEL {conf:.2f}", (tx+10, ty+5), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+            else:
+                color = (0, 0, 255)  # Red
+                cv2.circle(debug_img, (tx, ty), 8, color, 2)
+                cv2.putText(debug_img, f"{conf:.2f}", (tx+10, ty+5), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+        
+        # Add header text
+        cv2.putText(debug_img, f"Dart {dart_number} - {camera_id} - {request_id}", 
+                   (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        
+        # Save to disk if enabled
+        if DEBUG_IMAGES_ENABLED:
+            DEBUG_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+            timestamp = datetime.now().strftime("%H%M%S_%f")
+            filename = f"dart{dart_number}_{camera_id}_{request_id}_{timestamp}.jpg"
+            filepath = DEBUG_IMAGES_DIR / filename
+            cv2.imwrite(str(filepath), debug_img)
+            logger.info(f"[DEBUG] Saved debug image: {filename}")
+        
+    except Exception as e:
+        logger.warning(f"[DEBUG] Failed to save debug image: {e}")
+    
+    return debug_img
 
 # === Training Data Capture ===
 # Set to True to save images for future model training
@@ -93,13 +186,198 @@ def save_training_data(camera_id: str, image_base64: str, segment: int, multipli
     except Exception as e:
         logger.warning(f"[TRAINING] Failed to save training data: {e}")
 
+
+# === Benchmark System ===
+# Comprehensive logging for accuracy analysis - enabled via Settings UI
+BENCHMARK_ENABLED = False  # Set via API when logging is enabled in Settings
+BENCHMARK_DIR = Path(os.environ.get("DARTDETECT_BENCHMARK_DIR", "C:/Users/clawd/DartBenchmark"))
+
+# Current game context - set by DartGame API when game starts
+_benchmark_context = {
+    "board_id": None,
+    "game_id": None,
+    "round": None,
+    "player_name": None
+}
+_benchmark_lock = threading.Lock()
+
+# Track last saved dart paths for correction matching
+# Key: (game_id, dart_number) -> path OR just dart_number for legacy
+# Keep history of recent darts (last 50) so corrections work even after new game starts
+_last_dart_paths = {}
+_dart_path_history = []  # List of (game_id, dart_number, path, timestamp) for fallback lookup
+MAX_PATH_HISTORY = 50
+
+def set_benchmark_enabled(enabled: bool):
+    """Enable/disable benchmark logging (called from Settings UI)."""
+    global BENCHMARK_ENABLED
+    BENCHMARK_ENABLED = enabled
+    logger.info(f"[BENCHMARK] {'Enabled' if enabled else 'Disabled'}")
+
+def set_benchmark_context(board_id: str = None, game_id: str = None, 
+                          round_num: int = None, player_name: str = None):
+    """Set current game context for benchmark organization."""
+    global _benchmark_context
+    with _benchmark_lock:
+        if board_id is not None:
+            _benchmark_context["board_id"] = board_id
+        if game_id is not None:
+            _benchmark_context["game_id"] = game_id
+        if round_num is not None:
+            _benchmark_context["round"] = round_num
+        if player_name is not None:
+            _benchmark_context["player_name"] = player_name
+    logger.debug(f"[BENCHMARK] Context: {_benchmark_context}")
+
+def get_benchmark_path(dart_number: int) -> Optional[Path]:
+    """Get the path where benchmark data should be saved for current dart."""
+    if not BENCHMARK_ENABLED:
+        return None
+    
+    with _benchmark_lock:
+        ctx = _benchmark_context.copy()
+    
+    board_id = ctx.get("board_id") or "default"
+    game_id = ctx.get("game_id") or datetime.now().strftime("%Y%m%d_%H%M%S")
+    round_num = ctx.get("round") or 1
+    player_name = ctx.get("player_name") or "player"
+    
+    # Sanitize names for filesystem
+    player_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in player_name)
+    
+    path = BENCHMARK_DIR / board_id / game_id / f"round_{round_num}_{player_name}" / f"dart_{dart_number}"
+    return path
+
+def save_benchmark_data(
+    dart_number: int,
+    request_id: str,
+    raw_images: Dict[str, str],  # camera_id -> base64 image
+    debug_images: Dict[str, np.ndarray],  # camera_id -> cv2 image with annotations
+    camera_results: List[Dict],  # Per-camera detection results
+    final_result: Dict,  # Final voted result
+    calibrations: Dict[str, Dict],  # camera_id -> calibration data
+    timings: Dict[str, int],
+    pipeline_data: Dict[str, Dict] = None  # camera_id -> detailed pipeline info
+):
+    """
+    Save complete benchmark data for a dart detection.
+    This captures everything needed to replay and analyze detection accuracy.
+    """
+    if not BENCHMARK_ENABLED:
+        return None
+    
+    dart_path = get_benchmark_path(dart_number)
+    if not dart_path:
+        return None
+    
+    try:
+        dart_path.mkdir(parents=True, exist_ok=True)
+        
+        # Save raw images (original camera captures)
+        for cam_id, img_b64 in raw_images.items():
+            try:
+                img_data = base64.b64decode(img_b64.split(',')[-1] if ',' in img_b64 else img_b64)
+                with open(dart_path / f"{cam_id}_raw.jpg", 'wb') as f:
+                    f.write(img_data)
+            except Exception as e:
+                logger.warning(f"[BENCHMARK] Failed to save raw image for {cam_id}: {e}")
+        
+        # Save debug images (with annotations)
+        for cam_id, img in debug_images.items():
+            try:
+                cv2.imwrite(str(dart_path / f"{cam_id}_debug.jpg"), img)
+            except Exception as e:
+                logger.warning(f"[BENCHMARK] Failed to save debug image for {cam_id}: {e}")
+        
+        # Build comprehensive metadata
+        metadata = {
+            "request_id": request_id,
+            "dart_number": dart_number,
+            "timestamp": datetime.now().isoformat(),
+            "context": _benchmark_context.copy(),
+            "camera_results": camera_results,
+            "final_result": final_result,
+            "timings": timings,
+            "calibrations": {},
+            "pipeline": pipeline_data or {}  # Detailed per-camera detection pipeline
+        }
+        
+        # Include key calibration data (but not full images)
+        for cam_id, cal in calibrations.items():
+            metadata["calibrations"][cam_id] = {
+                "center": cal.get("center"),
+                "segment_20_index": cal.get("segment_20_index"),
+                "rotation_offset_deg": cal.get("rotation_offset_deg"),
+                "quality": cal.get("quality")
+            }
+        
+        # Save metadata
+        with open(dart_path / "metadata.json", 'w') as f:
+            json.dump(metadata, f, indent=2)
+        
+        # Track this dart path for correction matching
+        global _last_dart_paths, _dart_path_history
+        game_id = _benchmark_context.get("game_id") or "unknown"
+        
+        # Store by (game_id, dart_number) for precise matching
+        _last_dart_paths[(game_id, dart_number)] = str(dart_path)
+        # Also store by dart_number alone for legacy/fallback
+        _last_dart_paths[dart_number] = str(dart_path)
+        
+        # Add to history for fallback lookup
+        _dart_path_history.append({
+            "game_id": game_id,
+            "dart_number": dart_number,
+            "path": str(dart_path),
+            "timestamp": datetime.now().isoformat()
+        })
+        # Trim history
+        if len(_dart_path_history) > MAX_PATH_HISTORY:
+            _dart_path_history = _dart_path_history[-MAX_PATH_HISTORY:]
+        
+        logger.info(f"[BENCHMARK] Saved dart {dart_number} to {dart_path}")
+        return str(dart_path)
+        
+    except Exception as e:
+        logger.error(f"[BENCHMARK] Failed to save benchmark data: {e}")
+        return None
+
+def save_benchmark_correction(dart_path: str, original: Dict, corrected: Dict):
+    """Save correction data when user corrects a dart score."""
+    try:
+        path = Path(dart_path)
+        if not path.exists():
+            logger.warning(f"[BENCHMARK] Dart path not found for correction: {dart_path}")
+            return
+        
+        correction = {
+            "corrected_at": datetime.now().isoformat(),
+            "original": original,
+            "corrected": corrected
+        }
+        
+        with open(path / "correction.json", 'w') as f:
+            json.dump(correction, f, indent=2)
+        
+        logger.info(f"[BENCHMARK] Saved correction: {original} -> {corrected}")
+    except Exception as e:
+        logger.error(f"[BENCHMARK] Failed to save correction: {e}")
+
 # === Mask Cache for Differential Detection ===
 # Like Machine Darts: 0=background, 76=new dart, 152=old dart
 MASK_NEW = 76
 MASK_OLD = 152
 MASK_BG = 0
 
-# Structure: { board_id: { "baseline": {cam_id: np.ndarray}, "masks": {cam_id: np.ndarray}, "timestamp": float, "dart_count": int } }
+# Distance threshold for "new dart" detection (in pixels)
+# Tips within this distance of existing darts are rejected
+# NOTE: 1/2 inch on board ≈ 20-40px at typical webcam distances
+# Keep this LOW to allow close darts - mask filtering handles the rest
+NEW_DART_DISTANCE_PX = 30
+
+# Structure: { board_id: { "baseline": {cam_id: np.ndarray}, "masks": {cam_id: np.ndarray}, 
+#              "timestamp": float, "dart_count": int,
+#              "dart_locations": {cam_id: [(x, y, conf), ...]} } }
 _mask_cache: Dict[str, Dict[str, Any]] = {}
 _cache_lock = threading.Lock()
 CACHE_TTL_SECONDS = 300  # 5 minutes
@@ -118,15 +396,21 @@ def init_board_cache(board_id: str, baseline_images: Dict[str, np.ndarray]):
     """Initialize cache with baseline (empty board) images."""
     with _cache_lock:
         masks = {}
+        dart_locations = {}
         for cam_id, img in baseline_images.items():
             h, w = img.shape[:2]
             masks[cam_id] = np.zeros((h, w), dtype=np.uint8)
+            dart_locations[cam_id] = []  # List of (x, y, confidence) tuples
         
         _mask_cache[board_id] = {
             "baseline": {k: v.copy() for k, v in baseline_images.items()},
             "masks": masks,
             "timestamp": time.time(),
-            "dart_count": 0
+            "dart_count": 0,
+            "dart_locations": dart_locations,
+            # Source of truth: winning camera's dart locations
+            # Format: [(cam_id, x, y, dart_number), ...]
+            "source_of_truth": []
         }
     logger.info(f"Initialized cache for board {board_id} with {len(baseline_images)} cameras")
 
@@ -200,6 +484,176 @@ def promote_new_to_old(board_id: str):
         cache["dart_count"] = cache.get("dart_count", 0) + 1
         logger.info(f"[MASK] Promoted new→old for board {board_id}, dart_count={cache['dart_count']}")
 
+def mark_tip_as_old(board_id: str, cam_id: str, x: float, y: float, radius: int = 30):
+    """Mark a tip location as OLD in the mask (for dart 1 which has no NEW pixels)."""
+    with _cache_lock:
+        cache = _mask_cache.get(board_id)
+        if not cache:
+            return
+        
+        mask = cache.get("masks", {}).get(cam_id)
+        if mask is None:
+            return
+        
+        h, w = mask.shape
+        x_int, y_int = int(x), int(y)
+        
+        # Create circular mask around tip
+        y_coords, x_coords = np.ogrid[:h, :w]
+        dist_sq = (x_coords - x_int)**2 + (y_coords - y_int)**2
+        circle = dist_sq <= radius**2
+        mask[circle] = MASK_OLD
+        
+        cache["masks"][cam_id] = mask
+
+
+def add_source_of_truth(board_id: str, cam_id: str, x_px: float, y_px: float, x_mm: float, y_mm: float, dart_number: int):
+    """
+    Record a winning dart location as source of truth (legacy - single camera).
+    """
+    with _cache_lock:
+        cache = _mask_cache.get(board_id)
+        if not cache:
+            return
+        
+        if "source_of_truth" not in cache:
+            cache["source_of_truth"] = []
+        
+        cache["source_of_truth"].append({
+            "cam_id": cam_id,
+            "x_px": x_px,
+            "y_px": y_px,
+            "x_mm": x_mm,
+            "y_mm": y_mm,
+            "dart_number": dart_number
+        })
+        logger.info(f"[SOT] Added source of truth: Dart {dart_number} @ ({x_mm:.1f}, {y_mm:.1f})mm [from {cam_id}]")
+
+
+def add_source_of_truth_all_cameras(board_id: str, dart_number: int, all_camera_tips: List[dict]):
+    """
+    Record dart position from ALL cameras for accurate per-camera matching.
+    
+    Since mm coords aren't perfectly calibrated across cameras, we store each camera's
+    own mm coords and match against the same camera's history.
+    
+    Args:
+        board_id: Board ID
+        dart_number: Which dart (1, 2, 3)
+        all_camera_tips: List of tips from all cameras, each with camera_id, x_mm, y_mm
+    """
+    with _cache_lock:
+        cache = _mask_cache.get(board_id)
+        if not cache:
+            return
+        
+        if "sot_per_camera" not in cache:
+            cache["sot_per_camera"] = {}  # cam_id -> list of {dart_number, x_mm, y_mm}
+        
+        sot = cache["sot_per_camera"]
+        
+        for tip in all_camera_tips:
+            cam_id = tip.get('camera_id')
+            x_mm = tip.get('x_mm', 0)
+            y_mm = tip.get('y_mm', 0)
+            
+            if not cam_id:
+                continue
+            
+            if cam_id not in sot:
+                sot[cam_id] = []
+            
+            sot[cam_id].append({
+                "dart_number": dart_number,
+                "x_mm": x_mm,
+                "y_mm": y_mm
+            })
+            logger.info(f"[SOT] Stored Dart {dart_number} for {cam_id}: ({x_mm:.1f}, {y_mm:.1f})mm")
+
+
+def get_source_of_truth_for_camera(board_id: str, cam_id: str) -> List[dict]:
+    """
+    Get source-of-truth dart locations for a specific camera.
+    Returns list of {dart_number, x_mm, y_mm} for that camera's perspective.
+    """
+    with _cache_lock:
+        cache = _mask_cache.get(board_id)
+        if not cache:
+            return []
+        
+        sot = cache.get("sot_per_camera", {})
+        return list(sot.get(cam_id, []))
+
+
+def get_source_of_truth(board_id: str, cam_id: str = None) -> List[dict]:
+    """
+    Get all source-of-truth dart locations (legacy - from winning camera only).
+    If cam_id provided, returns only darts where that camera was the winner.
+    Otherwise returns all darts (for mm-based matching).
+    """
+    with _cache_lock:
+        cache = _mask_cache.get(board_id)
+        if not cache:
+            return []
+        
+        sot = cache.get("source_of_truth", [])
+        if cam_id:
+            return [d for d in sot if d["cam_id"] == cam_id]
+        return list(sot)
+
+
+def find_new_tip_by_elimination_mm(tips: List[dict], board_id: str, cam_id: str, match_threshold_mm: float = 20.0) -> Optional[dict]:
+    """
+    Find the new dart tip by eliminating known dart locations using MM COORDINATES.
+    
+    Uses PER-CAMERA matching: compares this camera's tips against this camera's
+    historical dart positions, since mm coords aren't perfectly calibrated across cameras.
+    
+    Args:
+        tips: List of tips, each must have 'x_mm' and 'y_mm' set
+        board_id: Board ID for cache lookup
+        cam_id: Camera ID to match against (uses that camera's stored history)
+        match_threshold_mm: Distance in mm to consider a match (default 20mm)
+    
+    Returns the new tip, or None if can't determine.
+    """
+    # Use per-camera source of truth
+    known_darts = get_source_of_truth_for_camera(board_id, cam_id)
+    
+    if not known_darts:
+        # No previous darts for this camera - can't eliminate, all tips are potentially new
+        logger.debug(f"[SOT] No known darts for {cam_id}, can't eliminate")
+        return None
+    
+    # Find tips that DON'T match any known dart
+    new_tips = []
+    for tip in tips:
+        tx_mm, ty_mm = tip.get('x_mm', 0), tip.get('y_mm', 0)
+        matches_known = False
+        
+        for known in known_darts:
+            kx_mm, ky_mm = known["x_mm"], known["y_mm"]
+            dist = math.sqrt((tx_mm - kx_mm)**2 + (ty_mm - ky_mm)**2)
+            if dist < match_threshold_mm:
+                matches_known = True
+                logger.info(f"[SOT] {cam_id}: Tip ({tx_mm:.1f}, {ty_mm:.1f})mm matches Dart {known['dart_number']} at ({kx_mm:.1f}, {ky_mm:.1f})mm - dist={dist:.1f}mm")
+                break
+        
+        if not matches_known:
+            new_tips.append(tip)
+            logger.info(f"[SOT] {cam_id}: Tip ({tx_mm:.1f}, {ty_mm:.1f})mm is NEW (no match to known darts)")
+    
+    if len(new_tips) == 1:
+        return new_tips[0]
+    elif len(new_tips) > 1:
+        # Multiple new tips - pick highest confidence
+        logger.warning(f"[SOT] {cam_id}: Found {len(new_tips)} new tips, picking highest confidence")
+        return max(new_tips, key=lambda t: t.get('confidence', 0))
+    else:
+        # All tips matched known darts - shouldn't happen
+        logger.warning(f"[SOT] {cam_id}: All tips matched known darts - can't find new tip")
+        return None
+
 def get_new_region_bbox(mask: np.ndarray, margin: int = 20) -> Optional[tuple]:
     """Get bounding box of NEW (76) region with margin."""
     new_pixels = (mask == MASK_NEW)
@@ -247,7 +701,7 @@ def clear_cache(board_id: str):
     with _cache_lock:
         if board_id in _mask_cache:
             del _mask_cache[board_id]
-            logger.info(f"Cache cleared for board {board_id}")
+            logger.info(f"Cache cleared for board {board_id} (masks + dart locations)")
 
 def get_cached_dart_count(board_id: str) -> int:
     """Get the dart count for cached board."""
@@ -256,6 +710,60 @@ def get_cached_dart_count(board_id: str) -> int:
         if cache:
             return cache.get("dart_count", 0)
     return 0
+
+
+def is_near_existing_dart(board_id: str, cam_id: str, x: float, y: float, threshold_px: float = None) -> bool:
+    """
+    Check if a tip location is within threshold distance of any existing dart.
+    Like Machine Darts' is_new_dart() but inverted (returns True if near existing).
+    """
+    if threshold_px is None:
+        threshold_px = NEW_DART_DISTANCE_PX
+    
+    with _cache_lock:
+        cache = _mask_cache.get(board_id)
+        if not cache:
+            return False
+        
+        dart_locations = cache.get("dart_locations", {}).get(cam_id, [])
+        
+        for (dx, dy, _) in dart_locations:
+            dist = math.sqrt((x - dx)**2 + (y - dy)**2)
+            if dist < threshold_px:
+                logger.info(f"[LOCATION] Tip ({x:.1f}, {y:.1f}) is {dist:.1f}px from existing dart at ({dx:.1f}, {dy:.1f}) - REJECTED")
+                return True
+        
+        return False
+
+
+def add_dart_location(board_id: str, cam_id: str, x: float, y: float, confidence: float):
+    """
+    Record a detected dart's location for future comparison.
+    Like Machine Darts' add_dart_location().
+    """
+    with _cache_lock:
+        cache = _mask_cache.get(board_id)
+        if not cache:
+            return
+        
+        if "dart_locations" not in cache:
+            cache["dart_locations"] = {}
+        
+        if cam_id not in cache["dart_locations"]:
+            cache["dart_locations"][cam_id] = []
+        
+        cache["dart_locations"][cam_id].append((x, y, confidence))
+        logger.info(f"[LOCATION] Added dart location ({x:.1f}, {y:.1f}) for {cam_id}, total={len(cache['dart_locations'][cam_id])}")
+
+
+def clear_dart_locations(board_id: str):
+    """Clear all tracked dart locations (on board clear)."""
+    with _cache_lock:
+        cache = _mask_cache.get(board_id)
+        if cache and "dart_locations" in cache:
+            for cam_id in cache["dart_locations"]:
+                cache["dart_locations"][cam_id] = []
+            logger.info(f"[LOCATION] Cleared all dart locations for board {board_id}")
 
 def has_cache(board_id: str) -> bool:
     """Check if board has cache initialized."""
@@ -395,9 +903,11 @@ def get_segment_from_boundaries(point_angle_deg: float, segment_angles: List[flo
     
     num_boundaries = len(segment_angles)
     
+    # Use segment_20_index directly - same formula as calibration overlay
+    # The overlay draws correctly, so scoring should match exactly
+    
     # Debug: show segment_20_index and first few boundaries
-    logger.info(f"[SCORE] Boundaries: segment_20_index={segment_20_index}, point_angle={point_angle_deg:.1f}°, point_rad={point_rad:.3f}")
-    logger.info(f"[SCORE] First 5 boundaries (rad): {[f'{b:.3f}' for b in segment_angles[:5]]}")
+    logger.info(f"[SCORE] Boundaries: seg20_idx={segment_20_index}, point_angle={point_angle_deg:.1f}°, point_rad={point_rad:.3f}")
     
     # Find which boundary pair contains the point
     for i in range(num_boundaries):
@@ -409,7 +919,6 @@ def get_segment_from_boundaries(point_angle_deg: float, segment_angles: List[flo
             # Segment wraps around from +pi to -pi
             if point_rad >= start or point_rad < end:
                 # Found it! Now map boundary index to segment number
-                # boundary_index i corresponds to segment at position (i - segment_20_index) % 20
                 segment_pos = (i - segment_20_index) % 20
                 logger.info(f"[SCORE] Found in boundary {i} (wrap), segment_pos={segment_pos}, segment={DARTBOARD_SEGMENTS[segment_pos]}")
                 return DARTBOARD_SEGMENTS[segment_pos]
@@ -664,9 +1173,17 @@ async def detect_tips(
     Dart 2+: Update mask with diff, filter tips to NEW regions only.
     """
     start_time = time.time()
+    timings = {}  # Track timing for each step
+    
     request_id = str(uuid.uuid4())[:12]
     board_id = request.board_id or "default"
     dart_number = request.dart_number or 1
+    
+    # Warmup model if it's been idle (prevents cold start latency)
+    t0 = time.time()
+    if calibrator.tip_detector and calibrator.tip_detector.is_initialized:
+        calibrator.tip_detector.maybe_warmup()
+    timings['warmup'] = int((time.time() - t0) * 1000)
     
     logger.info(f"")
     logger.info(f"{'='*60}")
@@ -676,16 +1193,28 @@ async def detect_tips(
     # Cleanup old cache entries periodically
     _cleanup_old_cache()
     
+    # Track raw images for benchmark (before decoding)
+    raw_images_b64: Dict[str, str] = {}
+    for cam in request.cameras:
+        raw_images_b64[cam.camera_id] = cam.image
+    
     # Decode all images first
+    t0 = time.time()
     current_images: Dict[str, np.ndarray] = {}
     for cam in request.cameras:
         try:
             current_images[cam.camera_id] = decode_image(cam.image)
         except Exception as e:
             logger.error(f"[DETECT] Failed to decode image for {cam.camera_id}: {e}")
+    timings['decode'] = int((time.time() - t0) * 1000)
+    
+    # Track debug images for benchmark
+    debug_images: Dict[str, np.ndarray] = {}
+    calibrations_used: Dict[str, Dict] = {}
     
     # For dart 1: initialize baseline (these images become the reference)
     # For dart 2+: update masks with diff from baseline
+    t0 = time.time()
     masks: Dict[str, np.ndarray] = {}
     
     if dart_number == 1:
@@ -702,9 +1231,13 @@ async def detect_tips(
             logger.warning(f"[DETECT] No baseline for board {board_id}, treating as dart 1")
             init_board_cache(board_id, current_images)
             dart_number = 1
+    timings['mask'] = int((time.time() - t0) * 1000)
     
     all_tips = []
     camera_results = []
+    pipeline_data = {}  # Per-camera detailed detection pipeline
+    yolo_total_ms = 0
+    scoring_total_ms = 0
     
     for cam in request.cameras:
         logger.info(f"[DETECT] Camera {cam.camera_id}: image_len={len(cam.image)}, has_calibration={cam.calibration is not None}")
@@ -759,49 +1292,166 @@ async def detect_tips(
                 ))
                 continue
             
+            # Track calibration for benchmark
+            calibrations_used[cam.camera_id] = calibration_data
+            
             # Detect tips using YOLO - always on full image
+            t_yolo = time.time()
             tips = calibrator.detect_tips(
                 camera_id=cam.camera_id,
                 image_base64=cam.image,
                 calibration_data=calibration_data
             )
+            yolo_ms = int((time.time() - t_yolo) * 1000)
+            yolo_total_ms += yolo_ms
             
-            logger.info(f"[DETECT] Camera {cam.camera_id}: YOLO found {len(tips)} tips")
+            # === ADD MM COORDINATES TO ALL TIPS ===
+            # Transform pixel coords to dartboard mm coords for cross-camera matching
+            for tip in tips:
+                x_px = tip.get('x_px', 0)
+                y_px = tip.get('y_px', 0)
+                x_mm, y_mm = calibrator.pixel_to_dartboard(x_px, y_px, calibration_data)
+                tip['x_mm'] = x_mm
+                tip['y_mm'] = y_mm
             
-            # For dart 2+, filter tips to only those in NEW (76) regions of the mask
+            # Keep original tips for debug image AND benchmark
+            all_yolo_tips = [t.copy() for t in tips] if tips else []
+            
+            logger.info(f"[DETECT] Camera {cam.camera_id}: YOLO found {len(tips)} tips ({yolo_ms}ms)")
+            
+            # Track selected tip and context for debug image
+            selected_tip = None
+            selection_method = "none"  # Track how tip was selected
+            known_darts_for_debug = get_source_of_truth(board_id) if dart_number > 1 else []
+            new_centroid_for_debug = None
+            
+            # Track mask filter results for benchmark
+            mask_filter_results = []
+            tips_before_mask = len(tips)
+            
+            # === STEP 1: MASK FILTER (all darts) ===
+            # Filter tips to only those INSIDE the NEW mask region
+            # This eliminates flight detections and noise
             mask = masks.get(cam.camera_id)
-            if dart_number > 1 and tips and mask is not None:
-                original_count = len(tips)
-                filtered_tips = []
-                for t in tips:
-                    tx, ty = t.get('x_px', 0), t.get('y_px', 0)
-                    in_new = point_in_new_region(tx, ty, mask, margin=15)
-                    logger.info(f"[DETECT] Camera {cam.camera_id}: Tip ({tx:.1f}, {ty:.1f}) in NEW region? {in_new}")
-                    if in_new:
-                        filtered_tips.append(t)
-                tips = filtered_tips
-                logger.info(f"[DETECT] Camera {cam.camera_id}: Filtered {original_count} → {len(tips)} tips (NEW region only)")
+            tips_in_mask = []
+            mask_stats = {"has_mask": mask is not None, "new_pixels": 0, "old_pixels": 0}
+            if mask is not None:
+                # Count mask pixel stats
+                mask_stats["new_pixels"] = int(np.sum(mask == MASK_NEW))
+                mask_stats["old_pixels"] = int(np.sum(mask == MASK_OLD))
+                
+                if tips:
+                    for t in tips:
+                        tx, ty = t.get('x_px', 0), t.get('y_px', 0)
+                        in_region = point_in_new_region(tx, ty, mask, margin=15)
+                        mask_filter_results.append({
+                            "x_px": tx,
+                            "y_px": ty,
+                            "x_mm": t.get('x_mm', 0),
+                            "y_mm": t.get('y_mm', 0),
+                            "confidence": t.get('confidence', 0),
+                            "passed_mask": in_region
+                        })
+                        if in_region:
+                            tips_in_mask.append(t)
+                            logger.debug(f"[MASK] Tip ({tx:.1f}, {ty:.1f}) is IN NEW region")
+                        else:
+                            logger.debug(f"[MASK] Tip ({tx:.1f}, {ty:.1f}) is OUTSIDE NEW region - filtered")
+                    
+                    if tips_in_mask:
+                        logger.info(f"[DETECT] Camera {cam.camera_id}: {len(tips_in_mask)}/{len(tips)} tips in NEW mask region")
+                        tips = tips_in_mask
+                    else:
+                        logger.warning(f"[DETECT] Camera {cam.camera_id}: NO tips in NEW region, keeping all {len(tips)}")
             
-            # Only keep ONE tip per camera - the one closest to NEW region centroid
-            # This ensures we pick the actual new dart, not an old dart with high confidence
-            if len(tips) > 1:
-                centroid = get_new_region_centroid(mask) if mask is not None else None
-                if centroid:
-                    cx, cy = centroid
-                    # Sort by distance to centroid (ascending)
-                    tips = sorted(tips, key=lambda t: math.sqrt((t.get('x_px', 0) - cx)**2 + (t.get('y_px', 0) - cy)**2))
-                    best_tip = tips[0]
-                    dist = math.sqrt((best_tip.get('x_px', 0) - cx)**2 + (best_tip.get('y_px', 0) - cy)**2)
-                    logger.info(f"[DETECT] Camera {cam.camera_id}: Picked tip closest to NEW centroid ({cx:.1f}, {cy:.1f}), dist={dist:.1f}")
-                    tips = [best_tip]
+            tips_after_mask = len(tips)
+            
+            # Track MM elimination results
+            mm_elimination_results = []
+            
+            # === STEP 2: MM ELIMINATION (dart 2+) ===
+            # Use mm coordinates to eliminate known dart locations (per-camera matching)
+            if tips and dart_number > 1:
+                # Get known darts for this camera for logging
+                camera_known = get_source_of_truth_for_camera(board_id, cam.camera_id)
+                
+                new_tip = find_new_tip_by_elimination_mm(tips, board_id, cam.camera_id, match_threshold_mm=20.0)
+                if new_tip:
+                    logger.info(f"[DETECT] Camera {cam.camera_id}: Found new tip by MM elimination @ ({new_tip.get('x_mm', 0):.1f}, {new_tip.get('y_mm', 0):.1f})mm")
+                    selected_tip = new_tip
+                    selection_method = "mm_elimination"
+                    tips = [new_tip]
+                elif len(tips) == 1:
+                    # Only one tip after mask filter - use it
+                    selected_tip = tips[0]
+                    selection_method = "single_after_mask"
+                    logger.info(f"[DETECT] Camera {cam.camera_id}: Single tip after mask filter")
                 else:
-                    # Fallback: highest confidence
+                    # Multiple tips, elimination didn't help - pick highest confidence
                     tips = sorted(tips, key=lambda t: t.get('confidence', 0), reverse=True)[:1]
-                    logger.info(f"[DETECT] Camera {cam.camera_id}: Fallback - taking best conf tip (conf={tips[0].get('confidence', 0):.3f})")
+                    selected_tip = tips[0] if tips else None
+                    selection_method = "highest_confidence"
+                    logger.info(f"[DETECT] Camera {cam.camera_id}: Multiple tips, picked highest conf")
+            
+            # === STEP 3: DART 1 FINAL SELECTION ===
+            if dart_number == 1 and tips:
+                if len(tips) == 1:
+                    selected_tip = tips[0]
+                    selection_method = "single_tip"
+                else:
+                    # Multiple tips after mask filter - pick highest confidence
+                    tips = sorted(tips, key=lambda t: t.get('confidence', 0), reverse=True)[:1]
+                    selected_tip = tips[0]
+                    selection_method = "highest_confidence"
+                logger.info(f"[DETECT] Camera {cam.camera_id}: Dart 1 - selected tip conf={selected_tip.get('confidence', 0):.3f}")
+            
+            # === BUILD PIPELINE DATA FOR THIS CAMERA ===
+            pipeline_data[cam.camera_id] = {
+                "yolo_ms": yolo_ms,
+                "all_yolo_tips": [
+                    {
+                        "x_px": t.get('x_px', 0),
+                        "y_px": t.get('y_px', 0),
+                        "x_mm": t.get('x_mm', 0),
+                        "y_mm": t.get('y_mm', 0),
+                        "confidence": t.get('confidence', 0)
+                    }
+                    for t in all_yolo_tips
+                ],
+                "mask_stats": mask_stats,
+                "mask_filter_results": mask_filter_results,
+                "tips_before_mask": tips_before_mask,
+                "tips_after_mask": tips_after_mask,
+                "selection_method": selection_method,
+                "selected_tip": {
+                    "x_px": selected_tip.get('x_px', 0) if selected_tip else None,
+                    "y_px": selected_tip.get('y_px', 0) if selected_tip else None,
+                    "x_mm": selected_tip.get('x_mm', 0) if selected_tip else None,
+                    "y_mm": selected_tip.get('y_mm', 0) if selected_tip else None,
+                    "confidence": selected_tip.get('confidence', 0) if selected_tip else None
+                } if selected_tip else None
+            }
+            
+            # Save debug image with all tips marked (and capture for benchmark)
+            debug_img = save_debug_image(
+                request_id=request_id,
+                dart_number=dart_number,
+                camera_id=cam.camera_id,
+                image=current_img,
+                all_tips=all_yolo_tips,
+                selected_tip=selected_tip,
+                known_darts=known_darts_for_debug,
+                new_centroid=new_centroid_for_debug
+            )
+            if debug_img is not None:
+                debug_images[cam.camera_id] = debug_img
             
             # Calculate score for each tip
             for tip in tips:
+                t_score = time.time()
                 score_info = score_with_calibration(tip, calibration_data)
+                scoring_total_ms += int((time.time() - t_score) * 1000)
+                
                 tip['camera_id'] = cam.camera_id
                 tip['segment'] = score_info.get('segment', 0)
                 tip['multiplier'] = score_info.get('multiplier', 1)
@@ -821,7 +1471,7 @@ async def detect_tips(
                     zone=tip['zone']
                 )
                 
-                logger.info(f"[DETECT] Tip: segment={tip['segment']}, multiplier={tip['multiplier']}, score={tip['score']}, conf={tip.get('confidence', 0):.3f}")
+                logger.info(f"[DETECT] {cam.camera_id}: segment={tip['segment']}, multiplier={tip['multiplier']}, zone={tip['zone']}, score={tip['score']}, conf={tip.get('confidence', 0):.3f}")
             
             camera_results.append(CameraResult(
                 camera_id=cam.camera_id,
@@ -840,6 +1490,11 @@ async def detect_tips(
     clustered_tips = cluster_tips_by_segment(all_tips)
     logger.info(f"[DETECT] Clustered {len(all_tips)} tips into {len(clustered_tips)} clusters")
     
+    # Log per-camera votes for debugging
+    if all_tips:
+        votes_summary = ", ".join([f"{t.get('camera_id')}={t.get('segment')}x{t.get('multiplier')}" for t in all_tips])
+        logger.info(f"[VOTE] Camera votes: {votes_summary}")
+    
     # If all cameras see 1 dart each but clustering failed (mm coords don't match),
     # do segment-based voting across all tips
     if len(clustered_tips) > 1 and all(len(c) == 1 for c in clustered_tips):
@@ -849,6 +1504,11 @@ async def detect_tips(
     
     detected_tips = vote_on_scores(clustered_tips)
     
+    # Log final result vs votes
+    if detected_tips and all_tips:
+        winner = detected_tips[0]
+        logger.info(f"[VOTE] WINNER: {winner.segment}x{winner.multiplier}={winner.score} (from {len(all_tips)} cameras)")
+    
     # DartSensor triggers once per dart - we should only return 1 tip per request
     # Take the most confident one if multiple were detected
     if len(detected_tips) > 1:
@@ -856,11 +1516,58 @@ async def detect_tips(
         detected_tips = sorted(detected_tips, key=lambda t: t.confidence, reverse=True)[:1]
     
     # After successful detection, promote NEW pixels to OLD in the mask
+    # AND record the WINNING tip as source of truth
     if detected_tips:
         promote_new_to_old(board_id)
         logger.info(f"[DETECT] Promoted new→old for board {board_id}")
+        
+        # Find the winning tip (the one from all_tips that matches the voted result)
+        # Use the highest confidence tip from the winning segment/multiplier
+        for dt in detected_tips:
+            winning_tip = None
+            winning_conf = 0
+            for tip in all_tips:
+                if tip['segment'] == dt.segment and tip['multiplier'] == dt.multiplier:
+                    if tip.get('confidence', 0) > winning_conf:
+                        winning_conf = tip.get('confidence', 0)
+                        winning_tip = tip
+            
+            if winning_tip:
+                cam_id = winning_tip.get('camera_id')
+                x_px = winning_tip.get('x_px', 0)
+                y_px = winning_tip.get('y_px', 0)
+                x_mm = winning_tip.get('x_mm', 0)
+                y_mm = winning_tip.get('y_mm', 0)
+                # Record as source of truth with BOTH px and mm coords (legacy - single camera)
+                add_source_of_truth(board_id, cam_id, x_px, y_px, x_mm, y_mm, dart_number)
+                # Also add to general dart locations (for backwards compat)
+                add_dart_location(board_id, cam_id, x_px, y_px, winning_conf)
+    
+    # Store source of truth for ALL cameras (for per-camera mm elimination on next dart)
+    # all_tips contains the selected tip from each camera with their mm coords
+    if all_tips:
+        add_source_of_truth_all_cameras(board_id, dart_number, all_tips)
+    
+    # For dart 1: also mark detected tip locations as OLD so dart 2+ won't include them
+    if dart_number == 1 and all_tips:
+        for tip in all_tips:
+            cam_id = tip.get('camera_id')
+            x = tip.get('x_px', 0)
+            y = tip.get('y_px', 0)
+            if cam_id and x and y:
+                mark_tip_as_old(board_id, cam_id, x, y, radius=35)
+        logger.info(f"[DETECT] Marked {len(all_tips)} dart 1 tip locations as OLD")
     
     processing_ms = int((time.time() - start_time) * 1000)
+    
+    # Collect all timings
+    timings['yolo'] = yolo_total_ms
+    timings['scoring'] = scoring_total_ms
+    timings['total'] = processing_ms
+    
+    # Log timing breakdown
+    timing_str = ", ".join([f"{k}={v}ms" for k, v in timings.items()])
+    logger.info(f"[TIMING] {timing_str}")
     
     # Clear result summary
     if detected_tips:
@@ -868,10 +1575,77 @@ async def detect_tips(
         logger.info(f"")
         logger.info(f">>> RESULT: DART {dart_number} = {result_summary} ({processing_ms}ms)")
         logger.info(f"{'='*60}")
+        
+        # Log to centralized system with full timing breakdown
+        for t in detected_tips:
+            log_to_api("INFO", "Detection", f"Dart {dart_number}: {t.zone} {t.segment} = {t.score}",
+                      {"dart_number": dart_number, "segment": t.segment, "multiplier": t.multiplier,
+                       "score": t.score, "zone": t.zone, "confidence": t.confidence,
+                       "cameras_used": len(camera_results),
+                       "timing": timings})
     else:
         logger.info(f"")
         logger.info(f">>> RESULT: DART {dart_number} = NO DETECTION ({processing_ms}ms)")
         logger.info(f"{'='*60}")
+        
+        # Log no detection with timing
+        log_to_api("WARN", "Detection", f"Dart {dart_number}: No detection",
+                  {"dart_number": dart_number, "tips_found": len(all_tips),
+                   "cameras_used": len(camera_results),
+                   "timing": timings})
+    
+    # === Save Benchmark Data ===
+    # Only save if benchmark logging is enabled (via Settings UI)
+    if BENCHMARK_ENABLED:
+        # Build final result info
+        final_result = {}
+        if detected_tips:
+            t = detected_tips[0]
+            final_result = {
+                "segment": t.segment,
+                "multiplier": t.multiplier,
+                "score": t.score,
+                "zone": t.zone,
+                "confidence": t.confidence
+            }
+        
+        # Build per-camera results for metadata including what each camera detected
+        camera_data = []
+        for cr in camera_results:
+            # Find tips from this camera to include per-camera segment votes
+            camera_tips = [t for t in all_tips if t.get('camera_id') == cr.camera_id]
+            tip_info = None
+            if camera_tips:
+                t = camera_tips[0]  # Usually just 1 tip per camera
+                tip_info = {
+                    "segment": t.get('segment'),
+                    "multiplier": t.get('multiplier'),
+                    "zone": t.get('zone'),
+                    "score": t.get('score'),
+                    "confidence": t.get('confidence')
+                }
+            camera_data.append({
+                "camera_id": cr.camera_id,
+                "tips_detected": cr.tips_detected,
+                "error": cr.error,
+                "detected": tip_info
+            })
+        
+        # Save benchmark data
+        benchmark_path = save_benchmark_data(
+            dart_number=dart_number,
+            request_id=request_id,
+            raw_images=raw_images_b64,
+            debug_images=debug_images,
+            camera_results=camera_data,
+            final_result=final_result,
+            calibrations=calibrations_used,
+            timings=timings,
+            pipeline_data=pipeline_data
+        )
+        
+        if benchmark_path:
+            logger.info(f"[BENCHMARK] Saved to {benchmark_path}")
     
     return DetectResponse(
         request_id=request_id,
@@ -1207,3 +1981,225 @@ async def measure_focus(request: FocusRequest):
     except Exception as e:
         logger.error(f"[FOCUS] Error measuring focus: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# === Benchmark API Endpoints ===
+
+class BenchmarkContextRequest(BaseModel):
+    """Request to set benchmark context."""
+    board_id: Optional[str] = None
+    game_id: Optional[str] = None
+    round_num: Optional[int] = None
+    player_name: Optional[str] = None
+
+
+class BenchmarkCorrectionRequest(BaseModel):
+    """Request to record a dart correction."""
+    dart_path: Optional[str] = None  # Full path, or...
+    dart_number: Optional[int] = None  # Just dart number (1,2,3) to use tracked path
+    game_id: Optional[str] = None  # Game ID for precise matching
+    original_segment: int
+    original_multiplier: int
+    corrected_segment: int
+    corrected_multiplier: int
+
+
+@router.get("/v1/benchmark/status")
+async def get_benchmark_status():
+    """Get current benchmark status and context."""
+    return {
+        "enabled": BENCHMARK_ENABLED,
+        "directory": str(BENCHMARK_DIR),
+        "context": _benchmark_context.copy()
+    }
+
+
+@router.post("/v1/benchmark/enable")
+async def enable_benchmark():
+    """Enable benchmark logging."""
+    set_benchmark_enabled(True)
+    return {"enabled": True, "directory": str(BENCHMARK_DIR)}
+
+
+@router.post("/v1/benchmark/disable")
+async def disable_benchmark():
+    """Disable benchmark logging."""
+    set_benchmark_enabled(False)
+    return {"enabled": False}
+
+
+@router.post("/v1/benchmark/clear")
+async def clear_benchmark():
+    """Clear all benchmark data (images and metadata)."""
+    import shutil
+    try:
+        if BENCHMARK_DIR.exists():
+            shutil.rmtree(BENCHMARK_DIR)
+            BENCHMARK_DIR.mkdir(parents=True, exist_ok=True)
+            logger.info(f"[BENCHMARK] Cleared all benchmark data from {BENCHMARK_DIR}")
+            return {"cleared": True, "message": "All benchmark data cleared"}
+        else:
+            return {"cleared": True, "message": "No benchmark data to clear"}
+    except Exception as e:
+        logger.error(f"[BENCHMARK] Failed to clear data: {e}")
+        return {"cleared": False, "error": str(e)}
+
+
+@router.post("/v1/benchmark/context")
+async def update_benchmark_context(request: BenchmarkContextRequest):
+    """Update benchmark context (called when game state changes)."""
+    set_benchmark_context(
+        board_id=request.board_id,
+        game_id=request.game_id,
+        round_num=request.round_num,
+        player_name=request.player_name
+    )
+    return {"context": _benchmark_context.copy()}
+
+
+@router.post("/v1/benchmark/correction")
+async def record_benchmark_correction(request: BenchmarkCorrectionRequest):
+    """Record a dart correction for accuracy analysis."""
+    # If dart_path not provided, try to find it from recent tracking
+    dart_path = request.dart_path
+    
+    if not dart_path and request.dart_number:
+        # Try precise match with game_id first
+        if request.game_id:
+            dart_path = _last_dart_paths.get((request.game_id, request.dart_number))
+            logger.info(f"[BENCHMARK] Looking up path for game={request.game_id}, dart={request.dart_number}: {dart_path}")
+        
+        # Fallback to dart_number only (most recent)
+        if not dart_path:
+            dart_path = _last_dart_paths.get(request.dart_number)
+            logger.info(f"[BENCHMARK] Fallback lookup for dart={request.dart_number}: {dart_path}")
+        
+        # Last resort: search history for most recent dart with this number
+        if not dart_path and _dart_path_history:
+            for entry in reversed(_dart_path_history):
+                if entry["dart_number"] == request.dart_number:
+                    dart_path = entry["path"]
+                    logger.info(f"[BENCHMARK] History lookup for dart={request.dart_number}: {dart_path}")
+                    break
+    
+    if not dart_path:
+        logger.warning(f"[BENCHMARK] No dart_path found for game={request.game_id}, dart={request.dart_number}")
+        return {"success": False, "error": "No dart path available"}
+    
+    save_benchmark_correction(
+        dart_path=dart_path,
+        original={
+            "segment": request.original_segment,
+            "multiplier": request.original_multiplier
+        },
+        corrected={
+            "segment": request.corrected_segment,
+            "multiplier": request.corrected_multiplier
+        }
+    )
+    return {"success": True}
+
+
+@router.get("/v1/benchmark/games")
+async def list_benchmark_games():
+    """List all games with benchmark data."""
+    games = []
+    
+    if not BENCHMARK_DIR.exists():
+        return {"games": []}
+    
+    for board_dir in BENCHMARK_DIR.iterdir():
+        if not board_dir.is_dir():
+            continue
+        
+        for game_dir in board_dir.iterdir():
+            if not game_dir.is_dir():
+                continue
+            
+            # Count darts and corrections
+            total_darts = 0
+            corrections = 0
+            
+            for round_dir in game_dir.iterdir():
+                if not round_dir.is_dir():
+                    continue
+                for dart_dir in round_dir.iterdir():
+                    if not dart_dir.is_dir():
+                        continue
+                    total_darts += 1
+                    if (dart_dir / "correction.json").exists():
+                        corrections += 1
+            
+            if total_darts > 0:
+                accuracy = ((total_darts - corrections) / total_darts) * 100
+                games.append({
+                    "board_id": board_dir.name,
+                    "game_id": game_dir.name,
+                    "path": str(game_dir),
+                    "total_darts": total_darts,
+                    "corrections": corrections,
+                    "accuracy": round(accuracy, 1)
+                })
+    
+    # Sort by most recent first (game_id often contains timestamp)
+    games.sort(key=lambda g: g["game_id"], reverse=True)
+    
+    return {"games": games}
+
+
+@router.get("/v1/benchmark/games/{board_id}/{game_id}/darts")
+async def get_benchmark_game_darts(board_id: str, game_id: str):
+    """Get all darts for a specific game with their detection details."""
+    game_dir = BENCHMARK_DIR / board_id / game_id
+    
+    if not game_dir.exists():
+        raise HTTPException(status_code=404, detail="Game not found")
+    
+    darts = []
+    
+    for round_dir in sorted(game_dir.iterdir()):
+        if not round_dir.is_dir():
+            continue
+        
+        for dart_dir in sorted(round_dir.iterdir()):
+            if not dart_dir.is_dir():
+                continue
+            
+            dart_info = {
+                "path": str(dart_dir),
+                "round": round_dir.name,
+                "dart": dart_dir.name,
+                "has_correction": (dart_dir / "correction.json").exists()
+            }
+            
+            # Load metadata if exists
+            meta_path = dart_dir / "metadata.json"
+            if meta_path.exists():
+                with open(meta_path) as f:
+                    dart_info["metadata"] = json.load(f)
+            
+            # Load correction if exists
+            correction_path = dart_dir / "correction.json"
+            if correction_path.exists():
+                with open(correction_path) as f:
+                    dart_info["correction"] = json.load(f)
+            
+            # List available images
+            dart_info["images"] = [f.name for f in dart_dir.iterdir() if f.suffix in ['.jpg', '.png']]
+            
+            darts.append(dart_info)
+    
+    return {"darts": darts}
+
+
+@router.get("/v1/benchmark/image/{board_id}/{game_id}/{round_name}/{dart_name}/{image_name}")
+async def get_benchmark_image(board_id: str, game_id: str, round_name: str, dart_name: str, image_name: str):
+    """Get a benchmark image as base64."""
+    from fastapi.responses import FileResponse
+    
+    image_path = BENCHMARK_DIR / board_id / game_id / round_name / dart_name / image_name
+    
+    if not image_path.exists():
+        raise HTTPException(status_code=404, detail="Image not found")
+    
+    return FileResponse(image_path, media_type="image/jpeg")

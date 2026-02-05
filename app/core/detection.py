@@ -5,8 +5,9 @@ Uses YOLO pose estimation to detect dart tips in images.
 Based on the original DartDetector approach.
 """
 import os
-# Set OpenVINO to optimize for latency (keeps model warm)
-os.environ.setdefault('OPENVINO_TPUT_MODE', 'LATENCY')
+# OpenVINO optimizations
+os.environ.setdefault('OPENVINO_CACHE_DIR', r'C:\Users\clawd\openvino_cache')  # Compiled model cache
+os.environ.setdefault('OV_GPU_CACHE_MODEL', '1')  # GPU kernel caching
 
 import cv2
 import numpy as np
@@ -78,7 +79,7 @@ class DartTipDetector:
         self.is_pose_model = False
         self.image_size = 1280  # Default size
         self._last_inference_time = 0
-        self._warmup_interval = 3  # Run inference every 3 seconds to keep model hot
+        self._warmup_interval = 2  # Warmup if no inference in last 2 seconds
         self._warmup_thread = None
         self._stop_warmup = False
         self._warmup_image = None  # Store a calibration image for warmups
@@ -111,45 +112,42 @@ class DartTipDetector:
         return None
     
     def _start_background_warmup(self):
-        """Start background thread to keep model warm using real camera images."""
+        """Start background thread to keep model warm.
+        
+        OpenVINO goes cold after ~4-5 seconds idle, causing 300-500ms latency spike.
+        This thread runs inference every 2 seconds to prevent that.
+        """
         import threading
         
         def warmup_loop():
             import time
             dummy_img = np.zeros((640, 640, 3), dtype=np.uint8)
+            warmup_count = 0
             
             while not self._stop_warmup:
                 try:
                     if self.is_initialized and self.model is not None:
-                        # Only warmup if no recent inference
-                        if time.time() - self._last_inference_time > self._warmup_interval:
-                            # Try to get a real image
-                            warmup_img = None
+                        # Only warmup if no real inference recently
+                        time_since_last = time.time() - self._last_inference_time
+                        if time_since_last > 2.0:
+                            # Use cached camera image if available, else dummy
+                            warmup_img = self._warmup_image if self._warmup_image is not None else dummy_img
                             
-                            # Option 1: Use stored warmup image
-                            if self._warmup_image is not None:
-                                warmup_img = self._warmup_image
-                            # Option 2: Fetch live camera snapshot (every 10th warmup)
-                            elif self._warmup_counter % 10 == 0:
-                                warmup_img = self._fetch_camera_snapshot()
-                                if warmup_img is not None:
-                                    self._warmup_image = warmup_img  # Cache it
-                            
-                            # Fallback to dummy
-                            if warmup_img is None:
-                                warmup_img = dummy_img
-                            
-                            # Run inference
+                            # Run inference silently
+                            start = time.time()
                             _ = self.model(warmup_img, imgsz=self.image_size, verbose=False)
+                            elapsed = (time.time() - start) * 1000
                             self._last_inference_time = time.time()
-                            self._warmup_counter += 1
+                            warmup_count += 1
+                            if warmup_count % 10 == 1:  # Log every 10th warmup
+                                print(f"[WARMUP] #{warmup_count} - {elapsed:.0f}ms (idle was {time_since_last:.1f}s)")
                 except Exception as e:
-                    pass
-                time.sleep(2)  # Check every 2 seconds
+                    print(f"[WARMUP] Error: {e}")
+                time.sleep(1.0)  # Check every 1 second
         
         self._warmup_thread = threading.Thread(target=warmup_loop, daemon=True)
         self._warmup_thread.start()
-        print("Background warmup thread started (uses real camera images)")
+        print("Background warmup thread started (keeps model hot)")
     
     def _load_model(self):
         """Load the YOLO tip detection model."""
@@ -214,8 +212,13 @@ class DartTipDetector:
     def maybe_warmup(self):
         """Warmup if model has been idle too long."""
         import time
-        if time.time() - self._last_inference_time > self._warmup_interval:
+        time_since_last = time.time() - self._last_inference_time
+        if time_since_last > self._warmup_interval:
+            print(f"[WARMUP] Model was idle {time_since_last:.1f}s, warming up...")
+            start = time.time()
             self.warmup()
+            elapsed = (time.time() - start) * 1000
+            print(f"[WARMUP] Done in {elapsed:.0f}ms")
     
     def detect_tips(
         self, 
@@ -272,8 +275,10 @@ class DartTipDetector:
                 x1, y1, x2, y2 = boxes.xyxy[i].cpu().numpy()
                 
                 # Default to box center
-                cx = (x1 + x2) / 2
-                cy = (y1 + y2) / 2
+                box_cx = (x1 + x2) / 2
+                box_cy = (y1 + y2) / 2
+                cx, cy = box_cx, box_cy
+                used_keypoint = False
                 
                 # Prefer keypoint if available with good confidence
                 kp = None
@@ -283,12 +288,16 @@ class DartTipDetector:
                         if len(kp_data) > 0:
                             tip_kp = kp_data[0][0]  # First keypoint
                             kp_conf = tip_kp[2] if len(tip_kp) > 2 else 0
+                            print(f"[YOLO] Box=({box_cx:.1f},{box_cy:.1f}) KP=({tip_kp[0]:.1f},{tip_kp[1]:.1f}) kp_conf={kp_conf:.2f} box_conf={conf:.2f}")
                             # Use keypoint if confident and valid
-                            if kp_conf > 0.5 and tip_kp[0] > 0 and tip_kp[1] > 0:
+                            if kp_conf > 0.3 and tip_kp[0] > 0 and tip_kp[1] > 0:
                                 cx, cy = tip_kp[0], tip_kp[1]
+                                used_keypoint = True
                             kp = kp_data[0]
                     except Exception as e:
                         print(f"Error processing keypoints: {e}")
+                else:
+                    print(f"[YOLO] Box=({box_cx:.1f},{box_cy:.1f}) NO KEYPOINTS (pose={self.is_pose_model})")
                 
                 tips.append(DetectedTip(
                     x=float(cx),
