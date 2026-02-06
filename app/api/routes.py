@@ -1125,7 +1125,7 @@ def score_with_calibration(tip_data: Dict[str, Any], calibration_data: Dict[str,
     # Check bullseye first
     if point_in_ellipse(point, bullseye_ellipse):
         print(f"[SCORE] Zone: inner_bull (bullseye)")
-        return {"score": 50, "multiplier": 1, "segment": 0, "zone": "inner_bull"}
+        return {"score": 50, "multiplier": 2, "segment": 25, "zone": "inner_bull"}  # Bull counts as double for checkout!
     
     # Check outer bull
     if point_in_ellipse(point, bull_ellipse):
@@ -2048,7 +2048,7 @@ def score_from_polar(angle_deg: float, norm_dist: float) -> dict:
     
     # Determine zone from normalized distance
     if norm_dist <= BULLSEYE_NORM:
-        return {"score": 50, "multiplier": 1, "segment": 0, "zone": "inner_bull", "boundary_distance_deg": 9.0}
+        return {"score": 50, "multiplier": 2, "segment": 25, "zone": "inner_bull", "boundary_distance_deg": 9.0}  # Double!
     elif norm_dist <= OUTER_BULL_NORM:
         return {"score": 25, "multiplier": 1, "segment": 0, "zone": "outer_bull", "boundary_distance_deg": 9.0}
     elif norm_dist > OUTER_DOUBLE_NORM * 1.05:  # 5% tolerance
