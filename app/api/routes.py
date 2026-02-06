@@ -3211,15 +3211,31 @@ async def auto_tune_parameters():
     """
     global CONFIDENCE_THRESHOLD
     
-    # Get all benchmark data
+    # Get all benchmark data from disk
     all_darts = []
-    for board_id, games in benchmark_storage.items():
-        for game_id, game_data in games.items():
-            for dart in game_data.get("darts", []):
-                dart_copy = dart.copy()
-                dart_copy["board_id"] = board_id
-                dart_copy["game_id"] = game_id
-                all_darts.append(dart_copy)
+    benchmark_dir = Path(BENCHMARK_DIR)
+    
+    if benchmark_dir.exists():
+        for board_dir in benchmark_dir.iterdir():
+            if not board_dir.is_dir():
+                continue
+            board_id = board_dir.name
+            
+            for game_dir in board_dir.iterdir():
+                if not game_dir.is_dir():
+                    continue
+                game_id = game_dir.name
+                
+                # Load darts from JSON files
+                for dart_file in game_dir.glob("round_*/dart_*.json"):
+                    try:
+                        with open(dart_file, 'r') as f:
+                            dart_data = json.load(f)
+                        dart_data["board_id"] = board_id
+                        dart_data["game_id"] = game_id
+                        all_darts.append(dart_data)
+                    except Exception as e:
+                        logger.warning(f"Error loading {dart_file}: {e}")
     
     if len(all_darts) < 5:
         return {
