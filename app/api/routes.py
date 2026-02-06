@@ -3233,6 +3233,26 @@ async def auto_tune_parameters():
                             dart_data = json.load(f)
                         dart_data["board_id"] = board_id
                         dart_data["game_id"] = game_id
+                        
+                        # Check for correction file
+                        correction_file = dart_file.parent / "correction.json"
+                        if correction_file.exists():
+                            try:
+                                with open(correction_file, 'r') as cf:
+                                    correction = json.load(cf)
+                                dart_data["was_corrected"] = True
+                                dart_data["original_segment"] = correction.get("original", {}).get("segment")
+                                dart_data["original_multiplier"] = correction.get("original", {}).get("multiplier")
+                                dart_data["final_segment"] = correction.get("corrected", {}).get("segment")
+                                dart_data["final_multiplier"] = correction.get("corrected", {}).get("multiplier")
+                            except Exception as ce:
+                                logger.warning(f"Error loading correction {correction_file}: {ce}")
+                        else:
+                            dart_data["was_corrected"] = False
+                            # Use detected values as final
+                            dart_data["final_segment"] = dart_data.get("detected_segment", dart_data.get("segment"))
+                            dart_data["final_multiplier"] = dart_data.get("detected_multiplier", dart_data.get("multiplier"))
+                        
                         all_darts.append(dart_data)
                     except Exception as e:
                         logger.warning(f"Error loading {dart_file}: {e}")
