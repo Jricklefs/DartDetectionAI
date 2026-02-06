@@ -2277,6 +2277,10 @@ def vote_on_scores(clusters: List[List[dict]]) -> List[DetectedTip]:
                 'cal_quality': cal_quality
             })
         
+        # Find initial winning vote from weighted voting (always needed)
+        winning_key = max(votes.keys(), key=lambda k: votes[k])
+        winning_segment, winning_multiplier = winning_key
+        
         # Detect disagreement
         unique_votes = len(votes)
         if unique_votes > 1:
@@ -2293,9 +2297,6 @@ def vote_on_scores(clusters: List[List[dict]]) -> List[DetectedTip]:
                 total_weight = sum(d['weight'] for d in details)
                 logger.info(f"[VOTE]   {seg}x{mult}: {cam_info} total_weight={total_weight:.2f}")
             
-            # Find initial winning vote from weighted voting
-            winning_key = max(votes.keys(), key=lambda k: votes[k])
-            winning_segment, winning_multiplier = winning_key
             logger.info(f"[VOTE] Initial vote winner: {winning_segment}x{winning_multiplier} (weight={votes[winning_key]:.2f})")
             
             # POLAR AVERAGING: When cameras disagree, average polar coordinates
