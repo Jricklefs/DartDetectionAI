@@ -2290,10 +2290,11 @@ def vote_on_scores(clusters: List[List[dict]]) -> List[DetectedTip]:
             
             # POLAR AVERAGING: When cameras disagree, average polar coordinates
             # (mm coordinates are camera-specific, polar coords are comparable)
-            avg_angle, avg_dist, avg_weight = weighted_polar_average(cluster)
-            if avg_weight > 0:
-                pos_score = score_from_polar(avg_angle, avg_dist)
-                logger.info(f"[VOTE] Polar average: angle={avg_angle:.1f}°, dist={avg_dist:.3f}")
+            try:
+                avg_angle, avg_dist, avg_weight = weighted_polar_average(cluster)
+                if avg_weight > 0:
+                    pos_score = score_from_polar(avg_angle, avg_dist)
+                    logger.info(f"[VOTE] Polar average: angle={avg_angle:.1f}°, dist={avg_dist:.3f}")
                 pos_segment = pos_score['segment']
                 pos_multiplier = pos_score['multiplier']
                 pos_key = (pos_segment, pos_multiplier)
@@ -2306,6 +2307,8 @@ def vote_on_scores(clusters: List[List[dict]]) -> List[DetectedTip]:
                     if pos_boundary > 2.0:  # Not on a wire
                         logger.info(f"[VOTE] Position averaging suggests {pos_segment}x{pos_multiplier} (boundary={pos_boundary:.1f}°)")
                         logger.info(f"[VOTE] OVERRIDE: Using position average instead of vote winner")
+            except Exception as polar_err:
+                logger.warning(f"[VOTE] Polar averaging failed: {polar_err}")
 
             # Check if stereo triangulation is available and enabled
             if TRIANGULATION_MODE == "stereo":
