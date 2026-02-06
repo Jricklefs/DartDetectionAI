@@ -313,19 +313,27 @@ def save_benchmark_data(
         
         # Include full calibration data for replay (needed for scoring)
         for cam_id, cal in calibrations.items():
+            # Normalize ellipse key names - DartGame API may use old names
+            # Old: triple_ellipse, double_ellipse, inner_single_ellipse, outer_single_ellipse
+            # New: outer_triple_ellipse, inner_triple_ellipse, outer_double_ellipse, inner_double_ellipse
+            outer_double = cal.get("outer_double_ellipse") or cal.get("double_ellipse")
+            inner_double = cal.get("inner_double_ellipse") or cal.get("inner_single_ellipse")
+            outer_triple = cal.get("outer_triple_ellipse") or cal.get("triple_ellipse")
+            inner_triple = cal.get("inner_triple_ellipse") or cal.get("outer_single_ellipse")
+            
             # Save essential scoring fields (ellipses and segment angles for proper scoring)
             metadata["calibrations"][cam_id] = {
                 "center": cal.get("center"),
                 "segment_20_index": cal.get("segment_20_index"),
                 "rotation_offset_deg": cal.get("rotation_offset_deg"),
                 "quality": cal.get("quality"),
-                # These are needed for score_from_ellipse_calibration:
+                # Ring ellipses for multiplier detection (normalized key names):
                 "bullseye_ellipse": cal.get("bullseye_ellipse"),
                 "bull_ellipse": cal.get("bull_ellipse"),
-                "triple_ellipse": cal.get("triple_ellipse"),
-                "double_ellipse": cal.get("double_ellipse"),
-                "inner_single_ellipse": cal.get("inner_single_ellipse"),
-                "outer_single_ellipse": cal.get("outer_single_ellipse"),
+                "outer_double_ellipse": outer_double,
+                "inner_double_ellipse": inner_double,
+                "outer_triple_ellipse": outer_triple,
+                "inner_triple_ellipse": inner_triple,
                 "segment_angles": cal.get("segment_angles"),
                 "segment_boundaries": cal.get("segment_boundaries"),
             }
@@ -1075,13 +1083,14 @@ def score_with_calibration(tip_data: Dict[str, Any], calibration_data: Dict[str,
     
     center = calibration_data.get('center', [0, 0])
     
-    # Get calibrated ellipses
+    # Get calibrated ellipses - dartboard layout from outside to center:
+    # outer_double_ellipse (board edge) -> inner_double_ellipse -> outer_triple_ellipse -> inner_triple_ellipse -> bull
     bullseye_ellipse = calibration_data.get('bullseye_ellipse')
     bull_ellipse = calibration_data.get('bull_ellipse')
-    board_edge = calibration_data.get('outer_double_ellipse')      # Board outer edge
-    double_inner = calibration_data.get('inner_triple_ellipse')    # Inner edge of double ring
-    triple_outer = calibration_data.get('outer_triple_ellipse')    # Outer edge of triple ring  
-    triple_inner = calibration_data.get('inner_double_ellipse')    # Inner edge of triple ring
+    board_edge = calibration_data.get('outer_double_ellipse')       # Outermost edge of board
+    double_inner = calibration_data.get('inner_double_ellipse')     # Inner edge of double ring
+    triple_outer = calibration_data.get('outer_triple_ellipse')     # Outer edge of triple ring  
+    triple_inner = calibration_data.get('inner_triple_ellipse')     # Inner edge of triple ring
     
     # Calculate angle from center in PIXEL space (in degrees, 0-360)
     dx = x_px - center[0]
@@ -1489,6 +1498,7 @@ async def detect_tips(
                         })
                         if in_region:
                             tips_in_mask.append(t)
+                            t['found_in_new_region'] = True  # Mark as found in NEW region
                             logger.debug(f"[MASK] Tip ({tx:.1f}, {ty:.1f}) is IN NEW region")
                         else:
                             logger.debug(f"[MASK] Tip ({tx:.1f}, {ty:.1f}) is OUTSIDE NEW region - filtered")
@@ -1512,6 +1522,8 @@ async def detect_tips(
                         
                         # Only use if reasonably close (within 100px)
                         if closest_dist < 100:
+                            closest_tip['found_in_new_region'] = False  # Mark as fallback
+                            closest_tip['centroid_distance_px'] = closest_dist
                             tips = [closest_tip]
                             logger.info(f"[DETECT] Camera {cam.camera_id}: No tips in NEW, using closest to centroid (dist={closest_dist:.1f}px)")
                         else:
@@ -1886,10 +1898,11 @@ def vote_on_scores(clusters: List[List[dict]]) -> List[DetectedTip]:
     """
     For each cluster (same dart seen by multiple cameras), vote on the score.
     
-    Uses majority voting:
+    Uses weighted voting:
+    - Tips found IN the NEW mask region get full weight
+    - Tips found via centroid fallback (not in NEW region) get heavily reduced weight (0.1x)
     - Each camera's detection votes for its calculated segment/multiplier
-    - Majority wins (if 2+ cameras agree)
-    - If no majority, use highest confidence detection
+    - Highest weighted vote wins
     """
     detected_tips = []
     
@@ -1918,10 +1931,24 @@ def vote_on_scores(clusters: List[List[dict]]) -> List[DetectedTip]:
         votes = {}
         total_confidence = 0.0
         
+        # Check if ANY tip was found in NEW region
+        tips_in_new = [t for t in cluster if t.get('found_in_new_region', True)]
+        tips_fallback = [t for t in cluster if not t.get('found_in_new_region', True)]
+        
+        # Log the voting situation
+        if tips_in_new and tips_fallback:
+            logger.info(f"[VOTE] {len(tips_in_new)} tips in NEW region, {len(tips_fallback)} via fallback")
+        
         for tip in cluster:
             key = (tip['segment'], tip['multiplier'])
             # Base weight is YOLO confidence
             weight = tip['confidence']
+            
+            # MAJOR weight reduction for tips NOT found in NEW region
+            # These are fallback tips that might be picking old darts
+            if not tip.get('found_in_new_region', True):
+                weight *= 0.1  # 90% reduction for fallback tips
+                logger.debug(f"[VOTE] {tip.get('camera_id')} tip NOT in NEW region - weight reduced to {weight:.3f}")
             
             # If boundary_distance_deg is available, boost weight for darts far from wires
             # Each segment is 18°, so max distance from boundary is 9°
@@ -2451,8 +2478,20 @@ async def replay_single_dart(request: ReplayRequest):
         if img is not None:
             baselines[cam_id] = img
     
-    # Get calibrations from metadata
-    saved_calibrations = metadata.get("calibrations", {})
+    # Get calibrations from metadata and normalize key names
+    raw_calibrations = metadata.get("calibrations", {})
+    saved_calibrations = {}
+    for cam_id, cal in raw_calibrations.items():
+        # Normalize ellipse key names - old benchmark data may use different names
+        # Old: triple_ellipse, double_ellipse, inner_single_ellipse, outer_single_ellipse
+        # New: outer_triple_ellipse, inner_triple_ellipse, outer_double_ellipse, inner_double_ellipse
+        saved_calibrations[cam_id] = {
+            **cal,  # Keep all original keys
+            "outer_double_ellipse": cal.get("outer_double_ellipse") or cal.get("double_ellipse"),
+            "inner_double_ellipse": cal.get("inner_double_ellipse") or cal.get("inner_single_ellipse"),
+            "outer_triple_ellipse": cal.get("outer_triple_ellipse") or cal.get("triple_ellipse"),
+            "inner_triple_ellipse": cal.get("inner_triple_ellipse") or cal.get("outer_single_ellipse"),
+        }
     from app.core.detection import score_from_ellipse_calibration
     # Get pipeline data with original tip locations
     pipeline_data = metadata.get("pipeline", {})
@@ -2642,3 +2681,111 @@ async def replay_all_darts(request: ReplayAllRequest = None):
         "results": results
     }
 
+@router.post("/v1/benchmark/replay-all-darts")
+async def replay_all_darts_full(request: ReplayAllRequest = None):
+    """
+    Replay ALL benchmark darts (not just corrected ones).
+    Returns comparison of original detection vs replay detection.
+    """
+    if request is None:
+        request = ReplayAllRequest()
+    
+    board_dir = BENCHMARK_DIR / request.board_id
+    if not board_dir.exists():
+        return {"error": "Board not found", "total_darts": 0}
+    
+    results = []
+    total_darts = 0
+    match_count = 0
+    corrected_count = 0
+    corrected_now_correct = 0
+    
+    # Find ALL darts
+    for game_dir in sorted(board_dir.iterdir(), reverse=True):
+        if not game_dir.is_dir():
+            continue
+        
+        for round_dir in game_dir.iterdir():
+            if not round_dir.is_dir():
+                continue
+            
+            for dart_dir in round_dir.iterdir():
+                if not dart_dir.is_dir():
+                    continue
+                
+                if total_darts >= request.limit:
+                    break
+                
+                meta_path = dart_dir / "metadata.json"
+                if not meta_path.exists():
+                    continue
+                
+                total_darts += 1
+                
+                # Check if has correction
+                correction_path = dart_dir / "correction.json"
+                has_correction = correction_path.exists()
+                if has_correction:
+                    corrected_count += 1
+                
+                # Replay this dart
+                try:
+                    replay_result = await replay_single_dart(ReplayRequest(dart_path=str(dart_dir)))
+                    
+                    if replay_result.get("success"):
+                        original = replay_result.get("original", {})
+                        new_result = replay_result.get("new_result", {})
+                        corrected = replay_result.get("corrected")
+                        
+                        # Check if replay matches original
+                        orig_match = (
+                            original.get("segment") == new_result.get("segment") and
+                            original.get("multiplier") == new_result.get("multiplier")
+                        )
+                        if orig_match:
+                            match_count += 1
+                        
+                        # Check if corrected dart is now correct
+                        now_correct = False
+                        if has_correction and corrected:
+                            now_correct = (
+                                corrected.get("segment") == new_result.get("segment") and
+                                corrected.get("multiplier") == new_result.get("multiplier")
+                            )
+                            if now_correct:
+                                corrected_now_correct += 1
+                        
+                        results.append({
+                            "dart_path": str(dart_dir),
+                            "round": dart_dir.parent.name,
+                            "dart": dart_dir.name,
+                            "original": original,
+                            "new_result": new_result,
+                            "matches_original": orig_match,
+                            "had_correction": has_correction,
+                            "corrected_to": corrected,
+                            "now_correct": now_correct if has_correction else None
+                        })
+                    else:
+                        results.append({
+                            "dart_path": str(dart_dir),
+                            "error": replay_result.get("error")
+                        })
+                except Exception as e:
+                    results.append({
+                        "dart_path": str(dart_dir),
+                        "error": str(e)
+                    })
+    
+    consistency = 0 if total_darts == 0 else (match_count / total_darts) * 100
+    correction_rate = 0 if corrected_count == 0 else (corrected_now_correct / corrected_count) * 100
+    
+    return {
+        "total_darts": total_darts,
+        "matches_original": match_count,
+        "consistency": f"{consistency:.1f}%",
+        "had_corrections": corrected_count,
+        "corrections_now_fixed": corrected_now_correct,
+        "correction_fix_rate": f"{correction_rate:.1f}%",
+        "results": results
+    }

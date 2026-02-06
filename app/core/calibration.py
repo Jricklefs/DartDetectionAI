@@ -186,10 +186,10 @@ class YOLOCalibrationDetector:
         Model class mapping (dartboard1280imgz):
         - 0: '20' - segment 20 marker
         - 2: bull
-        - 3: cal - outer double ring
-        - 4: cal1 - outer triple ring
-        - 5: cal2 - inner triple ring
-        - 6: cal3 - inner double ring
+        - 3: cal - outer double ring (board edge, ~170mm)
+        - 4: cal1 - inner double ring (~162mm)
+        - 5: cal2 - outer triple ring (~107mm)
+        - 6: cal3 - inner triple ring (~99mm)
         """
         if not self.is_initialized or self.model is None:
             return {'cal': [], 'cal1': [], 'cal2': [], 'cal3': [], 'bull': [], 'twenty': []}
@@ -200,10 +200,10 @@ class YOLOCalibrationDetector:
         points = {
             'twenty': [],   # Class 0 - segment 20 marker
             'bull': [],     # Class 2 - bullseye (old model)
-            'cal': [],      # Class 3 - outer double ring
-            'cal1': [],     # Class 4 - outer triple ring
-            'cal2': [],     # Class 5 - inner triple ring
-            'cal3': [],     # Class 6 - inner double ring
+            'cal': [],      # Class 3 - outer double ring (board edge, ~170mm)
+            'cal1': [],     # Class 4 - inner double ring (~162mm)
+            'cal2': [],     # Class 5 - outer triple ring (~107mm)
+            'cal3': [],     # Class 6 - inner triple ring (~99mm)
         }
         
         for result in results:
@@ -454,10 +454,15 @@ class DartboardCalibrator:
                 )
             
             # Fit ellipses to the detected points
+            # YOLO classes map to physical rings by size (verified by distance measurement):
+            # cal (class 3) = 172.6px avg → outer_double (board edge, ~170mm)
+            # cal1 (class 4) = 105.8px avg → outer_triple (~107mm)
+            # cal2 (class 5) = 161.9px avg → inner_double (~162mm)
+            # cal3 (class 6) = 96.0px avg  → inner_triple (~99mm)
             outer_double_ellipse = fit_ellipse_from_points(cal_points)
             outer_triple_ellipse = fit_ellipse_from_points(cal1_points) if len(cal1_points) >= 5 else None
-            inner_triple_ellipse = fit_ellipse_from_points(cal2_points) if len(cal2_points) >= 5 else None
-            inner_double_ellipse = fit_ellipse_from_points(cal3_points) if len(cal3_points) >= 5 else None
+            inner_double_ellipse = fit_ellipse_from_points(cal2_points) if len(cal2_points) >= 5 else None
+            inner_triple_ellipse = fit_ellipse_from_points(cal3_points) if len(cal3_points) >= 5 else None
             
             if outer_double_ellipse is None:
                 return CameraCalibrationResult(
@@ -691,7 +696,7 @@ class DartboardCalibrator:
             cv2.ellipse(overlay, 
                        (int(cal.outer_double_ellipse[0][0]), int(cal.outer_double_ellipse[0][1])),
                        (int(cal.outer_double_ellipse[1][0]/2), int(cal.outer_double_ellipse[1][1]/2)),
-                       cal.outer_double_ellipse[2], 0, 360, (255, 0, 255), 2)
+                       cal.outer_double_ellipse[2], 0, 360, (255, 255, 0), 2)
         
         if cal.inner_double_ellipse:
             cv2.ellipse(overlay,
@@ -703,32 +708,30 @@ class DartboardCalibrator:
             cv2.ellipse(overlay,
                        (int(cal.outer_triple_ellipse[0][0]), int(cal.outer_triple_ellipse[0][1])),
                        (int(cal.outer_triple_ellipse[1][0]/2), int(cal.outer_triple_ellipse[1][1]/2)),
-                       cal.outer_triple_ellipse[2], 0, 360, (0, 255, 0), 2)
+                       cal.outer_triple_ellipse[2], 0, 360, (255, 255, 0), 2)
         
         if cal.inner_triple_ellipse:
             cv2.ellipse(overlay,
                        (int(cal.inner_triple_ellipse[0][0]), int(cal.inner_triple_ellipse[0][1])),
                        (int(cal.inner_triple_ellipse[1][0]/2), int(cal.inner_triple_ellipse[1][1]/2)),
-                       cal.inner_triple_ellipse[2], 0, 360, (0, 255, 0), 1)
+                       cal.inner_triple_ellipse[2], 0, 360, (255, 255, 0), 1)
         
         if cal.bull_ellipse:
             cv2.ellipse(overlay,
                        (int(cal.bull_ellipse[0][0]), int(cal.bull_ellipse[0][1])),
                        (int(cal.bull_ellipse[1][0]/2), int(cal.bull_ellipse[1][1]/2)),
-                       cal.bull_ellipse[2], 0, 360, (255, 0, 0), 1)
+                       cal.bull_ellipse[2], 0, 360, (255, 255, 0), 1)
         
         if cal.bullseye_ellipse:
             cv2.ellipse(overlay,
                        (int(cal.bullseye_ellipse[0][0]), int(cal.bullseye_ellipse[0][1])),
                        (int(cal.bullseye_ellipse[1][0]/2), int(cal.bullseye_ellipse[1][1]/2)),
-                       cal.bullseye_ellipse[2], 0, 360, (255, 0, 255), -1)
+                       cal.bullseye_ellipse[2], 0, 360, (255, 255, 0), 1)
         
         # Calibration point dots removed for cleaner overlay
         # (Detection points are used for fitting but not displayed)
         
-        # Draw center marker
-        cv2.drawMarker(overlay, (int(cal.center[0]), int(cal.center[1])), 
-                       (0, 255, 255), cv2.MARKER_CROSS, 20, 2)
+        # Center marker removed
         
         # Draw segment boundary lines from bull to outer double ring
         if cal.outer_double_ellipse and cal.segment_angles and len(cal.segment_angles) >= 10:
@@ -783,19 +786,19 @@ class DartboardCalibrator:
                 text_pt = line_ellipse_intersection(cal.center, (dx, dy), text_ellipse)
                 
                 text_str = str(seg)
-                (tw, th), _ = cv2.getTextSize(text_str, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+                (tw, th), _ = cv2.getTextSize(text_str, cv2.FONT_HERSHEY_SIMPLEX, 1.0, 2)
                 
                 # Draw text with black outline for readability
                 text_x = text_pt[0] - tw//2
                 text_y = text_pt[1] + th//2
-                # Black outline (draw in 8 directions)
-                for ox, oy in [(-1,-1), (-1,0), (-1,1), (0,-1), (0,1), (1,-1), (1,0), (1,1)]:
+                # Black outline (draw in 8 directions with offset 2)
+                for ox, oy in [(-2,-2), (-2,0), (-2,2), (0,-2), (0,2), (2,-2), (2,0), (2,2)]:
                     cv2.putText(overlay, text_str, (text_x + ox, text_y + oy),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
+                               cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 0), 2)
                 # Bright green for 20, white for all others
                 text_color = (0, 255, 0) if seg == 20 else (255, 255, 255)
                 cv2.putText(overlay, text_str, (text_x, text_y),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, text_color, 2)
+                           cv2.FONT_HERSHEY_SIMPLEX, 1.0, text_color, 2)
         
         # Draw segment 20 as a filled cyan wedge (semi-transparent)
         # Use the actual detected segment boundaries for segment 20
@@ -839,7 +842,7 @@ class DartboardCalibrator:
         # Add info text
         total_points = len(cal_points) + len(cal1_points) + len(cal2_points) + len(cal3_points)
         cv2.putText(overlay, f"Calibration points: {total_points} | Segments: {len(cal.segment_angles)}",
-                   (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                   (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
         
         return overlay
     
@@ -1046,7 +1049,7 @@ class DartboardCalibrator:
                 
                 cv2.putText(overlay, score_text, 
                            (int(pos["x"]) + 15, int(pos["y"]) - 10),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
             
             overlay_base64 = encode_image(overlay)
             
@@ -1064,3 +1067,4 @@ class DartboardCalibrator:
                 success=False,
                 error=str(e)
             )
+
