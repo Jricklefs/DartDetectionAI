@@ -1336,6 +1336,10 @@ async def detect_tips(
     timings = {}  # Track timing for each step
     
     request_id = str(uuid.uuid4())[:12]
+    import time as timing_module
+    endpoint_start = timing_module.time()
+    logger.info(f"[TIMING] /v1/detect called at {endpoint_start}")
+    
     board_id = request.board_id or "default"
     dart_number = request.dart_number or 1
     
@@ -1456,6 +1460,7 @@ async def detect_tips(
             calibrations_used[cam.camera_id] = calibration_data
             
             # Detect tips using YOLO - always on full image
+            logger.info(f"[TIMING] Before YOLO: {(timing_module.time() - endpoint_start)*1000:.0f}ms since start")
             t_yolo = time.time()
             tips = calibrator.detect_tips(
                 camera_id=cam.camera_id,
