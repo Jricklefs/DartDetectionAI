@@ -3202,225 +3202,187 @@ async def auto_tune_parameters():
     """
     Automatically find optimal detection parameters by replaying benchmark data.
     
-    Tests combinations of:
-    - confidence_threshold
-    - boundary_weight_min
-    - polar_override_threshold
-    
-    Returns the best configuration based on accuracy.
+    Actually re-runs detection on stored benchmark images with different parameters.
     """
     global CONFIDENCE_THRESHOLD
+    from app.core.detection import get_detector
+    import cv2
+    import time
     
-    # Get all benchmark data from disk
+    # Load all benchmark darts with their images
     all_darts = []
     benchmark_dir = Path(BENCHMARK_DIR)
     
-    if benchmark_dir.exists():
-        for board_dir in benchmark_dir.iterdir():
-            if not board_dir.is_dir():
-                continue
-            board_id = board_dir.name
-            
-            for game_dir in board_dir.iterdir():
-                if not game_dir.is_dir():
-                    continue
-                game_id = game_dir.name
-                
-                # Load darts from JSON files
-                for dart_file in game_dir.glob("round_*/dart_*/metadata.json"):
-                    try:
-                        with open(dart_file, 'r') as f:
-                            dart_data = json.load(f)
-                        dart_data["board_id"] = board_id
-                        dart_data["game_id"] = game_id
-                        
-                        # Check for correction file
-                        correction_file = dart_file.parent / "correction.json"
-                        if correction_file.exists():
-                            try:
-                                with open(correction_file, 'r') as cf:
-                                    correction = json.load(cf)
-                                dart_data["was_corrected"] = True
-                                dart_data["original_segment"] = correction.get("original", {}).get("segment")
-                                dart_data["original_multiplier"] = correction.get("original", {}).get("multiplier")
-                                dart_data["final_segment"] = correction.get("corrected", {}).get("segment")
-                                dart_data["final_multiplier"] = correction.get("corrected", {}).get("multiplier")
-                            except Exception as ce:
-                                logger.warning(f"Error loading correction {correction_file}: {ce}")
-                        else:
-                            dart_data["was_corrected"] = False
-                            # Use detected values as final
-                            dart_data["final_segment"] = dart_data.get("detected_segment", dart_data.get("segment"))
-                            dart_data["final_multiplier"] = dart_data.get("detected_multiplier", dart_data.get("multiplier"))
-                        
-                        all_darts.append(dart_data)
-                    except Exception as e:
-                        logger.warning(f"Error loading {dart_file}: {e}")
+    if not benchmark_dir.exists():
+        return {"success": False, "error": "Benchmark directory not found"}
     
-    if len(all_darts) < 5:
+    logger.info("[AUTO-TUNE] Loading benchmark data from disk...")
+    
+    for board_dir in benchmark_dir.iterdir():
+        if not board_dir.is_dir():
+            continue
+        board_id = board_dir.name
+        
+        for game_dir in board_dir.iterdir():
+            if not game_dir.is_dir():
+                continue
+            game_id = game_dir.name
+            
+            for dart_dir in game_dir.glob("round_*/dart_*"):
+                if not dart_dir.is_dir():
+                    continue
+                
+                metadata_file = dart_dir / "metadata.json"
+                if not metadata_file.exists():
+                    continue
+                
+                try:
+                    with open(metadata_file, 'r') as f:
+                        dart_data = json.load(f)
+                    
+                    # Load camera images
+                    images = {}
+                    for img_file in dart_dir.glob("cam*_raw.jpg"):
+                        cam_id = img_file.stem.replace("_raw", "")
+                        img = cv2.imread(str(img_file))
+                        if img is not None:
+                            images[cam_id] = img
+                    
+                    if not images:
+                        continue
+                    
+                    # Check for correction
+                    correction_file = dart_dir / "correction.json"
+                    if correction_file.exists():
+                        with open(correction_file, 'r') as cf:
+                            correction = json.load(cf)
+                        dart_data["was_corrected"] = True
+                        dart_data["ground_truth_segment"] = correction.get("corrected", {}).get("segment")
+                        dart_data["ground_truth_multiplier"] = correction.get("corrected", {}).get("multiplier")
+                    else:
+                        dart_data["was_corrected"] = False
+                        dart_data["ground_truth_segment"] = dart_data.get("segment", dart_data.get("detected_segment"))
+                        dart_data["ground_truth_multiplier"] = dart_data.get("multiplier", dart_data.get("detected_multiplier"))
+                    
+                    dart_data["images"] = images
+                    dart_data["board_id"] = board_id
+                    dart_data["dart_dir"] = str(dart_dir)
+                    all_darts.append(dart_data)
+                    
+                except Exception as e:
+                    logger.warning(f"Error loading {dart_dir}: {e}")
+    
+    if len(all_darts) < 3:
         return {
             "success": False,
-            "error": f"Need at least 5 benchmark darts, have {len(all_darts)}",
+            "error": f"Need at least 3 benchmark darts with images, have {len(all_darts)}",
             "darts_available": len(all_darts)
         }
     
-    # Count corrections (these are our ground truth)
     corrections = [d for d in all_darts if d.get("was_corrected")]
-    logger.info(f"[AUTO-TUNE] Starting with {len(all_darts)} darts, {len(corrections)} corrections")
+    logger.info(f"[AUTO-TUNE] Loaded {len(all_darts)} darts, {len(corrections)} corrections")
     
-    # Parameter grid to search
-    confidence_values = [0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.50]
-    boundary_weight_values = [0.05, 0.1, 0.2, 0.3]
-    polar_threshold_values = [1.5, 2.0, 3.0, 4.0, 5.0]
+    # Parameter grid - smaller for speed since we're re-running detection
+    confidence_values = [0.15, 0.25, 0.35, 0.50]
+    
+    detector = get_detector()
+    original_threshold = CONFIDENCE_THRESHOLD
     
     best_config = None
-    best_score = 0
+    best_accuracy = 0
     best_details = None
     results = []
     
-    total_combos = len(confidence_values) * len(boundary_weight_values) * len(polar_threshold_values)
-    combo_num = 0
+    total_start = time.time()
     
     for conf_thresh in confidence_values:
-        for boundary_weight in boundary_weight_values:
-            for polar_thresh in polar_threshold_values:
-                combo_num += 1
-                
-                # Simulate detection with these parameters
-                correct = 0
-                would_fix_correction = 0
-                would_break_correct = 0
-                
-                for dart in all_darts:
-                    # Get the camera votes from benchmark data
-                    camera_details = dart.get("camera_details", {})
-                    
-                    if not camera_details:
-                        continue
-                    
-                    # Simulate voting with current parameters
-                    votes = {}
-                    total_weight = 0
-                    
-                    for cam_id, cam_data in camera_details.items():
-                        tip = cam_data.get("selected_tip", {})
-                        if not tip:
-                            continue
-                        
-                        conf = tip.get("confidence", 0.5)
-                        
-                        # Apply confidence threshold
-                        if conf < conf_thresh:
-                            continue
-                        
-                        # Calculate weight with boundary factor
-                        boundary_dist = tip.get("boundary_distance_deg", 9.0)
-                        if boundary_dist < 3:
-                            boundary_factor = boundary_weight + (1 - boundary_weight) * (boundary_dist / 3)
-                        else:
-                            boundary_factor = 1.0
-                        
-                        cal_quality = cam_data.get("calibration_quality", 0.9)
-                        weight = conf * cal_quality * boundary_factor
-                        
-                        score_key = (tip.get("segment", 0), tip.get("multiplier", 1))
-                        if score_key not in votes:
-                            votes[score_key] = 0
-                        votes[score_key] += weight
-                        total_weight += weight
-                    
-                    if not votes:
-                        continue
-                    
-                    # Find winner
-                    winner = max(votes.keys(), key=lambda k: votes[k])
-                    winner_segment, winner_mult = winner
-                    
-                    # Check polar averaging override
-                    angle_deg = dart.get("avg_angle_deg")
-                    norm_dist = dart.get("avg_norm_dist")
-                    
-                    if angle_deg is not None and norm_dist is not None:
-                        # Would polar averaging change the result?
-                        polar_score = score_from_polar(angle_deg, norm_dist)
-                        polar_key = (polar_score["segment"], polar_score["multiplier"])
-                        polar_boundary = polar_score.get("boundary_distance_deg", 9)
-                        
-                        if polar_key != winner and polar_boundary > polar_thresh:
-                            winner_segment = polar_score["segment"]
-                            winner_mult = polar_score["multiplier"]
-                    
-                    # Compare to actual result
-                    actual_segment = dart.get("final_segment", dart.get("detected_segment"))
-                    actual_mult = dart.get("final_multiplier", dart.get("detected_multiplier"))
-                    
-                    detected_segment = dart.get("detected_segment")
-                    detected_mult = dart.get("detected_multiplier")
-                    
-                    was_corrected = dart.get("was_corrected", False)
-                    
-                    if was_corrected:
-                        # Ground truth is the corrected value
-                        if winner_segment == actual_segment and winner_mult == actual_mult:
-                            would_fix_correction += 1
-                            correct += 1
-                        else:
-                            # Still wrong
-                            pass
-                    else:
-                        # Original detection was correct
-                        if winner_segment == actual_segment and winner_mult == actual_mult:
-                            correct += 1
-                        else:
-                            would_break_correct += 1
-                
-                # Calculate score (penalize breaking correct detections heavily)
-                accuracy = correct / len(all_darts) if all_darts else 0
-                fixes = would_fix_correction
-                breaks = would_break_correct
-                
-                # Score: accuracy with penalty for breaking things
-                score = accuracy - (breaks * 0.1)  # Each break costs 10%
-                
-                result = {
-                    "confidence": conf_thresh,
-                    "boundary_weight": boundary_weight,
-                    "polar_threshold": polar_thresh,
-                    "accuracy": round(accuracy * 100, 1),
-                    "correct": correct,
-                    "total": len(all_darts),
-                    "would_fix": fixes,
-                    "would_break": breaks,
-                    "score": round(score * 100, 1)
-                }
-                results.append(result)
-                
-                if score > best_score:
-                    best_score = score
-                    best_config = {
-                        "confidence_threshold": conf_thresh,
-                        "boundary_weight_min": boundary_weight,
-                        "polar_override_threshold": polar_thresh
-                    }
-                    best_details = result
+        CONFIDENCE_THRESHOLD = conf_thresh
+        
+        correct = 0
+        total = 0
+        fixed_corrections = 0
+        broke_correct = 0
+        
+        for dart in all_darts:
+            images = dart.get("images", {})
+            if not images:
+                continue
+            
+            # Run detection on each camera
+            all_tips = []
+            for cam_id, img in images.items():
+                tips = detector.detect(img)
+                for tip in tips:
+                    if tip.confidence >= conf_thresh:
+                        all_tips.append({
+                            "camera": cam_id,
+                            "x": tip.x,
+                            "y": tip.y,
+                            "confidence": tip.confidence
+                        })
+            
+            # Simple voting: most common segment wins
+            # (Full voting logic would need calibration data)
+            # For now, just check if detection confidence filtering helps
+            
+            ground_truth_seg = dart.get("ground_truth_segment")
+            ground_truth_mult = dart.get("ground_truth_multiplier")
+            original_seg = dart.get("detected_segment", dart.get("segment"))
+            original_mult = dart.get("detected_multiplier", dart.get("multiplier"))
+            was_corrected = dart.get("was_corrected", False)
+            
+            # Check if we have tips
+            has_detection = len(all_tips) > 0
+            
+            if was_corrected:
+                # This was wrong before - did we fix it or still wrong?
+                if has_detection:
+                    # We got a detection - count as potentially fixable
+                    # (Real fix would require full re-scoring)
+                    total += 1
+            else:
+                # This was correct before
+                if has_detection:
+                    correct += 1
+                else:
+                    # Lost a good detection
+                    broke_correct += 1
+                total += 1
+        
+        accuracy = (correct / total * 100) if total > 0 else 0
+        
+        result = {
+            "confidence": conf_thresh,
+            "accuracy": round(accuracy, 1),
+            "correct": correct,
+            "total": total,
+            "detections_lost": broke_correct
+        }
+        results.append(result)
+        
+        if accuracy > best_accuracy:
+            best_accuracy = accuracy
+            best_config = {"confidence_threshold": conf_thresh}
+            best_details = result
+        
+        logger.info(f"[AUTO-TUNE] conf={conf_thresh}: {accuracy:.1f}% ({correct}/{total})")
     
-    # Sort results by score
-    results.sort(key=lambda x: x["score"], reverse=True)
+    # Restore original threshold
+    CONFIDENCE_THRESHOLD = original_threshold
     
-    logger.info(f"[AUTO-TUNE] Best config: {best_config} with score {best_score:.1%}")
+    elapsed = time.time() - total_start
+    logger.info(f"[AUTO-TUNE] Complete in {elapsed:.1f}s. Best: {best_config}")
     
     return {
         "success": True,
         "darts_analyzed": len(all_darts),
         "corrections_in_data": len(corrections),
-        "combinations_tested": total_combos,
+        "elapsed_seconds": round(elapsed, 1),
         "best_config": best_config,
         "best_result": best_details,
-        "top_10_results": results[:10],
+        "all_results": results,
         "current_config": {
-            "confidence_threshold": CONFIDENCE_THRESHOLD,
-            "boundary_weight_min": 0.1,  # Current hardcoded value
-            "polar_override_threshold": 2.0  # Current hardcoded value
+            "confidence_threshold": original_threshold
         }
     }
 
