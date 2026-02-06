@@ -262,11 +262,18 @@ class DartTipDetector:
             
             print(f"Loaded tip model from {model_path} (pose={self.is_pose_model})")
             
-            # Warmup inference - run a dummy image through to initialize OpenVINO
-            print("Warming up model...")
+            # Warmup inference - run MULTIPLE inferences to fully compile OpenVINO kernels
+            # First inference compiles, subsequent ones optimize - need 3-5 for full speed
+            print("[WARMUP] Compiling OpenVINO kernels (this takes a few seconds on first start)...")
+            import time
             dummy_img = np.zeros((640, 640, 3), dtype=np.uint8)
-            _ = self.model(dummy_img, imgsz=self.image_size, verbose=False)
-            print("Model warmup complete")
+            for i in range(5):
+                start = time.time()
+                _ = self.model(dummy_img, imgsz=self.image_size, verbose=False)
+                elapsed = (time.time() - start) * 1000
+                print(f"[WARMUP] Inference {i+1}/5: {elapsed:.0f}ms")
+            self._last_inference_time = time.time()
+            print("[WARMUP] Model fully warmed up and ready!")
             
         except ImportError:
             print("Warning: ultralytics not installed. Tip detection disabled.")
