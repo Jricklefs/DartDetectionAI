@@ -3417,7 +3417,7 @@ AVAILABLE_MODELS = {
 # Currently active model (in-memory, persists until restart)
 ACTIVE_MODEL = "default"
 # Detection confidence threshold (0.0 - 1.0)
-CONFIDENCE_THRESHOLD = 0.5
+CONFIDENCE_THRESHOLD = 0.25
 
 
 @router.get("/v1/settings/threshold")
@@ -3428,7 +3428,7 @@ async def get_threshold():
         "threshold": CONFIDENCE_THRESHOLD,
         "min": 0.1,
         "max": 0.9,
-        "default": 0.5
+        "default": 0.25
     }
 
 
