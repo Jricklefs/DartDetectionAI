@@ -22,6 +22,7 @@ import cv2
 import base64
 
 from app.core.calibration import DartboardCalibrator
+from app.core.stereo_calibration import StereoCalibrator, StereoCalibration, generate_checkerboard_pdf
 from app.core.scoring import scoring_system
 from app.core.geometry import (
     DARTBOARD_SEGMENTS,
@@ -190,6 +191,24 @@ def save_training_data(camera_id: str, image_base64: str, segment: int, multipli
 # === Benchmark System ===
 # Comprehensive logging for accuracy analysis - enabled via Settings UI
 BENCHMARK_ENABLED = False  # Set via API when logging is enabled in Settings
+# === Stereo Calibration ===
+# Triangulation mode: "ellipse" (default) or "stereo" (requires checkerboard calibration)
+TRIANGULATION_MODE = os.environ.get("DARTDETECT_TRIANGULATION", "ellipse")
+STEREO_CALIBRATION_DIR = Path(os.environ.get("DARTDETECT_STEREO_DIR", "C:/Users/clawd/DartDetectionAI/stereo_calibrations"))
+_stereo_calibrator: StereoCalibrator = None
+_stereo_capture_images: Dict[str, List] = {}  # Temporary storage for calibration images
+
+def get_stereo_calibrator(board_id: str = "default") -> StereoCalibrator:
+    """Get or create stereo calibrator, loading saved calibration if available."""
+    global _stereo_calibrator
+    if _stereo_calibrator is None:
+        _stereo_calibrator = StereoCalibrator()
+        cal_file = STEREO_CALIBRATION_DIR / f"{board_id}_stereo.json"
+        if cal_file.exists():
+            _stereo_calibrator.load(cal_file)
+    return _stereo_calibrator
+
+
 BENCHMARK_DIR = Path(os.environ.get("DARTDETECT_BENCHMARK_DIR", "C:/Users/clawd/DartBenchmark"))
 
 # Current game context - set by DartGame API when game starts
@@ -2164,6 +2183,39 @@ def vote_on_scores(clusters: List[List[dict]]) -> List[DetectedTip]:
                     if pos_boundary > 2.0:  # Not on a wire
                         logger.info(f"[VOTE] Position averaging suggests {pos_segment}x{pos_multiplier} (boundary={pos_boundary:.1f}°)")
                         logger.info(f"[VOTE] OVERRIDE: Using position average instead of vote winner")
+
+            # Check if stereo triangulation is available and enabled
+            if TRIANGULATION_MODE == "stereo":
+                try:
+                    stereo_cal = get_stereo_calibrator()
+                    if stereo_cal.calibration is not None:
+                        # Get pixel coordinates for each camera
+                        pixel_coords = {}
+                        for tip in cluster:
+                            cam_id = tip.get('camera_id')
+                            if cam_id and 'x_px' in tip and 'y_px' in tip:
+                                pixel_coords[cam_id] = (tip['x_px'], tip['y_px'])
+                        
+                        if len(pixel_coords) >= 2:
+                            # Use true 3D triangulation
+                            avg_x, avg_y = stereo_cal.triangulate_to_dartboard(pixel_coords)
+                            logger.info(f"[STEREO] Triangulated position: ({avg_x:.1f}, {avg_y:.1f}) mm")
+                            
+                            pos_score = score_from_position(avg_x, avg_y)
+                            pos_segment = pos_score['segment']
+                            pos_multiplier = pos_score['multiplier']
+                            pos_key = (pos_segment, pos_multiplier)
+                            
+                            if pos_key != winning_key:
+                                pos_boundary = pos_score.get('boundary_distance_deg', 9)
+                                if pos_boundary > 2.0:
+                                    logger.info(f"[STEREO] Triangulation suggests {pos_segment}x{pos_multiplier}")
+                                    logger.info(f"[STEREO] OVERRIDE: Using triangulated position")
+                                    winning_key = pos_key
+                                    winning_segment, winning_multiplier = pos_key
+                except Exception as e:
+                    logger.warning(f"[STEREO] Triangulation failed: {e}, falling back to position averaging")
+
                         winning_key = pos_key
                         winning_segment, winning_multiplier = pos_key
         
@@ -3008,3 +3060,260 @@ async def replay_all_darts_full(request: ReplayAllRequest = None):
         "correction_fix_rate": f"{correction_rate:.1f}%",
         "results": results
     }
+
+# === Stereo Calibration Endpoints ===
+
+class StereoStatusResponse(BaseModel):
+    mode: str  # "ellipse" or "stereo"
+    stereo_available: bool
+    cameras_calibrated: List[str]
+    reprojection_error: Optional[float]
+
+
+@router.get("/v1/stereo/status")
+async def get_stereo_status(board_id: str = "default"):
+    """Get current triangulation mode and stereo calibration status."""
+    calibrator = get_stereo_calibrator(board_id)
+    
+    return {
+        "mode": TRIANGULATION_MODE,
+        "stereo_available": calibrator.calibration is not None,
+        "cameras_calibrated": list(calibrator.calibration.intrinsics.keys()) if calibrator.calibration else [],
+        "reprojection_error": calibrator.calibration.reprojection_error if calibrator.calibration else None
+    }
+
+
+@router.post("/v1/stereo/set-mode")
+async def set_triangulation_mode(request: dict):
+    """Switch between ellipse and stereo triangulation modes."""
+    global TRIANGULATION_MODE
+    mode = request.get("mode", "ellipse")
+    
+    if mode not in ["ellipse", "stereo"]:
+        raise HTTPException(400, f"Invalid mode: {mode}. Use 'ellipse' or 'stereo'")
+    
+    if mode == "stereo":
+        calibrator = get_stereo_calibrator(request.get("board_id", "default"))
+        if calibrator.calibration is None:
+            raise HTTPException(400, "Stereo calibration not available. Run /v1/stereo/calibrate first.")
+    
+    TRIANGULATION_MODE = mode
+    logger.info(f"[STEREO] Triangulation mode set to: {mode}")
+    
+    return {"mode": mode, "success": True}
+
+
+@router.get("/v1/stereo/checkerboard")
+async def get_checkerboard_pattern(
+    cols: int = 9, 
+    rows: int = 6, 
+    square_mm: float = 25.0
+):
+    """
+    Generate a printable checkerboard pattern.
+    
+    Recommended: Print on A3 paper or larger.
+    Mount flat on dartboard for calibration.
+    """
+    import base64
+    
+    output_path = STEREO_CALIBRATION_DIR / f"checkerboard_{cols}x{rows}_{int(square_mm)}mm.png"
+    STEREO_CALIBRATION_DIR.mkdir(parents=True, exist_ok=True)
+    
+    generate_checkerboard_pdf((cols, rows), square_mm, str(output_path))
+    
+    # Read and encode
+    with open(output_path, 'rb') as f:
+        img_data = base64.b64encode(f.read()).decode()
+    
+    return {
+        "success": True,
+        "size": f"{cols}x{rows} inner corners",
+        "square_mm": square_mm,
+        "print_width_mm": (cols + 1) * square_mm,
+        "print_height_mm": (rows + 1) * square_mm,
+        "image": f"data:image/png;base64,{img_data}",
+        "instructions": [
+            "1. Print this pattern at 100% scale (no fit-to-page)",
+            "2. Mount on rigid foam board or cardboard",
+            "3. Attach flat to dartboard face",
+            "4. Capture calibration images from Settings"
+        ]
+    }
+
+
+@router.post("/v1/stereo/capture")
+async def capture_stereo_image(request: dict):
+    """
+    Capture a calibration image from each camera.
+    
+    Call this multiple times with the checkerboard in different positions/angles.
+    Need at least 10 captures for good calibration.
+    """
+    global _stereo_capture_images
+    
+    cameras = request.get("cameras", [])
+    board_id = request.get("board_id", "default")
+    
+    if not cameras:
+        raise HTTPException(400, "No camera images provided")
+    
+    if board_id not in _stereo_capture_images:
+        _stereo_capture_images[board_id] = {}
+    
+    calibrator = get_stereo_calibrator(board_id)
+    results = []
+    
+    for cam in cameras:
+        cam_id = cam.get("camera_id")
+        image_b64 = cam.get("image")
+        
+        if not cam_id or not image_b64:
+            continue
+        
+        # Decode image
+        img = decode_image(image_b64)
+        
+        # Detect checkerboard
+        corners = calibrator.detect_checkerboard(img)
+        
+        if corners is not None:
+            # Store image for calibration
+            if cam_id not in _stereo_capture_images[board_id]:
+                _stereo_capture_images[board_id][cam_id] = []
+            _stereo_capture_images[board_id][cam_id].append(img)
+            
+            # Draw checkerboard for visualization
+            vis = calibrator.draw_checkerboard(img, corners)
+            vis_b64 = encode_image(vis, "jpeg")
+            
+            results.append({
+                "camera_id": cam_id,
+                "success": True,
+                "corners_found": len(corners),
+                "total_captures": len(_stereo_capture_images[board_id][cam_id]),
+                "preview": vis_b64
+            })
+        else:
+            results.append({
+                "camera_id": cam_id,
+                "success": False,
+                "error": "Checkerboard not detected",
+                "total_captures": len(_stereo_capture_images[board_id].get(cam_id, []))
+            })
+    
+    # Summary
+    min_captures = min(
+        len(imgs) for imgs in _stereo_capture_images[board_id].values()
+    ) if _stereo_capture_images[board_id] else 0
+    
+    return {
+        "results": results,
+        "total_captures": min_captures,
+        "ready_to_calibrate": min_captures >= 10,
+        "recommendation": "Capture at least 10 images with checkerboard at different angles"
+    }
+
+
+@router.post("/v1/stereo/calibrate")
+async def run_stereo_calibration(request: dict = {}):
+    """
+    Run stereo calibration using captured images.
+    
+    Requires at least 10 captures from /v1/stereo/capture.
+    """
+    global _stereo_calibrator, _stereo_capture_images
+    
+    board_id = request.get("board_id", "default")
+    
+    if board_id not in _stereo_capture_images:
+        raise HTTPException(400, "No calibration images captured. Use /v1/stereo/capture first.")
+    
+    camera_images = _stereo_capture_images[board_id]
+    
+    # Check we have enough images
+    for cam_id, images in camera_images.items():
+        if len(images) < 3:
+            raise HTTPException(400, f"Camera {cam_id} needs at least 3 images, has {len(images)}")
+    
+    # Run calibration
+    checkerboard_size = tuple(request.get("checkerboard_size", [9, 6]))
+    square_mm = request.get("square_mm", 25.0)
+    
+    calibrator = StereoCalibrator(checkerboard_size, square_mm)
+    calibration = calibrator.calibrate(camera_images, board_id)
+    
+    if calibration is None:
+        raise HTTPException(500, "Calibration failed. Check that checkerboard is visible in all cameras.")
+    
+    # Save calibration
+    STEREO_CALIBRATION_DIR.mkdir(parents=True, exist_ok=True)
+    cal_file = STEREO_CALIBRATION_DIR / f"{board_id}_stereo.json"
+    calibrator.save(cal_file)
+    
+    # Update global calibrator
+    _stereo_calibrator = calibrator
+    
+    # Clear captured images
+    _stereo_capture_images[board_id] = {}
+    
+    return {
+        "success": True,
+        "cameras_calibrated": list(calibration.intrinsics.keys()),
+        "reprojection_error": calibration.reprojection_error,
+        "saved_to": str(cal_file),
+        "next_step": "Use /v1/stereo/set-mode with mode='stereo' to enable triangulation"
+    }
+
+
+@router.post("/v1/stereo/clear-captures")
+async def clear_stereo_captures(request: dict = {}):
+    """Clear captured calibration images to start over."""
+    global _stereo_capture_images
+    
+    board_id = request.get("board_id", "default")
+    
+    if board_id in _stereo_capture_images:
+        count = sum(len(imgs) for imgs in _stereo_capture_images[board_id].values())
+        _stereo_capture_images[board_id] = {}
+        return {"success": True, "cleared": count}
+    
+    return {"success": True, "cleared": 0}
+
+
+@router.post("/v1/stereo/triangulate")
+async def triangulate_point(request: dict):
+    """
+    Test triangulation with pixel coordinates from each camera.
+    
+    Useful for debugging/verifying stereo calibration.
+    """
+    board_id = request.get("board_id", "default")
+    pixel_coords = request.get("pixel_coords", {})  # {cam_id: [x, y]}
+    
+    if len(pixel_coords) < 2:
+        raise HTTPException(400, "Need at least 2 camera coordinates")
+    
+    calibrator = get_stereo_calibrator(board_id)
+    if calibrator.calibration is None:
+        raise HTTPException(400, "No stereo calibration available")
+    
+    # Convert to tuples
+    coords = {k: tuple(v) for k, v in pixel_coords.items()}
+    
+    try:
+        x_mm, y_mm = calibrator.triangulate_to_dartboard(coords)
+        
+        # Calculate what score this would be
+        pos_score = score_from_position(x_mm, y_mm)
+        
+        return {
+            "success": True,
+            "x_mm": round(x_mm, 2),
+            "y_mm": round(y_mm, 2),
+            "distance_mm": round((x_mm**2 + y_mm**2)**0.5, 2),
+            "score": pos_score
+        }
+    except Exception as e:
+        raise HTTPException(500, f"Triangulation failed: {e}")
+
