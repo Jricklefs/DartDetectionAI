@@ -3227,7 +3227,7 @@ async def auto_tune_parameters():
                 game_id = game_dir.name
                 
                 # Load darts from JSON files
-                for dart_file in game_dir.glob("round_*/dart_*.json"):
+                for dart_file in game_dir.glob("round_*/dart_*/metadata.json"):
                     try:
                         with open(dart_file, 'r') as f:
                             dart_data = json.load(f)
