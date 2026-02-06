@@ -473,6 +473,8 @@ def score_from_ellipse_calibration(
     segment_angles = calibration_data.get("segment_angles", [])
     segment_20_index = calibration_data.get("segment_20_index", 0)
     
+    boundary_distance_deg = None  # How far from nearest wire (in degrees)
+    
     if len(segment_angles) == 20 and 0 <= segment_20_index < 20:
         # Find which boundary interval contains this angle
         found_idx = 0
@@ -489,13 +491,29 @@ def score_from_ellipse_calibration(
                     found_idx = i
                     break
         
+        # Calculate distance to nearest boundary (in degrees)
+        a1 = segment_angles[found_idx]
+        a2 = segment_angles[(found_idx + 1) % 20]
+        
+        # Normalize angle differences
+        def angle_diff(a, b):
+            d = a - b
+            while d > math.pi: d -= 2*math.pi
+            while d < -math.pi: d += 2*math.pi
+            return abs(d)
+        
+        dist_to_a1 = angle_diff(angle, a1)
+        dist_to_a2 = angle_diff(angle, a2)
+        boundary_distance_deg = math.degrees(min(dist_to_a1, dist_to_a2))
+        
         # Convert boundary index to segment
         # segment_20_index points to where segment 20 starts
         # DARTBOARD_SEGMENTS[0] = 20, [1] = 1, [2] = 18, etc (clockwise)
         relative_idx = (found_idx - segment_20_index) % 20
         segment = DARTBOARD_SEGMENTS[relative_idx]
         
-        print(f"[SCORE] angle={math.degrees(angle):.1f}°, found_idx={found_idx}, seg20_idx={segment_20_index}, relative={relative_idx}, segment={segment}")
+        # Log with boundary distance
+        print(f"[SCORE] angle={math.degrees(angle):.1f}°, segment={segment}, boundary_dist={boundary_distance_deg:.1f}°")
     else:
         # Fallback if no segment_angles
         rotation_offset = calibration_data.get("rotation_offset_rad", 0.0)
@@ -516,9 +534,12 @@ def score_from_ellipse_calibration(
     outer_triple = calibration_data.get("outer_triple_ellipse")
     inner_triple = calibration_data.get("inner_triple_ellipse")
     
+    # Build result dict - we'll add boundary_distance_deg at the end
+    result = None
+    
     # Check if outside board
     if outer_double and not point_in_ellipse(point, outer_double):
-        return {
+        result = {
             "score": 0,
             "multiplier": 0,
             "segment": 0,
@@ -528,11 +549,11 @@ def score_from_ellipse_calibration(
         }
     
     # Double ring (between inner and outer double)
-    if outer_double and inner_double:
+    if result is None and outer_double and inner_double:
         in_outer = point_in_ellipse(point, outer_double)
         in_inner = point_in_ellipse(point, inner_double)
         if in_outer and not in_inner:
-            return {
+            result = {
                 "score": segment * 2,
                 "multiplier": 2,
                 "segment": segment,
@@ -542,11 +563,11 @@ def score_from_ellipse_calibration(
             }
     
     # Triple ring (between inner and outer triple)
-    if outer_triple and inner_triple:
+    if result is None and outer_triple and inner_triple:
         in_outer = point_in_ellipse(point, outer_triple)
         in_inner = point_in_ellipse(point, inner_triple)
         if in_outer and not in_inner:
-            return {
+            result = {
                 "score": segment * 3,
                 "multiplier": 3,
                 "segment": segment,
@@ -556,11 +577,11 @@ def score_from_ellipse_calibration(
             }
     
     # Single outer (between triple and double)
-    if inner_double and outer_triple:
+    if result is None and inner_double and outer_triple:
         in_double = point_in_ellipse(point, inner_double)
         in_triple = point_in_ellipse(point, outer_triple)
         if in_double and not in_triple:
-            return {
+            result = {
                 "score": segment,
                 "multiplier": 1,
                 "segment": segment,
@@ -570,11 +591,11 @@ def score_from_ellipse_calibration(
             }
     
     # Single inner (between bull and triple)
-    if inner_triple and bull_ellipse:
+    if result is None and inner_triple and bull_ellipse:
         in_triple = point_in_ellipse(point, inner_triple)
         in_bull = point_in_ellipse(point, bull_ellipse)
         if in_triple and not in_bull:
-            return {
+            result = {
                 "score": segment,
                 "multiplier": 1,
                 "segment": segment,
@@ -584,11 +605,18 @@ def score_from_ellipse_calibration(
             }
     
     # Fallback to single
-    return {
-        "score": segment,
-        "multiplier": 1,
-        "segment": segment,
-        "zone": "single",
-        "is_bullseye": False,
-        "is_outer_bull": False
-    }
+    if result is None:
+        result = {
+            "score": segment,
+            "multiplier": 1,
+            "segment": segment,
+            "zone": "single",
+            "is_bullseye": False,
+            "is_outer_bull": False
+        }
+    
+    # Add boundary distance (how close to wire, in degrees)
+    if boundary_distance_deg is not None:
+        result["boundary_distance_deg"] = boundary_distance_deg
+    
+    return result
