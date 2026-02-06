@@ -1898,13 +1898,17 @@ def vote_on_scores(clusters: List[List[dict]]) -> List[DetectedTip]:
     """
     For each cluster (same dart seen by multiple cameras), vote on the score.
     
-    Uses weighted voting:
+    ENHANCED VOTING (Feb 2026):
     - Tips found IN the NEW mask region get full weight
-    - Tips found via centroid fallback (not in NEW region) get heavily reduced weight (0.1x)
-    - Each camera's detection votes for its calculated segment/multiplier
-    - Highest weighted vote wins
+    - Tips found via centroid fallback get 0.1x weight
+    - Darts near wire boundaries (<2°) get "low_confidence" flag
+    - Camera disagreement is detected and logged
+    - Exponential boundary weighting (more aggressive near wires)
     """
     detected_tips = []
+    
+    # Wire boundary threshold - darts closer than this are "uncertain"
+    WIRE_THRESHOLD_DEG = 2.0
     
     for cluster in clusters:
         if not cluster:
@@ -1912,9 +1916,20 @@ def vote_on_scores(clusters: List[List[dict]]) -> List[DetectedTip]:
         
         cameras_seen = list(set(t['camera_id'] for t in cluster))
         
-        # Single camera - use directly
+        # Check if any detection is near a wire boundary
+        min_boundary_dist = min(
+            (t.get('boundary_distance_deg') or 9.0) for t in cluster
+        )
+        near_wire = min_boundary_dist < WIRE_THRESHOLD_DEG
+        
+        # Single camera - use directly but flag if near wire
         if len(cluster) == 1:
             tip = cluster[0]
+            conf = tip['confidence']
+            if near_wire:
+                conf *= 0.5  # Reduce confidence for near-wire single-camera detections
+                logger.warning(f"[VOTE] Single camera near wire ({min_boundary_dist:.1f}°) - low confidence")
+            
             detected_tips.append(DetectedTip(
                 x_mm=round(tip['x_mm'], 2),
                 y_mm=round(tip['y_mm'], 2),
@@ -1922,58 +1937,104 @@ def vote_on_scores(clusters: List[List[dict]]) -> List[DetectedTip]:
                 multiplier=tip['multiplier'],
                 zone=tip['zone'],
                 score=tip['score'],
-                confidence=round(tip['confidence'], 3),
+                confidence=round(conf, 3),
                 cameras_seen=cameras_seen
             ))
             continue
         
         # Multiple cameras - vote on segment and multiplier
         votes = {}
+        vote_details = {}  # Track which cameras voted for what
         total_confidence = 0.0
         
         # Check if ANY tip was found in NEW region
         tips_in_new = [t for t in cluster if t.get('found_in_new_region', True)]
         tips_fallback = [t for t in cluster if not t.get('found_in_new_region', True)]
         
-        # Log the voting situation
         if tips_in_new and tips_fallback:
             logger.info(f"[VOTE] {len(tips_in_new)} tips in NEW region, {len(tips_fallback)} via fallback")
         
         for tip in cluster:
             key = (tip['segment'], tip['multiplier'])
+            cam_id = tip.get('camera_id', 'unknown')
+            
             # Base weight is YOLO confidence
             weight = tip['confidence']
             
             # MAJOR weight reduction for tips NOT found in NEW region
-            # These are fallback tips that might be picking old darts
             if not tip.get('found_in_new_region', True):
-                weight *= 0.1  # 90% reduction for fallback tips
-                logger.debug(f"[VOTE] {tip.get('camera_id')} tip NOT in NEW region - weight reduced to {weight:.3f}")
+                weight *= 0.1
+                logger.debug(f"[VOTE] {cam_id} tip NOT in NEW region - weight reduced to {weight:.3f}")
             
-            # If boundary_distance_deg is available, boost weight for darts far from wires
-            # Each segment is 18°, so max distance from boundary is 9°
-            # Scale: 0° (on wire) = 0.5x weight, 9° (center of segment) = 1.5x weight
+            # EXPONENTIAL boundary weighting (more aggressive near wires)
+            # 0° (on wire) = 0.1x, 2° = 0.5x, 5° = 0.9x, 9° (center) = 1.5x
             boundary_dist = tip.get('boundary_distance_deg')
             if boundary_dist is not None:
-                # Linear scale: 0° -> 0.5, 9° -> 1.5
-                boundary_factor = 0.5 + (boundary_dist / 9.0)
-                boundary_factor = min(1.5, max(0.5, boundary_factor))  # Clamp
+                if boundary_dist < 1.0:
+                    boundary_factor = 0.1  # Extremely low weight on wire
+                elif boundary_dist < 2.0:
+                    boundary_factor = 0.3  # Very low weight near wire
+                elif boundary_dist < 4.0:
+                    boundary_factor = 0.7  # Reduced weight
+                else:
+                    # Linear from 0.9 at 4° to 1.5 at 9°
+                    boundary_factor = 0.9 + (boundary_dist - 4.0) * 0.12
+                    boundary_factor = min(1.5, boundary_factor)
                 weight *= boundary_factor
             
             votes[key] = votes.get(key, 0.0) + weight
             total_confidence += weight
+            
+            # Track vote details for disagreement analysis
+            if key not in vote_details:
+                vote_details[key] = []
+            vote_details[key].append({
+                'camera': cam_id,
+                'weight': weight,
+                'boundary_dist': boundary_dist,
+                'in_new': tip.get('found_in_new_region', True)
+            })
+        
+        # Detect disagreement
+        unique_votes = len(votes)
+        if unique_votes > 1:
+            # Cameras disagree - log details
+            sorted_votes = sorted(votes.items(), key=lambda x: -x[1])
+            vote_summary = ', '.join([
+                f"{s}x{m}={votes[(s,m)]:.2f}" for s, m in [v[0] for v in sorted_votes]
+            ])
+            logger.warning(f"[VOTE] DISAGREEMENT ({unique_votes} options): {vote_summary}")
+            
+            # Log which cameras voted for what
+            for (seg, mult), details in vote_details.items():
+                cams = [d['camera'] for d in details]
+                logger.info(f"[VOTE]   {seg}x{mult}: cameras {cams}")
         
         # Find winning vote
         winning_key = max(votes.keys(), key=lambda k: votes[k])
         winning_segment, winning_multiplier = winning_key
         
-        # Consensus confidence
+        # Consensus confidence - how much of total weight agrees
         agreeing_confidence = votes[winning_key]
         consensus_confidence = agreeing_confidence / total_confidence if total_confidence > 0 else 0.0
         
+        # Reduce confidence if:
+        # 1. Near wire boundary
+        # 2. Cameras disagreed
+        # 3. Low consensus
+        if near_wire:
+            consensus_confidence *= 0.7
+            logger.info(f"[VOTE] Near wire ({min_boundary_dist:.1f}°) - confidence reduced")
+        
+        if unique_votes >= 3:
+            consensus_confidence *= 0.5
+            logger.warning(f"[VOTE] 3-way split - confidence heavily reduced")
+        elif unique_votes == 2 and consensus_confidence < 0.6:
+            consensus_confidence *= 0.7
+            logger.info(f"[VOTE] Split vote with low consensus - confidence reduced")
+        
         # Determine zone and score
         if winning_segment == 0:
-            # Bull - check inner vs outer
             inner_votes = sum(t['confidence'] for t in cluster if t['zone'] == 'inner_bull')
             outer_votes = sum(t['confidence'] for t in cluster if t['zone'] == 'outer_bull')
             if inner_votes >= outer_votes:
@@ -1995,11 +2056,12 @@ def vote_on_scores(clusters: List[List[dict]]) -> List[DetectedTip]:
             winning_zone = 'single'
             winning_score = winning_segment
         
-        # Average position for logging
+        # Average position
         avg_x = sum(t['x_mm'] for t in cluster) / len(cluster)
         avg_y = sum(t['y_mm'] for t in cluster) / len(cluster)
         
-        logger.info(f"[VOTE] Cluster: {len(cluster)} cameras, winner={winning_segment}x{winning_multiplier}={winning_score}, conf={consensus_confidence:.3f}")
+        confidence_label = "HIGH" if consensus_confidence > 0.7 else "MED" if consensus_confidence > 0.4 else "LOW"
+        logger.info(f"[VOTE] Result: {winning_segment}x{winning_multiplier}={winning_score}, conf={consensus_confidence:.3f} ({confidence_label}), near_wire={near_wire}")
         
         detected_tips.append(DetectedTip(
             x_mm=round(avg_x, 2),
