@@ -1472,6 +1472,23 @@ async def detect_tips(
                 y_px = tip.get('y_px', 0)
                 x_mm, y_mm = calibrator.pixel_to_dartboard(x_px, y_px, calibration_data)
                 tip['x_mm'] = x_mm
+                
+                # Calculate normalized polar coordinates (comparable across cameras)
+                center = calibration_data.get('center', (0, 0))
+                outer_double = calibration_data.get('outer_double_ellipse')
+                dx = x_px - center[0]
+                dy = y_px - center[1]
+                angle_deg = (math.degrees(math.atan2(dy, dx)) + 360) % 360
+                
+                if outer_double:
+                    (ecx, ecy), (ew, eh), eangle = outer_double
+                    avg_radius_px = (ew + eh) / 4  # Average semi-axis
+                    norm_dist = math.sqrt(dx*dx + dy*dy) / avg_radius_px if avg_radius_px > 0 else 0
+                else:
+                    norm_dist = math.sqrt(dx*dx + dy*dy) / 200  # Fallback
+                
+                tip['angle_deg'] = angle_deg
+                tip['norm_dist'] = norm_dist
                 tip['y_mm'] = y_mm
             
             # Keep original tips for debug image AND benchmark
@@ -1966,6 +1983,111 @@ def weighted_position_average(tips: List[dict]) -> Tuple[float, float, float]:
     return 0.0, 0.0, 0.0
 
 
+def weighted_polar_average(tips: List[dict]) -> Tuple[float, float, float]:
+    """
+    Calculate weighted average in POLAR coordinates.
+    
+    Unlike mm coordinates, polar coords (angle_deg, norm_dist) are
+    comparable across cameras because they're relative to each
+    camera's calibrated center and outer ring.
+    
+    Returns:
+        (avg_angle_deg, avg_norm_dist, total_weight)
+    """
+    if not tips:
+        return 0.0, 0.0, 0.0
+    
+    # Use vector averaging for angles to handle wraparound correctly
+    total_cos = 0.0
+    total_sin = 0.0
+    total_dist = 0.0
+    total_weight = 0.0
+    
+    for tip in tips:
+        weight = tip.get('confidence', 0.5)
+        cal_quality = tip.get('calibration_quality', 0.5)
+        weight *= (0.5 + cal_quality)
+        
+        angle_deg = tip.get('angle_deg', 0.0)
+        norm_dist = tip.get('norm_dist', 0.0)
+        
+        angle_rad = math.radians(angle_deg)
+        total_cos += math.cos(angle_rad) * weight
+        total_sin += math.sin(angle_rad) * weight
+        total_dist += norm_dist * weight
+        total_weight += weight
+    
+    if total_weight > 0:
+        avg_angle_rad = math.atan2(total_sin / total_weight, total_cos / total_weight)
+        avg_angle_deg = (math.degrees(avg_angle_rad) + 360) % 360
+        avg_norm_dist = total_dist / total_weight
+        return avg_angle_deg, avg_norm_dist, total_weight
+    return 0.0, 0.0, 0.0
+
+
+def score_from_polar(angle_deg: float, norm_dist: float) -> dict:
+    """
+    Calculate score from polar coordinates.
+    
+    Args:
+        angle_deg: Angle from center (0-360, 0=right/east)
+        norm_dist: Normalized distance (0 = center, 1.0 = outer double edge)
+    """
+    # Segment order (clockwise from right, but we need to find where 20 is)
+    # Standard dartboard: 20 at top, so 20 is at 90 degrees (up)
+    # Order clockwise: 20, 1, 18, 4, 13, 6, 10, 15, 2, 17, 3, 19, 7, 16, 8, 11, 14, 9, 12, 5
+    SEGMENTS = [20, 1, 18, 4, 13, 6, 10, 15, 2, 17, 3, 19, 7, 16, 8, 11, 14, 9, 12, 5]
+    
+    # Normalize zones by outer double (170mm)
+    BULLSEYE_NORM = 6.35 / 170.0       # ~0.037
+    OUTER_BULL_NORM = 16.0 / 170.0     # ~0.094
+    INNER_TRIPLE_NORM = 99.0 / 170.0   # ~0.582
+    OUTER_TRIPLE_NORM = 107.0 / 170.0  # ~0.629
+    INNER_DOUBLE_NORM = 162.0 / 170.0  # ~0.953
+    OUTER_DOUBLE_NORM = 1.0
+    
+    # Determine zone from normalized distance
+    if norm_dist <= BULLSEYE_NORM:
+        return {"score": 50, "multiplier": 1, "segment": 0, "zone": "inner_bull", "boundary_distance_deg": 9.0}
+    elif norm_dist <= OUTER_BULL_NORM:
+        return {"score": 25, "multiplier": 1, "segment": 0, "zone": "outer_bull", "boundary_distance_deg": 9.0}
+    elif norm_dist > OUTER_DOUBLE_NORM * 1.05:  # 5% tolerance
+        return {"score": 0, "multiplier": 0, "segment": 0, "zone": "miss", "boundary_distance_deg": 0.0}
+    
+    # Determine segment from angle
+    # 20 is at top (90°), each segment is 18° wide
+    # Adjust so 20 is centered at 90°
+    adjusted_angle = (angle_deg - 90 + 9 + 360) % 360  # +9 to center the segment
+    segment_idx = int(adjusted_angle / 18.0) % 20
+    segment = SEGMENTS[segment_idx]
+    
+    # Calculate boundary distance (how far from wire)
+    angle_in_segment = adjusted_angle % 18.0
+    boundary_distance_deg = min(angle_in_segment, 18.0 - angle_in_segment)
+    
+    # Determine multiplier from distance
+    if INNER_DOUBLE_NORM <= norm_dist <= OUTER_DOUBLE_NORM * 1.05:
+        multiplier = 2
+        zone = "double"
+    elif INNER_TRIPLE_NORM <= norm_dist <= OUTER_TRIPLE_NORM:
+        multiplier = 3
+        zone = "triple"
+    elif norm_dist < INNER_TRIPLE_NORM:
+        multiplier = 1
+        zone = "single_inner"
+    else:
+        multiplier = 1
+        zone = "single_outer"
+    
+    return {
+        "score": segment * multiplier,
+        "multiplier": multiplier,
+        "segment": segment,
+        "zone": zone,
+        "boundary_distance_deg": boundary_distance_deg
+    }
+
+
 def score_from_position(x_mm: float, y_mm: float, calibration_data: Dict = None) -> Dict:
     """
     Calculate score from mm position on dartboard.
@@ -2166,11 +2288,12 @@ def vote_on_scores(clusters: List[List[dict]]) -> List[DetectedTip]:
                 total_weight = sum(d['weight'] for d in details)
                 logger.info(f"[VOTE]   {seg}x{mult}: {cam_info} total_weight={total_weight:.2f}")
             
-            # POSITION AVERAGING: When cameras disagree, try averaging positions
-            # and scoring from the averaged position
-            avg_x, avg_y, avg_weight = weighted_position_average(cluster)
+            # POLAR AVERAGING: When cameras disagree, average polar coordinates
+            # (mm coordinates are camera-specific, polar coords are comparable)
+            avg_angle, avg_dist, avg_weight = weighted_polar_average(cluster)
             if avg_weight > 0:
-                pos_score = score_from_position(avg_x, avg_y)
+                pos_score = score_from_polar(avg_angle, avg_dist)
+                logger.info(f"[VOTE] Polar average: angle={avg_angle:.1f}°, dist={avg_dist:.3f}")
                 pos_segment = pos_score['segment']
                 pos_multiplier = pos_score['multiplier']
                 pos_key = (pos_segment, pos_multiplier)
