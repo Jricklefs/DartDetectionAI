@@ -58,6 +58,94 @@ class DetectedTip:
     keypoints: Optional[np.ndarray] = None  # For pose models
 
 
+
+
+def refine_tip_position(image: np.ndarray, cx: float, cy: float, 
+                        box: Tuple[float, float, float, float],
+                        search_radius: int = 30) -> Tuple[float, float, float]:
+    """
+    Refine dart tip position using edge detection.
+    
+    Strategy:
+    1. Crop region around initial detection
+    2. Apply Canny edge detection
+    3. Find the point closest to board center that's on an edge
+    
+    Args:
+        image: Full camera image
+        cx, cy: Initial tip estimate from YOLO
+        box: Bounding box (x1, y1, x2, y2)
+        search_radius: Pixels to search around initial point
+    
+    Returns:
+        (refined_x, refined_y, refinement_dist) - refined position and how much it moved
+    """
+    import cv2
+    import numpy as np
+    
+    try:
+        h, w = image.shape[:2]
+        x1, y1, x2, y2 = box
+        
+        # Expand box slightly for search
+        margin = search_radius
+        crop_x1 = max(0, int(x1 - margin))
+        crop_y1 = max(0, int(y1 - margin))
+        crop_x2 = min(w, int(x2 + margin))
+        crop_y2 = min(h, int(y2 + margin))
+        
+        # Crop and convert to grayscale
+        crop = image[crop_y1:crop_y2, crop_x1:crop_x2]
+        if crop.size == 0:
+            return cx, cy, 0.0
+        
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if len(crop.shape) == 3 else crop
+        
+        # Apply edge detection
+        edges = cv2.Canny(gray, 50, 150)
+        
+        # Find edge points
+        edge_points = np.column_stack(np.where(edges > 0))
+        if len(edge_points) == 0:
+            return cx, cy, 0.0
+        
+        # Convert initial point to crop coordinates
+        local_cx = cx - crop_x1
+        local_cy = cy - crop_y1
+        
+        # Find edge point closest to initial position
+        # Prefer points that are "forward" (toward smaller y in most cases for dart tips)
+        distances = np.sqrt((edge_points[:, 1] - local_cx)**2 + (edge_points[:, 0] - local_cy)**2)
+        
+        # Filter to points within search radius
+        valid_mask = distances < search_radius
+        if not np.any(valid_mask):
+            return cx, cy, 0.0
+        
+        valid_points = edge_points[valid_mask]
+        valid_distances = distances[valid_mask]
+        
+        # Pick the closest edge point
+        min_idx = np.argmin(valid_distances)
+        refined_local_y, refined_local_x = valid_points[min_idx]
+        
+        # Convert back to image coordinates
+        refined_x = refined_local_x + crop_x1
+        refined_y = refined_local_y + crop_y1
+        
+        refinement_dist = np.sqrt((refined_x - cx)**2 + (refined_y - cy)**2)
+        
+        # Only accept refinement if it's small (< 15 pixels)
+        if refinement_dist > 15:
+            return cx, cy, 0.0
+        
+        return float(refined_x), float(refined_y), float(refinement_dist)
+        
+    except Exception as e:
+        print(f"[REFINE] Error: {e}")
+        return cx, cy, 0.0
+
+
 class DartTipDetector:
     """
     Uses YOLO to detect dart tips in images.
@@ -298,6 +386,14 @@ class DartTipDetector:
                         print(f"Error processing keypoints: {e}")
                 else:
                     print(f"[YOLO] Box=({box_cx:.1f},{box_cy:.1f}) NO KEYPOINTS (pose={self.is_pose_model})")
+                
+                # Try to refine tip position using edge detection
+                refined_x, refined_y, refine_dist = refine_tip_position(
+                    image, cx, cy, (x1, y1, x2, y2), search_radius=20
+                )
+                if refine_dist > 0:
+                    print(f"[REFINE] Tip moved {refine_dist:.1f}px: ({cx:.1f},{cy:.1f}) -> ({refined_x:.1f},{refined_y:.1f})")
+                    cx, cy = refined_x, refined_y
                 
                 tips.append(DetectedTip(
                     x=float(cx),
