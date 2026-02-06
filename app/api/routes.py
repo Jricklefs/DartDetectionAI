@@ -3197,6 +3197,12 @@ class StereoStatusResponse(BaseModel):
 
 # ==================== AUTO-TUNING ====================
 
+
+@router.get("/v1/benchmark/auto-tune/progress")
+async def get_autotune_progress():
+    """Get current auto-tune progress."""
+    return autotune_progress
+
 @router.post("/v1/benchmark/auto-tune")
 async def auto_tune_parameters():
     """
@@ -3205,7 +3211,7 @@ async def auto_tune_parameters():
     Actually re-runs detection on stored benchmark images with different parameters.
     """
     global CONFIDENCE_THRESHOLD
-    from app.core.detection import get_detector
+    from app.core.detection import DartTipDetector
     import cv2
     import time
     
@@ -3285,7 +3291,7 @@ async def auto_tune_parameters():
     # Parameter grid - smaller for speed since we're re-running detection
     confidence_values = [0.15, 0.25, 0.35, 0.50]
     
-    detector = get_detector()
+    detector = DartTipDetector()
     original_threshold = CONFIDENCE_THRESHOLD
     
     best_config = None
@@ -3295,15 +3301,26 @@ async def auto_tune_parameters():
     
     total_start = time.time()
     
+    autotune_progress["running"] = True
+    autotune_progress["total_configs"] = len(confidence_values)
+    autotune_progress["total_darts"] = len(all_darts)
+    config_num = 0
+    
     for conf_thresh in confidence_values:
+        config_num += 1
+        autotune_progress["current_config"] = config_num
+        autotune_progress["status"] = f"Testing confidence={conf_thresh}"
         CONFIDENCE_THRESHOLD = conf_thresh
         
         correct = 0
         total = 0
         fixed_corrections = 0
         broke_correct = 0
+        dart_num = 0
         
         for dart in all_darts:
+            dart_num += 1
+            autotune_progress["current_dart"] = dart_num
             images = dart.get("images", {})
             if not images:
                 continue
@@ -3372,6 +3389,9 @@ async def auto_tune_parameters():
     
     elapsed = time.time() - total_start
     logger.info(f"[AUTO-TUNE] Complete in {elapsed:.1f}s. Best: {best_config}")
+    
+    autotune_progress["running"] = False
+    autotune_progress["status"] = "complete"
     
     return {
         "success": True,
@@ -3730,8 +3750,8 @@ async def select_model(request: Request):
     if model_path and model_path.exists():
         # Reinitialize the global detector with new model
         try:
-            # Get the calibrator and update its detector
-            calibrator = get_calibrator()
+            # Update the global calibrator's detector
+            from app.core.detection import DartTipDetector
             calibrator.tip_detector = DartTipDetector(model_name=model_key)
             logger.info(f"[MODEL] Switched from {old_model} to {model_key}")
             

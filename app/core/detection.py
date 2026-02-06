@@ -716,3 +716,19 @@ def score_from_ellipse_calibration(
         result["boundary_distance_deg"] = boundary_distance_deg
     
     return result
+
+
+# Global detector instance
+_global_detector = None
+
+def get_detector(model_name: str = None) -> DartTipDetector:
+    """Get the global detector instance, creating if needed."""
+    global _global_detector
+    if _global_detector is None or (model_name and _global_detector.model_name != model_name):
+        _global_detector = DartTipDetector(model_name=model_name or DEFAULT_TIP_MODEL)
+    return _global_detector
+
+def set_detector(detector: DartTipDetector):
+    """Set the global detector instance."""
+    global _global_detector
+    _global_detector = detector
