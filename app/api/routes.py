@@ -2910,7 +2910,7 @@ async def replay_single_dart(request: ReplayRequest):
             tip_confidence = selected.get("confidence", 0)
         else:
             # Re-run YOLO tip detection
-            tips = calibrator.tip_detector.detect_tips(img, confidence_threshold=0.3)
+            tips = calibrator.tip_detector.detect_tips(img, confidence_threshold=CONFIDENCE_THRESHOLD)
             
             if not tips:
                 continue
@@ -3416,6 +3416,52 @@ AVAILABLE_MODELS = {
 
 # Currently active model (in-memory, persists until restart)
 ACTIVE_MODEL = "default"
+# Detection confidence threshold (0.0 - 1.0)
+CONFIDENCE_THRESHOLD = 0.5
+
+
+@router.get("/v1/settings/threshold")
+async def get_threshold():
+    """Get current YOLO confidence threshold."""
+    global CONFIDENCE_THRESHOLD
+    return {
+        "threshold": CONFIDENCE_THRESHOLD,
+        "min": 0.1,
+        "max": 0.9,
+        "default": 0.5
+    }
+
+
+@router.post("/v1/settings/threshold")
+async def set_threshold(request: Request):
+    """
+    Set YOLO confidence threshold.
+    
+    Body: {"threshold": 0.5}
+    
+    Lower = more detections (but more false positives)
+    Higher = fewer detections (but more reliable)
+    """
+    global CONFIDENCE_THRESHOLD
+    
+    body = await request.json()
+    new_threshold = body.get("threshold", 0.5)
+    
+    # Clamp to valid range
+    new_threshold = max(0.1, min(0.9, float(new_threshold)))
+    
+    old_threshold = CONFIDENCE_THRESHOLD
+    CONFIDENCE_THRESHOLD = new_threshold
+    
+    logger.info(f"[SETTINGS] Confidence threshold changed: {old_threshold} -> {new_threshold}")
+    
+    return {
+        "success": True,
+        "previous": old_threshold,
+        "current": new_threshold
+    }
+
+
 
 
 @router.get("/v1/models")
