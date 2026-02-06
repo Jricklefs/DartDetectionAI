@@ -167,7 +167,7 @@ class DartTipDetector:
         self.is_pose_model = False
         self.image_size = 1280  # Default size
         self._last_inference_time = 0
-        self._warmup_interval = 2  # Warmup if no inference in last 2 seconds
+        self._warmup_interval = 1  # Warmup if no inference in last 1 second (more aggressive)
         self._warmup_thread = None
         self._stop_warmup = False
         self._warmup_image = None  # Store a calibration image for warmups
@@ -217,7 +217,7 @@ class DartTipDetector:
                     if self.is_initialized and self.model is not None:
                         # Only warmup if no real inference recently
                         time_since_last = time.time() - self._last_inference_time
-                        if time_since_last > 2.0:
+                        if time_since_last > 1.0:
                             # Use cached camera image if available, else dummy
                             warmup_img = self._warmup_image if self._warmup_image is not None else dummy_img
                             
@@ -227,11 +227,11 @@ class DartTipDetector:
                             elapsed = (time.time() - start) * 1000
                             self._last_inference_time = time.time()
                             warmup_count += 1
-                            if warmup_count % 10 == 1:  # Log every 10th warmup
+                            if warmup_count % 30 == 1:  # Log every 30th warmup
                                 print(f"[WARMUP] #{warmup_count} - {elapsed:.0f}ms (idle was {time_since_last:.1f}s)")
                 except Exception as e:
                     print(f"[WARMUP] Error: {e}")
-                time.sleep(1.0)  # Check every 1 second
+                time.sleep(0.5)  # Check every 0.5 seconds (more responsive)
         
         self._warmup_thread = threading.Thread(target=warmup_loop, daemon=True)
         self._warmup_thread.start()
