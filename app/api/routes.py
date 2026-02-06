@@ -1627,6 +1627,7 @@ async def detect_tips(
                 tip['zone'] = score_info.get('zone', 'miss')
                 tip['score'] = score_info.get('score', 0)
                 tip['boundary_distance_deg'] = score_info.get('boundary_distance_deg')  # For weighted voting
+                tip['calibration_quality'] = calibration_data.get('quality', 0.5)  # Camera calibration quality for voting
                 all_tips.append(tip)
                 
                 # Save training data if enabled
@@ -1961,6 +1962,12 @@ def vote_on_scores(clusters: List[List[dict]]) -> List[DetectedTip]:
             # Base weight is YOLO confidence
             weight = tip['confidence']
             
+            # CAMERA QUALITY WEIGHTING: Higher calibration quality = more trusted
+            # Quality ranges 0-1, scale to 0.5-1.5 multiplier
+            cal_quality = tip.get('calibration_quality', 0.5)
+            quality_factor = 0.5 + cal_quality  # 0 quality = 0.5x, 1.0 quality = 1.5x
+            weight *= quality_factor
+            
             # MAJOR weight reduction for tips NOT found in NEW region
             if not tip.get('found_in_new_region', True):
                 weight *= 0.1
@@ -1992,7 +1999,8 @@ def vote_on_scores(clusters: List[List[dict]]) -> List[DetectedTip]:
                 'camera': cam_id,
                 'weight': weight,
                 'boundary_dist': boundary_dist,
-                'in_new': tip.get('found_in_new_region', True)
+                'in_new': tip.get('found_in_new_region', True),
+                'cal_quality': cal_quality
             })
         
         # Detect disagreement
@@ -2005,10 +2013,11 @@ def vote_on_scores(clusters: List[List[dict]]) -> List[DetectedTip]:
             ])
             logger.warning(f"[VOTE] DISAGREEMENT ({unique_votes} options): {vote_summary}")
             
-            # Log which cameras voted for what
+            # Log which cameras voted for what (with quality)
             for (seg, mult), details in vote_details.items():
-                cams = [d['camera'] for d in details]
-                logger.info(f"[VOTE]   {seg}x{mult}: cameras {cams}")
+                cam_info = [f"{d['camera']}(q={d.get('cal_quality', 0):.2f})" for d in details]
+                total_weight = sum(d['weight'] for d in details)
+                logger.info(f"[VOTE]   {seg}x{mult}: {cam_info} total_weight={total_weight:.2f}")
         
         # Find winning vote
         winning_key = max(votes.keys(), key=lambda k: votes[k])
