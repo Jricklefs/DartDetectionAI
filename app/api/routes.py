@@ -2293,6 +2293,11 @@ def vote_on_scores(clusters: List[List[dict]]) -> List[DetectedTip]:
                 total_weight = sum(d['weight'] for d in details)
                 logger.info(f"[VOTE]   {seg}x{mult}: {cam_info} total_weight={total_weight:.2f}")
             
+            # Find initial winning vote from weighted voting
+            winning_key = max(votes.keys(), key=lambda k: votes[k])
+            winning_segment, winning_multiplier = winning_key
+            logger.info(f"[VOTE] Initial vote winner: {winning_segment}x{winning_multiplier} (weight={votes[winning_key]:.2f})")
+            
             # POLAR AVERAGING: When cameras disagree, average polar coordinates
             # (mm coordinates are camera-specific, polar coords are comparable)
             try:
@@ -2300,18 +2305,20 @@ def vote_on_scores(clusters: List[List[dict]]) -> List[DetectedTip]:
                 if avg_weight > 0:
                     pos_score = score_from_polar(avg_angle, avg_dist)
                     logger.info(f"[VOTE] Polar average: angle={avg_angle:.1f}°, dist={avg_dist:.3f}")
-                pos_segment = pos_score['segment']
-                pos_multiplier = pos_score['multiplier']
-                pos_key = (pos_segment, pos_multiplier)
-                
-                # Check if position-based score differs from vote winner
-                if pos_key != winning_key:
-                    # Position averaging suggests different score
-                    # Use it if it has reasonable confidence
-                    pos_boundary = pos_score.get('boundary_distance_deg', 9)
-                    if pos_boundary > 2.0:  # Not on a wire
-                        logger.info(f"[VOTE] Position averaging suggests {pos_segment}x{pos_multiplier} (boundary={pos_boundary:.1f}°)")
-                        logger.info(f"[VOTE] OVERRIDE: Using position average instead of vote winner")
+                    pos_segment = pos_score['segment']
+                    pos_multiplier = pos_score['multiplier']
+                    pos_key = (pos_segment, pos_multiplier)
+                    
+                    # Check if position-based score differs from vote winner
+                    if pos_key != winning_key:
+                        # Position averaging suggests different score
+                        # Use it if it has reasonable confidence
+                        pos_boundary = pos_score.get('boundary_distance_deg', 9)
+                        if pos_boundary > 2.0:  # Not on a wire
+                            logger.info(f"[VOTE] Position averaging suggests {pos_segment}x{pos_multiplier} (boundary={pos_boundary:.1f}°)")
+                            logger.info(f"[VOTE] OVERRIDE: Using position average instead of vote winner")
+                            winning_key = pos_key
+                            winning_segment, winning_multiplier = pos_key
             except Exception as polar_err:
                 logger.warning(f"[VOTE] Polar averaging failed: {polar_err}")
 
@@ -2346,10 +2353,6 @@ def vote_on_scores(clusters: List[List[dict]]) -> List[DetectedTip]:
                                     winning_segment, winning_multiplier = pos_key
                 except Exception as e:
                     logger.warning(f"[STEREO] Triangulation failed: {e}, falling back to position averaging")
-        
-        # Find winning vote
-        winning_key = max(votes.keys(), key=lambda k: votes[k])
-        winning_segment, winning_multiplier = winning_key
         
         # Consensus confidence - how much of total weight agrees
         agreeing_confidence = votes[winning_key]
