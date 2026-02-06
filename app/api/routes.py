@@ -3328,15 +3328,14 @@ async def auto_tune_parameters():
             # Run detection on each camera
             all_tips = []
             for cam_id, img in images.items():
-                tips = detector.detect(img)
+                tips = detector.detect_tips(img, confidence_threshold=conf_thresh)
                 for tip in tips:
-                    if tip.confidence >= conf_thresh:
-                        all_tips.append({
-                            "camera": cam_id,
-                            "x": tip.x,
-                            "y": tip.y,
-                            "confidence": tip.confidence
-                        })
+                    all_tips.append({
+                        "camera": cam_id,
+                        "x": tip.x,
+                        "y": tip.y,
+                        "confidence": tip.confidence
+                    })
             
             # Simple voting: most common segment wins
             # (Full voting logic would need calibration data)
