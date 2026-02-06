@@ -2215,9 +2215,6 @@ def vote_on_scores(clusters: List[List[dict]]) -> List[DetectedTip]:
                                     winning_segment, winning_multiplier = pos_key
                 except Exception as e:
                     logger.warning(f"[STEREO] Triangulation failed: {e}, falling back to position averaging")
-
-                        winning_key = pos_key
-                        winning_segment, winning_multiplier = pos_key
         
         # Find winning vote
         winning_key = max(votes.keys(), key=lambda k: votes[k])
