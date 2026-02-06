@@ -2356,8 +2356,9 @@ def vote_on_scores(clusters: List[List[dict]]) -> List[DetectedTip]:
                     logger.warning(f"[STEREO] Triangulation failed: {e}, falling back to position averaging")
         
         # Consensus confidence - how much of total weight agrees
-        agreeing_confidence = votes[winning_key]
-        consensus_confidence = agreeing_confidence / total_confidence if total_confidence > 0 else 0.0
+        # Use .get() since polar averaging might override to a key not in votes
+        agreeing_confidence = votes.get(winning_key, total_confidence * 0.5)
+        consensus_confidence = agreeing_confidence / total_confidence if total_confidence > 0 else 0.5
         
         # Reduce confidence if:
         # 1. Near wire boundary
