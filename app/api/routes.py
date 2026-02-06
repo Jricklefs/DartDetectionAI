@@ -1895,6 +1895,134 @@ def cluster_tips_by_position(
     return clusters
 
 
+
+def weighted_position_average(tips: List[dict]) -> Tuple[float, float, float]:
+    """
+    Compute weighted average position from multiple camera detections.
+    
+    Instead of voting on scores, we average the mm positions weighted by:
+    - YOLO confidence
+    - Calibration quality
+    - Whether tip was found in NEW region
+    - Boundary distance (tips near center of segment are more reliable)
+    
+    Returns:
+        (x_mm, y_mm, total_weight)
+    """
+    if not tips:
+        return 0.0, 0.0, 0.0
+    
+    total_x = 0.0
+    total_y = 0.0
+    total_weight = 0.0
+    
+    for tip in tips:
+        weight = tip.get('confidence', 0.5)
+        
+        # Calibration quality factor
+        cal_quality = tip.get('calibration_quality', 0.5)
+        weight *= (0.5 + cal_quality)
+        
+        # Reduce weight for fallback tips (not in NEW region)
+        if not tip.get('found_in_new_region', True):
+            weight *= 0.1
+        
+        # Boundary distance factor - tips near wire are less reliable
+        boundary_dist = tip.get('boundary_distance_deg')
+        if boundary_dist is not None:
+            if boundary_dist < 2.0:
+                weight *= 0.3
+            elif boundary_dist < 4.0:
+                weight *= 0.7
+        
+        x_mm = tip.get('x_mm', 0.0)
+        y_mm = tip.get('y_mm', 0.0)
+        
+        total_x += x_mm * weight
+        total_y += y_mm * weight
+        total_weight += weight
+    
+    if total_weight > 0:
+        return total_x / total_weight, total_y / total_weight, total_weight
+    return 0.0, 0.0, 0.0
+
+
+def score_from_position(x_mm: float, y_mm: float, calibration_data: Dict = None) -> Dict:
+    """
+    Calculate score from mm position on dartboard.
+    
+    This is the reverse of pixel_to_dartboard - we have the position,
+    now calculate what segment/multiplier it's in.
+    """
+    import math
+    
+    # Calculate distance from center
+    distance = math.sqrt(x_mm**2 + y_mm**2)
+    
+    # Calculate angle (0° = right, counter-clockwise)
+    angle_rad = math.atan2(y_mm, x_mm)
+    angle_deg = math.degrees(angle_rad)
+    if angle_deg < 0:
+        angle_deg += 360
+    
+    # Standard dartboard radii (mm)
+    BULL_RADIUS = 6.35  # Inner bull
+    OUTER_BULL_RADIUS = 16.0  # Outer bull
+    TRIPLE_INNER = 99.0
+    TRIPLE_OUTER = 107.0
+    DOUBLE_INNER = 162.0
+    DOUBLE_OUTER = 170.0
+    
+    # Determine zone by distance
+    if distance <= BULL_RADIUS:
+        return {"segment": 0, "multiplier": 2, "zone": "inner_bull", "score": 50}
+    elif distance <= OUTER_BULL_RADIUS:
+        return {"segment": 0, "multiplier": 1, "zone": "outer_bull", "score": 25}
+    elif distance > DOUBLE_OUTER:
+        return {"segment": 0, "multiplier": 0, "zone": "miss", "score": 0}
+    
+    # Determine segment from angle
+    # Standard dartboard: 20 at top, going clockwise: 20,1,18,4,13,6,10,15,2,17,3,19,7,16,8,11,14,9,12,5
+    segments = [20, 1, 18, 4, 13, 6, 10, 15, 2, 17, 3, 19, 7, 16, 8, 11, 14, 9, 12, 5]
+    
+    # Each segment is 18 degrees, starting from -9° from top (270°)
+    # Segment 20 is centered at 270° (top)
+    # Normalize angle: 0° = segment 20 center
+    normalized_angle = (angle_deg - 270 + 9) % 360  # +9 to align with segment boundary
+    segment_index = int(normalized_angle / 18) % 20
+    segment = segments[segment_index]
+    
+    # Calculate boundary distance
+    segment_center_offset = normalized_angle % 18
+    boundary_distance = min(segment_center_offset, 18 - segment_center_offset)
+    
+    # Determine multiplier by distance
+    if TRIPLE_INNER <= distance <= TRIPLE_OUTER:
+        multiplier = 3
+        zone = "triple"
+    elif DOUBLE_INNER <= distance <= DOUBLE_OUTER:
+        multiplier = 2
+        zone = "double"
+    elif distance < TRIPLE_INNER:
+        multiplier = 1
+        zone = "single_inner"
+    else:
+        multiplier = 1
+        zone = "single_outer"
+    
+    score = segment * multiplier
+    
+    return {
+        "segment": segment,
+        "multiplier": multiplier,
+        "zone": zone,
+        "score": score,
+        "boundary_distance_deg": boundary_distance,
+        "distance_mm": distance
+    }
+
+
+
 def vote_on_scores(clusters: List[List[dict]]) -> List[DetectedTip]:
     """
     For each cluster (same dart seen by multiple cameras), vote on the score.
@@ -2018,6 +2146,26 @@ def vote_on_scores(clusters: List[List[dict]]) -> List[DetectedTip]:
                 cam_info = [f"{d['camera']}(q={d.get('cal_quality', 0):.2f})" for d in details]
                 total_weight = sum(d['weight'] for d in details)
                 logger.info(f"[VOTE]   {seg}x{mult}: {cam_info} total_weight={total_weight:.2f}")
+            
+            # POSITION AVERAGING: When cameras disagree, try averaging positions
+            # and scoring from the averaged position
+            avg_x, avg_y, avg_weight = weighted_position_average(cluster)
+            if avg_weight > 0:
+                pos_score = score_from_position(avg_x, avg_y)
+                pos_segment = pos_score['segment']
+                pos_multiplier = pos_score['multiplier']
+                pos_key = (pos_segment, pos_multiplier)
+                
+                # Check if position-based score differs from vote winner
+                if pos_key != winning_key:
+                    # Position averaging suggests different score
+                    # Use it if it has reasonable confidence
+                    pos_boundary = pos_score.get('boundary_distance_deg', 9)
+                    if pos_boundary > 2.0:  # Not on a wire
+                        logger.info(f"[VOTE] Position averaging suggests {pos_segment}x{pos_multiplier} (boundary={pos_boundary:.1f}°)")
+                        logger.info(f"[VOTE] OVERRIDE: Using position average instead of vote winner")
+                        winning_key = pos_key
+                        winning_segment, winning_multiplier = pos_key
         
         # Find winning vote
         winning_key = max(votes.keys(), key=lambda k: votes[k])
