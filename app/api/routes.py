@@ -3386,6 +3386,109 @@ async def run_stereo_calibration(request: dict = {}):
     }
 
 
+
+
+# ==================== MODEL SELECTION ====================
+
+# Available models configuration
+AVAILABLE_MODELS = {
+    "default": {
+        "name": "Pose Nano (Dec 2025)",
+        "description": "Balanced speed/accuracy, INT8 optimized",
+        "path": "posenano27122025_int8_openvino_model"
+    },
+    "best": {
+        "name": "YOLO26n Pose (Jan 2026)", 
+        "description": "Newer architecture, potentially better accuracy",
+        "path": "26tippose27012026_int8_openvino_model"
+    },
+    "rect": {
+        "name": "736x1280 FP16",
+        "description": "Non-square input, higher precision",
+        "path": "best_openvino_736x1280_fp16_openvino_model"
+    },
+    "square": {
+        "name": "Square (Jan 2026)",
+        "description": "Square input variant",
+        "path": "tippose25012026_square_openvino_model"
+    }
+}
+
+# Currently active model (in-memory, persists until restart)
+ACTIVE_MODEL = "default"
+
+
+@router.get("/v1/models")
+async def list_models():
+    """List available detection models."""
+    global ACTIVE_MODEL
+    return {
+        "active": ACTIVE_MODEL,
+        "models": AVAILABLE_MODELS
+    }
+
+
+@router.post("/v1/models/select")
+async def select_model(request: Request):
+    """
+    Select which detection model to use.
+    
+    Body: {"model": "default" | "best" | "rect" | "square"}
+    
+    Note: This changes the model for future detections. 
+    The detector will reload on next detection call.
+    """
+    global ACTIVE_MODEL
+    
+    body = await request.json()
+    model_key = body.get("model", "default")
+    
+    if model_key not in AVAILABLE_MODELS:
+        return JSONResponse(
+            status_code=400,
+            content={"error": f"Unknown model: {model_key}. Available: {list(AVAILABLE_MODELS.keys())}"}
+        )
+    
+    old_model = ACTIVE_MODEL
+    ACTIVE_MODEL = model_key
+    
+    # Update the detector to use the new model
+    from app.core.detection import DartTipDetector, TIP_MODEL_PATHS
+    
+    # Check if model path exists
+    model_info = AVAILABLE_MODELS[model_key]
+    model_path = TIP_MODEL_PATHS.get(model_key)
+    
+    if model_path and model_path.exists():
+        # Reinitialize the global detector with new model
+        try:
+            # Get the calibrator and update its detector
+            calibrator = get_calibrator()
+            calibrator.tip_detector = DartTipDetector(model_name=model_key)
+            logger.info(f"[MODEL] Switched from {old_model} to {model_key}")
+            
+            return {
+                "success": True,
+                "previous": old_model,
+                "current": model_key,
+                "model_info": model_info
+            }
+        except Exception as e:
+            ACTIVE_MODEL = old_model  # Rollback
+            logger.error(f"[MODEL] Failed to switch to {model_key}: {e}")
+            return JSONResponse(
+                status_code=500,
+                content={"error": f"Failed to load model: {str(e)}"}
+            )
+    else:
+        ACTIVE_MODEL = old_model  # Rollback
+        return JSONResponse(
+            status_code=404,
+            content={"error": f"Model file not found: {model_info['path']}"}
+        )
+
+
+
 @router.post("/v1/stereo/clear-captures")
 async def clear_stereo_captures(request: dict = {}):
     """Clear captured calibration images to start over."""
