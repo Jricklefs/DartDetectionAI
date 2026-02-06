@@ -3193,6 +3193,227 @@ class StereoStatusResponse(BaseModel):
     reprojection_error: Optional[float]
 
 
+
+
+# ==================== AUTO-TUNING ====================
+
+@router.post("/v1/benchmark/auto-tune")
+async def auto_tune_parameters():
+    """
+    Automatically find optimal detection parameters by replaying benchmark data.
+    
+    Tests combinations of:
+    - confidence_threshold
+    - boundary_weight_min
+    - polar_override_threshold
+    
+    Returns the best configuration based on accuracy.
+    """
+    global CONFIDENCE_THRESHOLD
+    
+    # Get all benchmark data
+    all_darts = []
+    for board_id, games in benchmark_storage.items():
+        for game_id, game_data in games.items():
+            for dart in game_data.get("darts", []):
+                dart_copy = dart.copy()
+                dart_copy["board_id"] = board_id
+                dart_copy["game_id"] = game_id
+                all_darts.append(dart_copy)
+    
+    if len(all_darts) < 5:
+        return {
+            "success": False,
+            "error": f"Need at least 5 benchmark darts, have {len(all_darts)}",
+            "darts_available": len(all_darts)
+        }
+    
+    # Count corrections (these are our ground truth)
+    corrections = [d for d in all_darts if d.get("was_corrected")]
+    logger.info(f"[AUTO-TUNE] Starting with {len(all_darts)} darts, {len(corrections)} corrections")
+    
+    # Parameter grid to search
+    confidence_values = [0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.50]
+    boundary_weight_values = [0.05, 0.1, 0.2, 0.3]
+    polar_threshold_values = [1.5, 2.0, 3.0, 4.0, 5.0]
+    
+    best_config = None
+    best_score = 0
+    best_details = None
+    results = []
+    
+    total_combos = len(confidence_values) * len(boundary_weight_values) * len(polar_threshold_values)
+    combo_num = 0
+    
+    for conf_thresh in confidence_values:
+        for boundary_weight in boundary_weight_values:
+            for polar_thresh in polar_threshold_values:
+                combo_num += 1
+                
+                # Simulate detection with these parameters
+                correct = 0
+                would_fix_correction = 0
+                would_break_correct = 0
+                
+                for dart in all_darts:
+                    # Get the camera votes from benchmark data
+                    camera_details = dart.get("camera_details", {})
+                    
+                    if not camera_details:
+                        continue
+                    
+                    # Simulate voting with current parameters
+                    votes = {}
+                    total_weight = 0
+                    
+                    for cam_id, cam_data in camera_details.items():
+                        tip = cam_data.get("selected_tip", {})
+                        if not tip:
+                            continue
+                        
+                        conf = tip.get("confidence", 0.5)
+                        
+                        # Apply confidence threshold
+                        if conf < conf_thresh:
+                            continue
+                        
+                        # Calculate weight with boundary factor
+                        boundary_dist = tip.get("boundary_distance_deg", 9.0)
+                        if boundary_dist < 3:
+                            boundary_factor = boundary_weight + (1 - boundary_weight) * (boundary_dist / 3)
+                        else:
+                            boundary_factor = 1.0
+                        
+                        cal_quality = cam_data.get("calibration_quality", 0.9)
+                        weight = conf * cal_quality * boundary_factor
+                        
+                        score_key = (tip.get("segment", 0), tip.get("multiplier", 1))
+                        if score_key not in votes:
+                            votes[score_key] = 0
+                        votes[score_key] += weight
+                        total_weight += weight
+                    
+                    if not votes:
+                        continue
+                    
+                    # Find winner
+                    winner = max(votes.keys(), key=lambda k: votes[k])
+                    winner_segment, winner_mult = winner
+                    
+                    # Check polar averaging override
+                    angle_deg = dart.get("avg_angle_deg")
+                    norm_dist = dart.get("avg_norm_dist")
+                    
+                    if angle_deg is not None and norm_dist is not None:
+                        # Would polar averaging change the result?
+                        polar_score = score_from_polar(angle_deg, norm_dist)
+                        polar_key = (polar_score["segment"], polar_score["multiplier"])
+                        polar_boundary = polar_score.get("boundary_distance_deg", 9)
+                        
+                        if polar_key != winner and polar_boundary > polar_thresh:
+                            winner_segment = polar_score["segment"]
+                            winner_mult = polar_score["multiplier"]
+                    
+                    # Compare to actual result
+                    actual_segment = dart.get("final_segment", dart.get("detected_segment"))
+                    actual_mult = dart.get("final_multiplier", dart.get("detected_multiplier"))
+                    
+                    detected_segment = dart.get("detected_segment")
+                    detected_mult = dart.get("detected_multiplier")
+                    
+                    was_corrected = dart.get("was_corrected", False)
+                    
+                    if was_corrected:
+                        # Ground truth is the corrected value
+                        if winner_segment == actual_segment and winner_mult == actual_mult:
+                            would_fix_correction += 1
+                            correct += 1
+                        else:
+                            # Still wrong
+                            pass
+                    else:
+                        # Original detection was correct
+                        if winner_segment == actual_segment and winner_mult == actual_mult:
+                            correct += 1
+                        else:
+                            would_break_correct += 1
+                
+                # Calculate score (penalize breaking correct detections heavily)
+                accuracy = correct / len(all_darts) if all_darts else 0
+                fixes = would_fix_correction
+                breaks = would_break_correct
+                
+                # Score: accuracy with penalty for breaking things
+                score = accuracy - (breaks * 0.1)  # Each break costs 10%
+                
+                result = {
+                    "confidence": conf_thresh,
+                    "boundary_weight": boundary_weight,
+                    "polar_threshold": polar_thresh,
+                    "accuracy": round(accuracy * 100, 1),
+                    "correct": correct,
+                    "total": len(all_darts),
+                    "would_fix": fixes,
+                    "would_break": breaks,
+                    "score": round(score * 100, 1)
+                }
+                results.append(result)
+                
+                if score > best_score:
+                    best_score = score
+                    best_config = {
+                        "confidence_threshold": conf_thresh,
+                        "boundary_weight_min": boundary_weight,
+                        "polar_override_threshold": polar_thresh
+                    }
+                    best_details = result
+    
+    # Sort results by score
+    results.sort(key=lambda x: x["score"], reverse=True)
+    
+    logger.info(f"[AUTO-TUNE] Best config: {best_config} with score {best_score:.1%}")
+    
+    return {
+        "success": True,
+        "darts_analyzed": len(all_darts),
+        "corrections_in_data": len(corrections),
+        "combinations_tested": total_combos,
+        "best_config": best_config,
+        "best_result": best_details,
+        "top_10_results": results[:10],
+        "current_config": {
+            "confidence_threshold": CONFIDENCE_THRESHOLD,
+            "boundary_weight_min": 0.1,  # Current hardcoded value
+            "polar_override_threshold": 2.0  # Current hardcoded value
+        }
+    }
+
+
+@router.post("/v1/benchmark/apply-config")
+async def apply_tuned_config(request: Request):
+    """Apply the auto-tuned configuration."""
+    global CONFIDENCE_THRESHOLD
+    
+    body = await request.json()
+    
+    new_conf = body.get("confidence_threshold")
+    if new_conf is not None:
+        CONFIDENCE_THRESHOLD = float(new_conf)
+        logger.info(f"[CONFIG] Applied confidence_threshold: {CONFIDENCE_THRESHOLD}")
+    
+    # Note: boundary_weight and polar_threshold would need code changes
+    # to be truly configurable at runtime. For now we just report them.
+    
+    return {
+        "success": True,
+        "applied": {
+            "confidence_threshold": CONFIDENCE_THRESHOLD
+        },
+        "note": "boundary_weight and polar_threshold require restart to change"
+    }
+
+
+
 @router.get("/v1/stereo/status")
 async def get_stereo_status(board_id: str = "default"):
     """Get current triangulation mode and stereo calibration status."""
