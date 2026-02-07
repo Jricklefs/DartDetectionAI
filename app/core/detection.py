@@ -173,7 +173,7 @@ class DartTipDetector:
         self._warmup_image = None  # Store a calibration image for warmups
         self._warmup_counter = 0
         self._load_model()
-        self._start_background_warmup()
+        # self._start_background_warmup()  # Disabled - not helping with latency
     
     def set_warmup_image(self, image: np.ndarray):
         """Set a real camera image to use for warmups instead of dummy."""
