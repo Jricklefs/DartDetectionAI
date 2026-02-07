@@ -3891,6 +3891,177 @@ async def select_model(request: Request):
 
 
 
+
+@router.post("/v1/models/select-and-recalibrate")
+async def select_model_and_recalibrate(request: Request):
+    """
+    Select a new model AND automatically recalibrate all cameras.
+    
+    Body: {"model": "default" | "best" | "rect" | "square"}
+    
+    This endpoint:
+    1. Switches to the new model
+    2. Grabs fresh images from DartSensor for all cameras
+    3. Runs calibration with the new model
+    4. Saves calibration to DartGame DB
+    """
+    import httpx
+    import base64
+    
+    body = await request.json()
+    model_key = body.get("model", "default")
+    
+    if model_key not in AVAILABLE_MODELS:
+        return JSONResponse(
+            status_code=400,
+            content={"error": f"Unknown model: {model_key}. Available: {list(AVAILABLE_MODELS.keys())}"}
+        )
+    
+    results = {
+        "model_switch": None,
+        "calibration": [],
+        "save_results": []
+    }
+    
+    # Step 1: Switch model
+    global ACTIVE_MODEL
+    old_model = ACTIVE_MODEL
+    ACTIVE_MODEL = model_key
+    
+    from app.core.detection import DartTipDetector, TIP_MODEL_PATHS
+    
+    model_info = AVAILABLE_MODELS[model_key]
+    model_path = TIP_MODEL_PATHS.get(model_key)
+    
+    if not model_path or not model_path.exists():
+        ACTIVE_MODEL = old_model
+        return JSONResponse(
+            status_code=500,
+            content={"error": f"Model path not found: {model_key}"}
+        )
+    
+    try:
+        calibrator.tip_detector = DartTipDetector(model_name=model_key)
+        logger.info(f"[MODEL] Switched from {old_model} to {model_key}")
+        results["model_switch"] = {"success": True, "from": old_model, "to": model_key}
+    except Exception as e:
+        ACTIVE_MODEL = old_model
+        return JSONResponse(
+            status_code=500,
+            content={"error": f"Failed to load model: {str(e)}"}
+        )
+    
+    # Step 2: Get fresh images from DartSensor for all cameras
+    DARTSENSOR_URL = "http://localhost:8001"
+    DARTGAME_URL = "http://localhost:5000"
+    
+    camera_images = {}
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        for cam_id in ["cam0", "cam1", "cam2"]:
+            try:
+                # Get snapshot from DartSensor
+                resp = await client.get(f"{DARTSENSOR_URL}/snapshot/{cam_id[-1]}")
+                if resp.status_code == 200:
+                    # Convert to base64
+                    img_b64 = base64.b64encode(resp.content).decode('utf-8')
+                    camera_images[cam_id] = img_b64
+                    logger.info(f"[RECAL] Got image from {cam_id}: {len(resp.content)} bytes")
+                else:
+                    logger.warning(f"[RECAL] Failed to get {cam_id}: {resp.status_code}")
+            except Exception as e:
+                logger.warning(f"[RECAL] Error getting {cam_id}: {e}")
+    
+    if not camera_images:
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": "Could not get images from any camera",
+                "model_switch": results["model_switch"]
+            }
+        )
+    
+    # Step 3: Run calibration for each camera
+    for cam_id, img_b64 in camera_images.items():
+        try:
+            result = calibrator.calibrate(
+                camera_id=cam_id,
+                image_base64=img_b64
+            )
+            
+            cal_result = {
+                "camera_id": cam_id,
+                "success": result.success,
+                "quality": result.quality,
+                "error": result.error
+            }
+            
+            if result.success:
+                cal_result["calibration_data"] = result.calibration_data
+                cal_result["segment_at_top"] = result.segment_at_top
+            
+            results["calibration"].append(cal_result)
+            logger.info(f"[RECAL] Calibrated {cam_id}: success={result.success}, quality={result.quality}")
+            
+        except Exception as e:
+            results["calibration"].append({
+                "camera_id": cam_id,
+                "success": False,
+                "error": str(e)
+            })
+            logger.error(f"[RECAL] Calibration error for {cam_id}: {e}")
+    
+    # Step 4: Save calibration to DartGame DB
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        for cal in results["calibration"]:
+            if not cal.get("success"):
+                continue
+            
+            try:
+                # POST to DartGame to save calibration
+                save_resp = await client.post(
+                    f"{DARTGAME_URL}/api/calibrations",
+                    json={
+                        "cameraId": cal["camera_id"],
+                        "calibrationData": json.dumps(cal["calibration_data"]) if isinstance(cal["calibration_data"], dict) else cal["calibration_data"],
+                        "quality": cal["quality"],
+                        "twentyAngle": cal.get("segment_at_top")
+                    }
+                )
+                
+                if save_resp.status_code == 200:
+                    results["save_results"].append({
+                        "camera_id": cal["camera_id"],
+                        "saved": True
+                    })
+                    logger.info(f"[RECAL] Saved calibration for {cal['camera_id']}")
+                else:
+                    results["save_results"].append({
+                        "camera_id": cal["camera_id"],
+                        "saved": False,
+                        "error": f"HTTP {save_resp.status_code}"
+                    })
+            except Exception as e:
+                results["save_results"].append({
+                    "camera_id": cal["camera_id"],
+                    "saved": False,
+                    "error": str(e)
+                })
+                logger.warning(f"[RECAL] Failed to save calibration for {cal['camera_id']}: {e}")
+    
+    # Summary
+    successful_cals = sum(1 for c in results["calibration"] if c.get("success"))
+    saved_cals = sum(1 for s in results["save_results"] if s.get("saved"))
+    
+    return {
+        "success": successful_cals > 0,
+        "model": model_key,
+        "model_info": model_info,
+        "cameras_calibrated": successful_cals,
+        "cameras_saved": saved_cals,
+        "total_cameras": len(camera_images),
+        "details": results
+    }
+
 @router.post("/v1/stereo/clear-captures")
 async def clear_stereo_captures(request: dict = {}):
     """Clear captured calibration images to start over."""
