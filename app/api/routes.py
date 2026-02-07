@@ -2704,6 +2704,63 @@ async def update_benchmark_context(request: BenchmarkContextRequest):
 
 
 @router.post("/v1/benchmark/correction")
+class ExcludeDartRequest(BaseModel):
+    game_id: str
+    dart_index: int
+    reason: str = "bounce_out"
+
+@router.post("/v1/benchmark/exclude-dart")
+async def exclude_dart_from_benchmark(request: ExcludeDartRequest):
+    """
+    Mark a dart as excluded from benchmark (bounce out, uncorrectable, etc.)
+    This creates a marker file so the dart is skipped in replay analysis.
+    """
+    try:
+        game_id = request.game_id
+        dart_index = request.dart_index
+        reason = request.reason
+        
+        # Find the most recent dart for this game
+        benchmark_dir = Path("C:/Users/clawd/DartBenchmark/default") / game_id
+        
+        if not benchmark_dir.exists():
+            return {"status": "ok", "message": "No benchmark data for this game"}
+        
+        # Find the latest round/dart directory
+        dart_dirs = list(benchmark_dir.glob(f"*/dart_{dart_index + 1}"))
+        if not dart_dirs:
+            # Try finding by dart number in metadata
+            all_dart_dirs = list(benchmark_dir.glob("*/dart_*"))
+            for d in sorted(all_dart_dirs, reverse=True):
+                meta_file = d / "metadata.json"
+                if meta_file.exists():
+                    import json
+                    with open(meta_file) as f:
+                        meta = json.load(f)
+                    if meta.get("dart_number") == dart_index + 1:
+                        dart_dirs = [d]
+                        break
+        
+        if dart_dirs:
+            dart_dir = sorted(dart_dirs)[-1]  # Most recent
+            exclude_file = dart_dir / "excluded.json"
+            import json
+            with open(exclude_file, 'w') as f:
+                json.dump({
+                    "reason": reason,
+                    "excluded_at": str(datetime.now().isoformat()),
+                    "dart_index": dart_index
+                }, f, indent=2)
+            
+            logger.info(f"[BENCHMARK] Excluded dart {dart_index} from game {game_id}: {reason}")
+            return {"status": "ok", "message": f"Dart {dart_index} excluded from benchmark", "path": str(exclude_file)}
+        
+        return {"status": "ok", "message": "Dart not found in benchmark data"}
+        
+    except Exception as e:
+        logger.error(f"[BENCHMARK] Failed to exclude dart: {e}")
+        return {"status": "error", "message": str(e)}
+
 async def record_benchmark_correction(request: BenchmarkCorrectionRequest):
     """Record a dart correction for accuracy analysis."""
     # If dart_path not provided, try to find it from recent tracking
