@@ -4136,10 +4136,13 @@ async def select_calibration_model(request: Request):
 async def rotate_segment_20(camera_id: str):
     """
     Rotate the segment 20 position by 1 segment (18 degrees clockwise).
-    This adjusts the calibration without re-detecting.
+    This adjusts the twentyAngle stored in the calibration.
     """
     import json
     import httpx
+    from starlette.responses import JSONResponse
+    from pathlib import Path
+    from datetime import datetime
     
     try:
         # Get current calibration from DartGame API
@@ -4152,50 +4155,55 @@ async def rotate_segment_20(camera_id: str):
         
         # Parse calibration data
         cal_json = json.loads(cal_data.get('calibrationData', '{}'))
-        current_angle = cal_data.get('twentyAngle', 0) or 0
+        current_angle = cal_data.get('twentyAngle') or 0
         
         # Rotate by 18 degrees (1 segment)
         new_angle = (current_angle + 18) % 360
         
-        # Update segment_20_index if present
-        segment_20_index = cal_json.get('segment_20_index', 0)
-        new_segment_20_index = (segment_20_index + 1) % 20
-        cal_json['segment_20_index'] = new_segment_20_index
-        
-        # Update rotation_offset_deg
+        # Update rotation_offset_deg in calibration data
         rotation_offset = cal_json.get('rotation_offset_deg', 0)
         new_rotation_offset = (rotation_offset + 18) % 360
         cal_json['rotation_offset_deg'] = new_rotation_offset
         
-        logger.info(f"[ROTATE20] {camera_id}: angle {current_angle}° -> {new_angle}°, segment_20_index {segment_20_index} -> {new_segment_20_index}")
+        logger.info(f"[ROTATE20] {camera_id}: angle {current_angle}° -> {new_angle}°, rotation_offset {rotation_offset}° -> {new_rotation_offset}°")
         
         # Regenerate overlay with new rotation
         cal_image_path = cal_data.get('calibrationImagePath', '')
         new_overlay_path = cal_data.get('overlayImagePath', '')
         
         if cal_image_path:
-            from pathlib import Path
-            from datetime import datetime
-            
             wwwroot = Path("C:/Users/clawd/DartGameSystem/DartGameAPI/wwwroot")
             img_path = wwwroot / cal_image_path.lstrip('/')
             
             if img_path.exists():
                 image = cv2.imread(str(img_path))
                 
-                # Draw new overlay
+                # Use DartboardCalibrator to regenerate overlay with new rotation
                 calibrator = DartboardCalibrator()
+                
+                # Build EllipseCalibration from stored data
+                from app.core.calibration import EllipseCalibration
+                ellipse_cal = EllipseCalibration(
+                    center=tuple(cal_json.get('center', [0, 0])),
+                    outer_double_ellipse=cal_json.get('outer_double_ellipse'),
+                    outer_triple_ellipse=cal_json.get('outer_triple_ellipse'),
+                    inner_triple_ellipse=cal_json.get('inner_triple_ellipse'),
+                    inner_double_ellipse=cal_json.get('inner_double_ellipse'),
+                    bull_ellipse=cal_json.get('bull_ellipse'),
+                    bullseye_ellipse=cal_json.get('bullseye_ellipse')
+                )
+                
+                # Draw overlay - use empty point lists since we just want the ellipses
                 overlay = calibrator._draw_calibration_overlay(
                     image,
-                    cal_json.get('center'),
-                    cal_json.get('outer_double_ellipse'),
-                    cal_json.get('outer_triple_ellipse'),
-                    cal_json.get('inner_triple_ellipse'),
-                    cal_json.get('inner_double_ellipse'),
-                    cal_json.get('bull_ellipse'),
-                    cal_json.get('bullseye_ellipse'),
-                    cal_json.get('segment_angles', []),
-                    new_segment_20_index
+                    ellipse_cal,
+                    [],  # cal_points
+                    [],  # cal1_points
+                    [],  # cal2_points
+                    [],  # cal3_points
+                    [],  # bull_points
+                    [],  # twenty_points
+                    new_rotation_offset
                 )
                 
                 # Save new overlay
@@ -4236,13 +4244,15 @@ async def rotate_segment_20(camera_id: str):
             "cameraId": camera_id,
             "previousAngle": current_angle,
             "twentyAngle": new_angle,
-            "segment20Index": new_segment_20_index,
+            "rotationOffset": new_rotation_offset,
             "overlayImagePath": new_overlay_path
         }
         
     except Exception as e:
         logger.error(f"[ROTATE20] Error: {e}", exc_info=True)
+        from starlette.responses import JSONResponse
         return JSONResponse(status_code=500, content={"error": str(e)})
+
 
 
 @router.post("/v1/stereo/clear-captures")
