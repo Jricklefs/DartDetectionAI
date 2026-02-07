@@ -40,15 +40,24 @@ CALIBRATION_MODELS = {
         "name": "Dartboard 1280 INT8",
         "description": "Original calibration model, proven accuracy",
         "path": MODELS_DIR / "dartboard1280imgz_int8_openvino_model",
-        "imgsz": (1280, 1280)
+        "imgsz": (1280, 1280),
+        # Class mapping: ID -> key
+        "class_map": {0: 'twenty', 2: 'bull', 3: 'cal', 4: 'cal1', 5: 'cal2', 6: 'cal3'}
     },
     "11m": {
         "name": "11M Dartboard Model",
-        "description": "Larger 11M parameter model, potentially better accuracy",
+        "description": "Larger model with segment detection (20, 3, 44)",
         "path": MODELS_DIR / "11mdartboard30-1-26_openvino_model",
-        "imgsz": (736, 1280)
+        "imgsz": (736, 1280),
+        # Class mapping: ID -> key (different from default!)
+        "class_map": {0: 'twenty', 1: 'three', 2: 'fortyfour', 3: 'bull', 4: 'cal', 5: 'cal1', 6: 'cal2', 7: 'cal3'}
     }
 }
+
+# Get current class map
+def get_calibration_class_map():
+    """Get class mapping for current calibration model."""
+    return CALIBRATION_MODELS[_active_calibration_model].get("class_map", {})
 
 # Active calibration model (can be switched via API)
 _active_calibration_model = "default"
@@ -56,6 +65,14 @@ _active_calibration_model = "default"
 def get_active_calibration_model():
     """Get the currently active calibration model name."""
     return _active_calibration_model
+
+# Global reference to the calibration detector (set by DartboardCalibrator)
+_calibration_detector_instance = None
+
+def set_calibration_detector_instance(detector):
+    """Set the global calibration detector instance for model reloading."""
+    global _calibration_detector_instance
+    _calibration_detector_instance = detector
 
 def set_active_calibration_model(model_name: str) -> bool:
     """Set the active calibration model. Returns True if successful."""
@@ -67,6 +84,11 @@ def set_active_calibration_model(model_name: str) -> bool:
     CALIBRATION_MODEL_PATH = model_info["path"]
     CALIBRATION_IMAGE_SIZE = model_info["imgsz"]
     print(f"[CALIBRATION] Switched to model: {model_name} ({model_info['name']})")
+    
+    # Reload the detector if it exists
+    if _calibration_detector_instance is not None:
+        _calibration_detector_instance.reload_model()
+    
     return True
 
 def get_calibration_models():
@@ -217,6 +239,13 @@ class YOLOCalibrationDetector:
         except Exception as e:
             print(f"Warning: Failed to load YOLO model: {e}")
     
+    def reload_model(self):
+        """Reload the model (call after switching calibration model)."""
+        self.is_initialized = False
+        self.model = None
+        self._load_model()
+        print(f"[CAL] Reloaded calibration model: {CALIBRATION_MODEL_PATH}")
+    
     def detect_calibration_points(
         self, 
         image: np.ndarray,
@@ -226,14 +255,7 @@ class YOLOCalibrationDetector:
         Detect calibration points in the image.
         
         Returns dict with keys for each class containing lists of (x, y, confidence).
-        
-        Model class mapping (dartboard1280imgz):
-        - 0: '20' - segment 20 marker
-        - 2: bull
-        - 3: cal - outer double ring (board edge, ~170mm)
-        - 4: cal1 - inner double ring (~162mm)
-        - 5: cal2 - outer triple ring (~107mm)
-        - 6: cal3 - inner triple ring (~99mm)
+        Uses dynamic class mapping from current calibration model config.
         """
         if not self.is_initialized or self.model is None:
             return {'cal': [], 'cal1': [], 'cal2': [], 'cal3': [], 'bull': [], 'twenty': []}
@@ -241,13 +263,19 @@ class YOLOCalibrationDetector:
         # Run inference
         results = self.model(image, imgsz=CALIBRATION_IMAGE_SIZE, conf=confidence_threshold, verbose=False)
         
+        # Get class mapping for current model
+        class_map = get_calibration_class_map()
+        
+        # Initialize points dict with all possible keys
         points = {
-            'twenty': [],   # Class 0 - segment 20 marker
-            'bull': [],     # Class 2 - bullseye (old model)
-            'cal': [],      # Class 3 - outer double ring (board edge, ~170mm)
-            'cal1': [],     # Class 4 - inner double ring (~162mm)
-            'cal2': [],     # Class 5 - outer triple ring (~107mm)
-            'cal3': [],     # Class 6 - inner triple ring (~99mm)
+            'twenty': [],   # Segment 20 marker
+            'three': [],    # Segment 3 marker (11M model)
+            'fortyfour': [],# Segment 44 marker (11M model)
+            'bull': [],     # Bullseye
+            'cal': [],      # Outer double ring (board edge)
+            'cal1': [],     # Inner double ring
+            'cal2': [],     # Outer triple ring
+            'cal3': [],     # Inner triple ring
         }
         
         for result in results:
@@ -264,19 +292,10 @@ class YOLOCalibrationDetector:
                 cx = float((x1 + x2) / 2)
                 cy = float((y1 + y2) / 2)
                 
-                # Map class ID to key (old model: 0=20, 2=bull, 3=cal, 4=cal1, 5=cal2, 6=cal3)
-                if cls_id == 0:
-                    points['twenty'].append((cx, cy, conf))
-                elif cls_id == 2:
-                    points['bull'].append((cx, cy, conf))
-                elif cls_id == 3:
-                    points['cal'].append((cx, cy, conf))
-                elif cls_id == 4:
-                    points['cal1'].append((cx, cy, conf))
-                elif cls_id == 5:
-                    points['cal2'].append((cx, cy, conf))
-                elif cls_id == 6:
-                    points['cal3'].append((cx, cy, conf))
+                # Use dynamic class mapping
+                key = class_map.get(cls_id)
+                if key and key in points:
+                    points[key].append((cx, cy, conf))
         
         return points
 
@@ -453,6 +472,8 @@ class DartboardCalibrator:
     
     def __init__(self):
         self.detector = YOLOCalibrationDetector()
+        # Register this detector instance for model reloading
+        set_calibration_detector_instance(self.detector)
         # Pre-load tip detector so first dart detection is fast
         try:
             from app.core.detection import DartTipDetector
