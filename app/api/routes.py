@@ -2703,7 +2703,6 @@ async def update_benchmark_context(request: BenchmarkContextRequest):
     return {"context": _benchmark_context.copy()}
 
 
-@router.post("/v1/benchmark/correction")
 class ExcludeDartRequest(BaseModel):
     game_id: str
     dart_index: int
@@ -2761,6 +2760,7 @@ async def exclude_dart_from_benchmark(request: ExcludeDartRequest):
         logger.error(f"[BENCHMARK] Failed to exclude dart: {e}")
         return {"status": "error", "message": str(e)}
 
+@router.post("/v1/benchmark/correction")
 async def record_benchmark_correction(request: BenchmarkCorrectionRequest):
     """Record a dart correction for accuracy analysis."""
     # If dart_path not provided, try to find it from recent tracking
