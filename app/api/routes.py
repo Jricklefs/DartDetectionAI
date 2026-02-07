@@ -4181,8 +4181,14 @@ async def rotate_segment_20(camera_id: str):
                 # Use DartboardCalibrator to regenerate overlay with new rotation
                 calibrator = DartboardCalibrator()
                 
-                # Build EllipseCalibration from stored data
+                # Build EllipseCalibration from stored data - include segment info for overlay drawing
                 from app.core.calibration import EllipseCalibration
+                
+                # Update segment_20_index to reflect the rotation
+                old_seg20_idx = cal_json.get('segment_20_index', 0)
+                new_seg20_idx = (old_seg20_idx + 1) % 20  # Rotate by 1 segment
+                cal_json['segment_20_index'] = new_seg20_idx
+                
                 ellipse_cal = EllipseCalibration(
                     center=tuple(cal_json.get('center', [0, 0])),
                     outer_double_ellipse=cal_json.get('outer_double_ellipse'),
@@ -4190,7 +4196,9 @@ async def rotate_segment_20(camera_id: str):
                     inner_triple_ellipse=cal_json.get('inner_triple_ellipse'),
                     inner_double_ellipse=cal_json.get('inner_double_ellipse'),
                     bull_ellipse=cal_json.get('bull_ellipse'),
-                    bullseye_ellipse=cal_json.get('bullseye_ellipse')
+                    bullseye_ellipse=cal_json.get('bullseye_ellipse'),
+                    segment_angles=cal_json.get('segment_angles', []),
+                    segment_20_index=new_seg20_idx
                 )
                 
                 # Draw overlay - use empty point lists since we just want the ellipses
