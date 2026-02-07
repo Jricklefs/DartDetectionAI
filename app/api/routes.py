@@ -3964,6 +3964,43 @@ async def set_threshold(request: Request):
     }
 
 
+@router.get("/v1/settings/method")
+async def get_detection_method():
+    """Get current detection method."""
+    return {
+        "method": DETECTION_METHOD,
+        "available_methods": ["yolo", "skeleton"],
+        "descriptions": {
+            "yolo": "YOLO neural network detection (default) - robust to lighting, needs trained model",
+            "skeleton": "Skeleton-based classical CV (Autodarts-style) - frame diff + skeletonization + lowest point"
+        }
+    }
+
+
+@router.post("/v1/settings/method")
+async def set_detection_method(request: Request):
+    """Set detection method (yolo or skeleton)."""
+    global DETECTION_METHOD
+    
+    body = await request.json()
+    method = body.get("method", "yolo").lower()
+    
+    if method not in ["yolo", "skeleton"]:
+        return JSONResponse(
+            status_code=400,
+            content={"error": f"Invalid method: {method}. Use 'yolo' or 'skeleton'."}
+        )
+    
+    old_method = DETECTION_METHOD
+    DETECTION_METHOD = method
+    
+    logger.info(f"[CONFIG] Detection method changed: {old_method} -> {method}")
+    
+    return {
+        "success": True,
+        "method": DETECTION_METHOD,
+        "previous": old_method
+    }
 
 
 @router.get("/v1/models")
