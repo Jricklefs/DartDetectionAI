@@ -4227,13 +4227,14 @@ async def rotate_segment_20(camera_id: str):
             else:
                 logger.warning(f"[ROTATE20] Calibration image not found: {img_path}")
         
-        # Save updated calibration to DartGame API
+        # Save updated calibration to DartGame API (preserve calibrationModel)
         update_data = {
             "cameraId": camera_id,
             "calibrationImagePath": cal_data.get('calibrationImagePath', ''),
             "overlayImagePath": new_overlay_path,
             "quality": cal_data.get('quality', 0),
             "twentyAngle": new_angle,
+            "calibrationModel": cal_data.get('calibrationModel'),  # Preserve the model used
             "calibrationData": json.dumps(cal_json)
         }
         
