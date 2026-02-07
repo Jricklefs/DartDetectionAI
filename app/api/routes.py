@@ -4090,6 +4090,40 @@ async def select_model_and_recalibrate(request: Request):
         "details": results
     }
 
+
+# ==================== CALIBRATION MODEL SELECTION ====================
+
+@router.get("/v1/calibration-models")
+async def get_calibration_model_list():
+    """Get list of available calibration models."""
+    return get_calibration_models()
+
+
+@router.post("/v1/calibration-models/select")
+async def select_calibration_model(request: Request):
+    """Select which calibration model to use."""
+    try:
+        body = await request.json()
+        model = body.get("model", "default")
+        
+        if set_active_calibration_model(model):
+            return {
+                "success": True,
+                "active": get_active_calibration_model(),
+                "message": f"Calibration model set to {model}"
+            }
+        else:
+            return JSONResponse(
+                status_code=400,
+                content={"error": f"Unknown calibration model: {model}"}
+            )
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e)}
+        )
+
+
 @router.post("/v1/stereo/clear-captures")
 async def clear_stereo_captures(request: dict = {}):
     """Clear captured calibration images to start over."""

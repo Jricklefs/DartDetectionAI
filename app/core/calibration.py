@@ -33,9 +33,53 @@ from app.models.schemas import CameraCalibrationResult, DetectResponse, DartScor
 
 # Get the models directory
 MODELS_DIR = Path(__file__).parent.parent.parent / "models"
-# Calibration model - use the proven one
-CALIBRATION_MODEL_PATH = MODELS_DIR / "dartboard1280imgz_int8_openvino_model"
-CALIBRATION_IMAGE_SIZE = 1280  # Square input
+
+# Available calibration models
+CALIBRATION_MODELS = {
+    "default": {
+        "name": "Dartboard 1280 INT8",
+        "description": "Original calibration model, proven accuracy",
+        "path": MODELS_DIR / "dartboard1280imgz_int8_openvino_model",
+        "imgsz": (1280, 1280)
+    },
+    "11m": {
+        "name": "11M Dartboard Model",
+        "description": "Larger 11M parameter model, potentially better accuracy",
+        "path": MODELS_DIR / "11mdartboard30-1-26_openvino_model",
+        "imgsz": (736, 1280)
+    }
+}
+
+# Active calibration model (can be switched via API)
+_active_calibration_model = "default"
+
+def get_active_calibration_model():
+    """Get the currently active calibration model name."""
+    return _active_calibration_model
+
+def set_active_calibration_model(model_name: str) -> bool:
+    """Set the active calibration model. Returns True if successful."""
+    global _active_calibration_model, CALIBRATION_MODEL_PATH, CALIBRATION_IMAGE_SIZE
+    if model_name not in CALIBRATION_MODELS:
+        return False
+    _active_calibration_model = model_name
+    model_info = CALIBRATION_MODELS[model_name]
+    CALIBRATION_MODEL_PATH = model_info["path"]
+    CALIBRATION_IMAGE_SIZE = model_info["imgsz"]
+    print(f"[CALIBRATION] Switched to model: {model_name} ({model_info['name']})")
+    return True
+
+def get_calibration_models():
+    """Get list of available calibration models."""
+    return {
+        "active": _active_calibration_model,
+        "models": {k: {"name": v["name"], "description": v["description"]} 
+                   for k, v in CALIBRATION_MODELS.items()}
+    }
+
+# Default calibration model path (for backward compatibility)
+CALIBRATION_MODEL_PATH = CALIBRATION_MODELS["default"]["path"]
+CALIBRATION_IMAGE_SIZE = CALIBRATION_MODELS["default"]["imgsz"]
 
 
 def decode_image(image_base64: str) -> np.ndarray:

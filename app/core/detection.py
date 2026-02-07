@@ -437,29 +437,17 @@ class DartTipDetector:
         if self._warmup_image is None and image is not None:
             self._warmup_image = image.copy()
         
-        # Apply letterboxing for non-square models
-        # This maintains aspect ratio and pads to model's expected size
-        orig_h, orig_w = image.shape[:2]
-        target_h, target_w = self.image_size if isinstance(self.image_size, tuple) else (self.image_size, self.image_size)
-        
-        # Check if letterboxing is needed (model expects different size)
-        needs_letterbox = (target_h != target_w) or (orig_h != target_h or orig_w != target_w)
-        
-        if needs_letterbox:
-            letterboxed, lb_scale, lb_pad = letterbox_image(image, (target_h, target_w))
-            inference_image = letterboxed
-        else:
-            inference_image = image
-            lb_scale = 1.0
-            lb_pad = (0, 0)
-        
-        # Run inference
+        # Run inference - YOLO handles letterboxing internally
+        # Just pass the imgsz and let ultralytics do the preprocessing
         results = self.model(
-            inference_image, 
+            image, 
             imgsz=self.image_size, 
             conf=confidence_threshold, 
             verbose=False
         )
+        
+        # No custom letterboxing needed - YOLO returns coords in original image space
+        needs_letterbox = False
         
         tips = []
         
@@ -487,12 +475,7 @@ class DartTipDetector:
                 box_cy = (y1 + y2) / 2
                 cx, cy = box_cx, box_cy
                 
-                # Convert letterboxed coordinates back to original image space
-                if needs_letterbox:
-                    x1, y1 = unletterbox_coords(x1, y1, lb_scale, lb_pad)
-                    x2, y2 = unletterbox_coords(x2, y2, lb_scale, lb_pad)
-                    box_cx, box_cy = unletterbox_coords(box_cx, box_cy, lb_scale, lb_pad)
-                    cx, cy = box_cx, box_cy
+                # YOLO returns coordinates in original image space (no unletterbox needed)
                 used_keypoint = False
                 
                 # Prefer keypoint if available with good confidence
@@ -504,9 +487,7 @@ class DartTipDetector:
                             tip_kp = kp_data[0][0]  # First keypoint
                             kp_conf = tip_kp[2] if len(tip_kp) > 2 else 0
                             kp_x, kp_y = tip_kp[0], tip_kp[1]
-                            # Unletterbox keypoint coordinates
-                            if needs_letterbox:
-                                kp_x, kp_y = unletterbox_coords(kp_x, kp_y, lb_scale, lb_pad)
+                            # YOLO returns keypoint coordinates in original image space
                             print(f"[YOLO] Box=({box_cx:.1f},{box_cy:.1f}) KP=({kp_x:.1f},{kp_y:.1f}) kp_conf={kp_conf:.2f} box_conf={conf:.2f}")
                             # Use keypoint if confident and valid
                             if kp_conf > 0.3 and kp_x > 0 and kp_y > 0:
