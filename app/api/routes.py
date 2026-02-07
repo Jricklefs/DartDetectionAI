@@ -4129,6 +4129,122 @@ async def select_calibration_model(request: Request):
         )
 
 
+
+# ==================== ROTATE SEGMENT 20 ====================
+
+@router.post("/v1/calibrations/{camera_id}/rotate20")
+async def rotate_segment_20(camera_id: str):
+    """
+    Rotate the segment 20 position by 1 segment (18 degrees clockwise).
+    This adjusts the calibration without re-detecting.
+    """
+    import json
+    import httpx
+    
+    try:
+        # Get current calibration from DartGame API
+        async with httpx.AsyncClient() as client:
+            res = await client.get(f"http://localhost:5000/api/calibrations/{camera_id}")
+            if res.status_code != 200:
+                return JSONResponse(status_code=404, content={"error": f"No calibration found for {camera_id}"})
+            
+            cal_data = res.json()
+        
+        # Parse calibration data
+        cal_json = json.loads(cal_data.get('calibrationData', '{}'))
+        current_angle = cal_data.get('twentyAngle', 0) or 0
+        
+        # Rotate by 18 degrees (1 segment)
+        new_angle = (current_angle + 18) % 360
+        
+        # Update segment_20_index if present
+        segment_20_index = cal_json.get('segment_20_index', 0)
+        new_segment_20_index = (segment_20_index + 1) % 20
+        cal_json['segment_20_index'] = new_segment_20_index
+        
+        # Update rotation_offset_deg
+        rotation_offset = cal_json.get('rotation_offset_deg', 0)
+        new_rotation_offset = (rotation_offset + 18) % 360
+        cal_json['rotation_offset_deg'] = new_rotation_offset
+        
+        logger.info(f"[ROTATE20] {camera_id}: angle {current_angle}° -> {new_angle}°, segment_20_index {segment_20_index} -> {new_segment_20_index}")
+        
+        # Regenerate overlay with new rotation
+        cal_image_path = cal_data.get('calibrationImagePath', '')
+        new_overlay_path = cal_data.get('overlayImagePath', '')
+        
+        if cal_image_path:
+            from pathlib import Path
+            from datetime import datetime
+            
+            wwwroot = Path("C:/Users/clawd/DartGameSystem/DartGameAPI/wwwroot")
+            img_path = wwwroot / cal_image_path.lstrip('/')
+            
+            if img_path.exists():
+                image = cv2.imread(str(img_path))
+                
+                # Draw new overlay
+                calibrator = DartboardCalibrator()
+                overlay = calibrator._draw_calibration_overlay(
+                    image,
+                    cal_json.get('center'),
+                    cal_json.get('outer_double_ellipse'),
+                    cal_json.get('outer_triple_ellipse'),
+                    cal_json.get('inner_triple_ellipse'),
+                    cal_json.get('inner_double_ellipse'),
+                    cal_json.get('bull_ellipse'),
+                    cal_json.get('bullseye_ellipse'),
+                    cal_json.get('segment_angles', []),
+                    new_segment_20_index
+                )
+                
+                # Save new overlay
+                timestamp = datetime.now().strftime('%Y%m%d%H%M%S')
+                overlay_filename = f"{camera_id}_overlay_{timestamp}.png"
+                overlay_dir = wwwroot / "images" / "calibrations"
+                overlay_dir.mkdir(parents=True, exist_ok=True)
+                overlay_path = overlay_dir / overlay_filename
+                cv2.imwrite(str(overlay_path), overlay)
+                new_overlay_path = f"/images/calibrations/{overlay_filename}"
+                
+                logger.info(f"[ROTATE20] Saved new overlay: {new_overlay_path}")
+            else:
+                logger.warning(f"[ROTATE20] Calibration image not found: {img_path}")
+        
+        # Save updated calibration to DartGame API
+        update_data = {
+            "cameraId": camera_id,
+            "calibrationImagePath": cal_data.get('calibrationImagePath', ''),
+            "overlayImagePath": new_overlay_path,
+            "quality": cal_data.get('quality', 0),
+            "twentyAngle": new_angle,
+            "calibrationData": json.dumps(cal_json)
+        }
+        
+        async with httpx.AsyncClient() as client:
+            save_res = await client.post(
+                "http://localhost:5000/api/calibrations",
+                json=update_data
+            )
+            
+            if save_res.status_code not in [200, 201]:
+                logger.error(f"[ROTATE20] Failed to save: {save_res.text}")
+                return JSONResponse(status_code=500, content={"error": "Failed to save rotated calibration"})
+        
+        return {
+            "success": True,
+            "cameraId": camera_id,
+            "previousAngle": current_angle,
+            "twentyAngle": new_angle,
+            "segment20Index": new_segment_20_index,
+            "overlayImagePath": new_overlay_path
+        }
+        
+    except Exception as e:
+        logger.error(f"[ROTATE20] Error: {e}", exc_info=True)
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
 @router.post("/v1/stereo/clear-captures")
 async def clear_stereo_captures(request: dict = {}):
     """Clear captured calibration images to start over."""
