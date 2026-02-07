@@ -3767,6 +3767,26 @@ AVAILABLE_MODELS = {
         "name": "Square (Jan 2026)",
         "description": "Square input variant",
         "path": "tippose25012026_square_openvino_model"
+    },
+    "384x640": {
+        "name": "YOLO26n 384x640 INT8",
+        "description": "Smaller rect input, faster inference",
+        "path": "y26-p-n-384x640_int8_openvino_model"
+    },
+    "552x960": {
+        "name": "YOLO26n 552x960 INT8",
+        "description": "Medium rect input, balanced",
+        "path": "y26-p-n-552x960_int8_openvino_model"
+    },
+    "736x1280": {
+        "name": "YOLO26n 736x1280 INT8",
+        "description": "Large rect input, highest resolution",
+        "path": "y26-p-n-736x1280_int8_openvino_model"
+    },
+    "11m": {
+        "name": "11M Dartboard Model",
+        "description": "Larger 11M parameter model for better accuracy",
+        "path": "11m_dartboard_openvino_model"
     }
 }
 

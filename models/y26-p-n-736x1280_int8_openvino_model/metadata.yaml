@@ -1,0 +1,15 @@
+description: YOLO26n pose 736x1280 INT8 (NNCF PTQ)
+task: pose
+imgsz:
+- 736
+- 1280
+args:
+  int8: true
+  half: false
+  dynamic: false
+  batch: 1
+quantization:
+  method: NNCF PTQ (OpenVINO)
+  samples: 300
+  source_model: c:\dev\machinedarts\machine-darts-app\machine-darts-app\backend-detection\backend-detection\dart_detector\models\y26-p-n-736-1280-07022026_openvino_model\y26-p-n-736-1280-07022026.xml
+  calibration_data: C:\Users\eugen\Downloads\tip 2.v13i.yolov8\valid\images

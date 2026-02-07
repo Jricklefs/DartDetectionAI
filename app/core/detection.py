@@ -38,6 +38,11 @@ TIP_MODEL_PATHS = {
     "best": MODELS_DIR / "26tippose27012026_int8_openvino_model",  # Newer YOLO26n-pose model (Jan 2026)
     "rect": MODELS_DIR / "best_openvino_736x1280_fp16_openvino_model",  # Non-square 736x1280
     "square": MODELS_DIR / "tippose25012026_square_openvino_model",
+    # New models from Machine Darts v1.0.25.1
+    "384x640": MODELS_DIR / "y26-p-n-384x640_int8_openvino_model",  # 384x640 INT8
+    "552x960": MODELS_DIR / "y26-p-n-552x960_int8_openvino_model",  # 552x960 INT8
+    "736x1280": MODELS_DIR / "y26-p-n-736x1280_int8_openvino_model",  # 736x1280 INT8
+    "11m": MODELS_DIR / "11m_dartboard_openvino_model",  # 11M param model
 }
 
 # Use the best model (requires ultralytics 8.4+)
