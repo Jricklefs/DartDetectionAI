@@ -2299,29 +2299,40 @@ def vote_on_scores(clusters: List[List[dict]]) -> List[DetectedTip]:
             
             logger.info(f"[VOTE] Initial vote winner: {winning_segment}x{winning_multiplier} (weight={votes[winning_key]:.2f})")
             
-            # POLAR AVERAGING: When cameras disagree, average polar coordinates
-            # (mm coordinates are camera-specific, polar coords are comparable)
-            try:
-                avg_angle, avg_dist, avg_weight = weighted_polar_average(cluster)
-                if avg_weight > 0:
-                    pos_score = score_from_polar(avg_angle, avg_dist)
-                    logger.info(f"[VOTE] Polar average: angle={avg_angle:.1f}°, dist={avg_dist:.3f}")
-                    pos_segment = pos_score['segment']
-                    pos_multiplier = pos_score['multiplier']
-                    pos_key = (pos_segment, pos_multiplier)
-                    
-                    # Check if position-based score differs from vote winner
-                    if pos_key != winning_key:
-                        # Position averaging suggests different score
-                        # Use it if it has reasonable confidence
-                        pos_boundary = pos_score.get('boundary_distance_deg', 9)
-                        if pos_boundary > 2.0:  # Not on a wire
-                            logger.info(f"[VOTE] Position averaging suggests {pos_segment}x{pos_multiplier} (boundary={pos_boundary:.1f}°)")
-                            logger.info(f"[VOTE] OVERRIDE: Using position average instead of vote winner")
-                            winning_key = pos_key
-                            winning_segment, winning_multiplier = pos_key
-            except Exception as polar_err:
-                logger.warning(f"[VOTE] Polar averaging failed: {polar_err}")
+            # POLAR AVERAGING: Only use when vote is close/tied
+            # Check if vote is close enough to consider polar averaging
+            sorted_vote_weights = sorted(votes.values(), reverse=True)
+            vote_is_close = False
+            if len(sorted_vote_weights) >= 2:
+                top_weight = sorted_vote_weights[0]
+                second_weight = sorted_vote_weights[1]
+                # Vote is close if second place has at least 70% of top weight
+                vote_is_close = second_weight >= top_weight * 0.7
+                logger.info(f"[VOTE] Top weights: {top_weight:.2f}, {second_weight:.2f}, close={vote_is_close}")
+            
+            if vote_is_close:
+                # Only try polar averaging when vote is close/tied
+                try:
+                    avg_angle, avg_dist, avg_weight = weighted_polar_average(cluster)
+                    if avg_weight > 0:
+                        pos_score = score_from_polar(avg_angle, avg_dist)
+                        logger.info(f"[VOTE] Polar average: angle={avg_angle:.1f}°, dist={avg_dist:.3f}")
+                        pos_segment = pos_score['segment']
+                        pos_multiplier = pos_score['multiplier']
+                        pos_key = (pos_segment, pos_multiplier)
+                        
+                        # Check if position-based score differs from vote winner
+                        if pos_key != winning_key:
+                            pos_boundary = pos_score.get('boundary_distance_deg', 9)
+                            if pos_boundary > 2.0:  # Not on a wire
+                                logger.info(f"[VOTE] Position averaging suggests {pos_segment}x{pos_multiplier} (boundary={pos_boundary:.1f}°)")
+                                logger.info(f"[VOTE] OVERRIDE: Using position average (vote was close)")
+                                winning_key = pos_key
+                                winning_segment, winning_multiplier = pos_key
+                except Exception as polar_err:
+                    logger.warning(f"[VOTE] Polar averaging failed: {polar_err}")
+            else:
+                logger.info(f"[VOTE] Clear winner - skipping polar averaging")
 
             # Check if stereo triangulation is available and enabled
             if TRIANGULATION_MODE == "stereo":
