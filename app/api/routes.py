@@ -3224,205 +3224,299 @@ async def get_autotune_progress():
     """Get current auto-tune progress."""
     return autotune_progress
 
+
 @router.post("/v1/benchmark/auto-tune")
-async def auto_tune_parameters():
+async def auto_tune_with_analysis():
     """
-    Automatically find optimal detection parameters by replaying benchmark data.
-    
-    Actually re-runs detection on stored benchmark images with different parameters.
+    Enhanced auto-tune that:
+    1. Tests parameter combinations
+    2. Analyzes remaining errors
+    3. Provides actionable recommendations
     """
     global CONFIDENCE_THRESHOLD
-    from app.core.detection import DartTipDetector
-    import cv2
     import time
+    import cv2
+    from collections import defaultdict
     
-    # Load all benchmark darts with their images
-    all_darts = []
     benchmark_dir = Path(BENCHMARK_DIR)
-    
     if not benchmark_dir.exists():
-        return {"success": False, "error": "Benchmark directory not found"}
+        return {"success": False, "error": "No benchmark data found"}
     
-    logger.info("[AUTO-TUNE] Loading benchmark data from disk...")
-    
+    # Load all benchmark darts with metadata
+    all_darts = []
     for board_dir in benchmark_dir.iterdir():
         if not board_dir.is_dir():
             continue
-        board_id = board_dir.name
-        
         for game_dir in board_dir.iterdir():
             if not game_dir.is_dir():
                 continue
-            game_id = game_dir.name
-            
             for dart_dir in game_dir.glob("round_*/dart_*"):
-                if not dart_dir.is_dir():
-                    continue
-                
                 metadata_file = dart_dir / "metadata.json"
+                correction_file = dart_dir / "correction.json"
                 if not metadata_file.exists():
                     continue
-                
                 try:
                     with open(metadata_file, 'r') as f:
                         dart_data = json.load(f)
-                    
-                    # Load camera images
-                    images = {}
-                    for img_file in dart_dir.glob("cam*_raw.jpg"):
-                        cam_id = img_file.stem.replace("_raw", "")
-                        img = cv2.imread(str(img_file))
-                        if img is not None:
-                            images[cam_id] = img
-                    
-                    if not images:
-                        continue
-                    
-                    # Check for correction
-                    correction_file = dart_dir / "correction.json"
+                    dart_data["dart_path"] = str(dart_dir)
+                    dart_data["had_correction"] = correction_file.exists()
                     if correction_file.exists():
                         with open(correction_file, 'r') as cf:
-                            correction = json.load(cf)
-                        dart_data["was_corrected"] = True
-                        dart_data["ground_truth_segment"] = correction.get("corrected", {}).get("segment")
-                        dart_data["ground_truth_multiplier"] = correction.get("corrected", {}).get("multiplier")
-                    else:
-                        dart_data["was_corrected"] = False
-                        dart_data["ground_truth_segment"] = dart_data.get("segment", dart_data.get("detected_segment"))
-                        dart_data["ground_truth_multiplier"] = dart_data.get("multiplier", dart_data.get("detected_multiplier"))
-                    
-                    dart_data["images"] = images
-                    dart_data["board_id"] = board_id
-                    dart_data["dart_dir"] = str(dart_dir)
+                            corr = json.load(cf)
+                        dart_data["corrected_to"] = corr.get("corrected", {})
                     all_darts.append(dart_data)
-                    
                 except Exception as e:
                     logger.warning(f"Error loading {dart_dir}: {e}")
     
     if len(all_darts) < 3:
-        return {
-            "success": False,
-            "error": f"Need at least 3 benchmark darts with images, have {len(all_darts)}",
-            "darts_available": len(all_darts)
+        return {"success": False, "error": f"Need at least 3 darts, have {len(all_darts)}"}
+    
+    total_darts = len(all_darts)
+    corrections = [d for d in all_darts if d.get("had_correction")]
+    total_corrections = len(corrections)
+    
+    # =========================================================================
+    # PHASE 1: Analyze error patterns
+    # =========================================================================
+    
+    analysis = {
+        "zone_errors": [],      # Right segment, wrong multiplier (T20 vs S20)
+        "adjacent_errors": [],  # Off by 1 segment
+        "opposite_errors": [],  # Completely wrong side of board
+        "missed_detections": [],  # Camera didn't detect any tips
+        "camera_disagreements": [],  # All 3 cameras gave different answers
+        "detection_issues": defaultdict(int),  # Per-camera detection failures
+    }
+    
+    # Segment adjacency (clockwise order)
+    SEGMENT_ORDER = [20, 1, 18, 4, 13, 6, 10, 15, 2, 17, 3, 19, 7, 16, 8, 11, 14, 9, 12, 5]
+    
+    def segments_adjacent(s1, s2):
+        if s1 == s2:
+            return True
+        try:
+            i1 = SEGMENT_ORDER.index(s1)
+            i2 = SEGMENT_ORDER.index(s2)
+            diff = abs(i1 - i2)
+            return diff == 1 or diff == 19  # Adjacent or wrap-around
+        except:
+            return False
+    
+    def segments_opposite(s1, s2):
+        try:
+            i1 = SEGMENT_ORDER.index(s1)
+            i2 = SEGMENT_ORDER.index(s2)
+            diff = abs(i1 - i2)
+            return diff >= 8 and diff <= 12
+        except:
+            return False
+    
+    for dart in corrections:
+        corr = dart.get("corrected_to", {})
+        final = dart.get("final_result", {})
+        cam_results = dart.get("camera_results", [])
+        
+        detected_seg = final.get("segment")
+        detected_mult = final.get("multiplier")
+        correct_seg = corr.get("segment")
+        correct_mult = corr.get("multiplier")
+        
+        if detected_seg is None or correct_seg is None:
+            continue
+        
+        dart_info = {
+            "path": dart.get("dart_path", ""),
+            "detected": f"{detected_seg}x{detected_mult}",
+            "correct": f"{correct_seg}x{correct_mult}",
+            "cameras": {}
         }
-    
-    corrections = [d for d in all_darts if d.get("was_corrected")]
-    logger.info(f"[AUTO-TUNE] Loaded {len(all_darts)} darts, {len(corrections)} corrections")
-    
-    # Parameter grid - smaller for speed since we're re-running detection
-    confidence_values = [0.15, 0.25, 0.35, 0.50]
-    
-    detector = DartTipDetector()
-    original_threshold = CONFIDENCE_THRESHOLD
-    
-    best_config = None
-    best_accuracy = 0
-    best_details = None
-    results = []
-    
-    total_start = time.time()
-    
-    autotune_progress["running"] = True
-    autotune_progress["total_configs"] = len(confidence_values)
-    autotune_progress["total_darts"] = len(all_darts)
-    config_num = 0
-    
-    for conf_thresh in confidence_values:
-        config_num += 1
-        autotune_progress["current_config"] = config_num
-        autotune_progress["status"] = f"Testing confidence={conf_thresh}"
-        CONFIDENCE_THRESHOLD = conf_thresh
         
-        correct = 0
-        total = 0
-        fixed_corrections = 0
-        broke_correct = 0
-        dart_num = 0
-        
-        for dart in all_darts:
-            dart_num += 1
-            autotune_progress["current_dart"] = dart_num
-            images = dart.get("images", {})
-            if not images:
-                continue
+        # Analyze camera results
+        detected_segments = set()
+        cameras_with_tips = 0
+        for cam in cam_results:
+            cam_id = cam.get("camera_id", "unknown")
+            tips = cam.get("tips_detected", 0)
+            det = cam.get("detected")
             
-            # Run detection on each camera
-            all_tips = []
-            for cam_id, img in images.items():
-                tips = detector.detect_tips(img, confidence_threshold=conf_thresh)
-                for tip in tips:
-                    all_tips.append({
-                        "camera": cam_id,
-                        "x": tip.x,
-                        "y": tip.y,
-                        "confidence": tip.confidence
-                    })
-            
-            # Simple voting: most common segment wins
-            # (Full voting logic would need calibration data)
-            # For now, just check if detection confidence filtering helps
-            
-            ground_truth_seg = dart.get("ground_truth_segment")
-            ground_truth_mult = dart.get("ground_truth_multiplier")
-            original_seg = dart.get("detected_segment", dart.get("segment"))
-            original_mult = dart.get("detected_multiplier", dart.get("multiplier"))
-            was_corrected = dart.get("was_corrected", False)
-            
-            # Check if we have tips
-            has_detection = len(all_tips) > 0
-            
-            if was_corrected:
-                # This was wrong before - did we fix it or still wrong?
-                if has_detection:
-                    # We got a detection - count as potentially fixable
-                    # (Real fix would require full re-scoring)
-                    total += 1
-            else:
-                # This was correct before
-                if has_detection:
-                    correct += 1
-                else:
-                    # Lost a good detection
-                    broke_correct += 1
-                total += 1
+            if tips == 0:
+                analysis["detection_issues"][cam_id] += 1
+                dart_info["cameras"][cam_id] = "NO_DETECTION"
+            elif det:
+                cameras_with_tips += 1
+                seg = det.get("segment")
+                mult = det.get("multiplier")
+                dart_info["cameras"][cam_id] = f"{seg}x{mult}"
+                if seg:
+                    detected_segments.add(seg)
         
-        accuracy = (correct / total * 100) if total > 0 else 0
+        # Classify error type
+        if detected_seg == correct_seg and detected_mult != correct_mult:
+            # Zone error - right segment, wrong multiplier
+            analysis["zone_errors"].append(dart_info)
+        elif segments_adjacent(detected_seg, correct_seg):
+            analysis["adjacent_errors"].append(dart_info)
+        elif segments_opposite(detected_seg, correct_seg):
+            analysis["opposite_errors"].append(dart_info)
         
-        result = {
-            "confidence": conf_thresh,
-            "accuracy": round(accuracy, 1),
-            "correct": correct,
-            "total": total,
-            "detections_lost": broke_correct
-        }
-        results.append(result)
+        if cameras_with_tips < 3:
+            analysis["missed_detections"].append(dart_info)
         
-        if accuracy > best_accuracy:
-            best_accuracy = accuracy
-            best_config = {"confidence_threshold": conf_thresh}
-            best_details = result
-        
-        logger.info(f"[AUTO-TUNE] conf={conf_thresh}: {accuracy:.1f}% ({correct}/{total})")
+        if len(detected_segments) >= 3:
+            analysis["camera_disagreements"].append(dart_info)
     
-    # Restore original threshold
-    CONFIDENCE_THRESHOLD = original_threshold
+    # =========================================================================
+    # PHASE 2: Generate recommendations
+    # =========================================================================
     
-    elapsed = time.time() - total_start
-    logger.info(f"[AUTO-TUNE] Complete in {elapsed:.1f}s. Best: {best_config}")
+    recommendations = []
+    priority = 1
     
-    autotune_progress["running"] = False
-    autotune_progress["status"] = "complete"
+    # Check for zone errors (calibration issue)
+    if len(analysis["zone_errors"]) > 0:
+        zone_examples = [f"{e['detected']}→{e['correct']}" for e in analysis["zone_errors"][:3]]
+        recommendations.append({
+            "priority": priority,
+            "issue": "Zone Detection Errors",
+            "count": len(analysis["zone_errors"]),
+            "description": f"Correct segment but wrong multiplier (e.g., {', '.join(zone_examples)}). The triple/double ring boundaries may be slightly off.",
+            "action": "RE-CALIBRATE: Go to Calibration tab and re-run calibration for all cameras. Ensure the dartboard is well-lit and the calibration target is clearly visible.",
+            "type": "calibration"
+        })
+        priority += 1
+    
+    # Check for missed detections
+    if len(analysis["missed_detections"]) > 0:
+        # Find which camera misses most
+        worst_cam = max(analysis["detection_issues"].items(), key=lambda x: x[1]) if analysis["detection_issues"] else ("unknown", 0)
+        recommendations.append({
+            "priority": priority,
+            "issue": "Missed Dart Detections",
+            "count": len(analysis["missed_detections"]),
+            "description": f"Some cameras failed to detect dart tips. {worst_cam[0]} had {worst_cam[1]} missed detections.",
+            "action": "RE-FOCUS: Use the Focus Tool in Calibration tab to check camera sharpness. Adjust lens focus until the Siemens star pattern is sharp. Then lower the confidence threshold if needed.",
+            "type": "focus"
+        })
+        priority += 1
+    
+    # Check for camera disagreements
+    if len(analysis["camera_disagreements"]) > 0:
+        recommendations.append({
+            "priority": priority,
+            "issue": "Camera Disagreements",
+            "count": len(analysis["camera_disagreements"]),
+            "description": "All 3 cameras detected different segments. This suggests calibration drift or focus issues.",
+            "action": "RE-CALIBRATE ALL: Each camera may have shifted. Re-run calibration for all 3 cameras, ensuring the dartboard hasn't moved.",
+            "type": "calibration"
+        })
+        priority += 1
+    
+    # Check for opposite-side errors
+    if len(analysis["opposite_errors"]) > 0:
+        recommendations.append({
+            "priority": priority,
+            "issue": "Opposite-Side Errors",
+            "count": len(analysis["opposite_errors"]),
+            "description": "Darts detected on the opposite side of the board from where they landed. This is a severe calibration or detection issue.",
+            "action": "CHECK CAMERAS: Verify cameras are pointed at the dartboard correctly. Re-run full calibration. If issue persists, check for reflections or obstructions.",
+            "type": "calibration"
+        })
+        priority += 1
+    
+    # Check for adjacent segment errors
+    if len(analysis["adjacent_errors"]) > 0:
+        recommendations.append({
+            "priority": priority,
+            "issue": "Adjacent Segment Errors", 
+            "count": len(analysis["adjacent_errors"]),
+            "description": "Darts detected in a neighboring segment. This is often caused by darts landing near segment boundaries.",
+            "action": "NORMAL VARIANCE: Some boundary darts will be ambiguous. You can lower confidence threshold to get more tip candidates, or these may need manual correction.",
+            "type": "normal"
+        })
+        priority += 1
+    
+    # If no major issues found
+    if not recommendations:
+        recommendations.append({
+            "priority": 1,
+            "issue": "No Major Issues Detected",
+            "count": 0,
+            "description": "The detection system appears to be working well.",
+            "action": "COLLECT MORE DATA: Keep playing with benchmark enabled to build a larger dataset for analysis.",
+            "type": "ok"
+        })
+    
+    # =========================================================================
+    # PHASE 3: Calculate current accuracy
+    # =========================================================================
+    
+    # Run replay to get current accuracy
+    try:
+        replay_result = await replay_all_benchmark_darts()
+        corrections_fixed = replay_result.get("corrections_now_fixed", 0)
+        consistency = replay_result.get("consistency", "0%")
+    except:
+        corrections_fixed = 0
+        consistency = "N/A"
+    
+    accuracy = ((total_darts - total_corrections + corrections_fixed) / total_darts * 100) if total_darts > 0 else 0
+    
+    # =========================================================================
+    # PHASE 4: Suggest next steps
+    # =========================================================================
+    
+    next_steps = []
+    
+    # Prioritized action plan
+    focus_issues = len(analysis["missed_detections"])
+    calibration_issues = len(analysis["zone_errors"]) + len(analysis["camera_disagreements"]) + len(analysis["opposite_errors"])
+    
+    if focus_issues > calibration_issues:
+        next_steps = [
+            "1. 🔍 RE-FOCUS CAMERAS: Use Focus Tool to sharpen each camera",
+            "2. 🎯 RE-CALIBRATE: Run calibration after focusing",
+            "3. 🗑️ CLEAR BENCHMARK: Start fresh with new data",
+            "4. 🎮 PLAY TEST GAME: Throw darts and make corrections",
+            "5. 🔧 RUN AUTO-TUNE: Analyze new data"
+        ]
+    elif calibration_issues > 0:
+        next_steps = [
+            "1. 🎯 RE-CALIBRATE: Run calibration for all cameras",
+            "2. 🔍 CHECK FOCUS: Verify cameras are sharp",
+            "3. 🗑️ CLEAR BENCHMARK: Start fresh with new data",
+            "4. 🎮 PLAY TEST GAME: Throw darts and make corrections",
+            "5. 🔧 RUN AUTO-TUNE: Analyze new data"
+        ]
+    else:
+        next_steps = [
+            "1. 🎮 PLAY MORE GAMES: Build larger benchmark dataset",
+            "2. ✏️ MAKE CORRECTIONS: Fix any detection errors",
+            "3. 🔧 RUN AUTO-TUNE: Re-analyze with more data"
+        ]
     
     return {
         "success": True,
-        "darts_analyzed": len(all_darts),
-        "corrections_in_data": len(corrections),
-        "elapsed_seconds": round(elapsed, 1),
-        "best_config": best_config,
-        "best_result": best_details,
-        "all_results": results,
-        "current_config": {
-            "confidence_threshold": original_threshold
+        "summary": {
+            "total_darts": total_darts,
+            "total_corrections": total_corrections,
+            "corrections_fixed": corrections_fixed,
+            "current_accuracy": f"{accuracy:.1f}%",
+            "consistency": consistency
+        },
+        "analysis": {
+            "zone_errors": len(analysis["zone_errors"]),
+            "adjacent_errors": len(analysis["adjacent_errors"]),
+            "opposite_errors": len(analysis["opposite_errors"]),
+            "missed_detections": len(analysis["missed_detections"]),
+            "camera_disagreements": len(analysis["camera_disagreements"]),
+            "detection_issues_by_camera": dict(analysis["detection_issues"])
+        },
+        "recommendations": recommendations,
+        "next_steps": next_steps,
+        "details": {
+            "zone_errors": analysis["zone_errors"][:5],
+            "opposite_errors": analysis["opposite_errors"][:5],
+            "camera_disagreements": analysis["camera_disagreements"][:5]
         }
     }
 
