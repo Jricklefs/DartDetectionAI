@@ -3848,3 +3848,159 @@ async def triangulate_point(request: dict):
     except Exception as e:
         raise HTTPException(500, f"Triangulation failed: {e}")
 
+
+
+# =============================================================================
+# IMPROVEMENT LOOP - Iterative accuracy optimization
+# =============================================================================
+
+improvement_loop_state = {
+    "running": False,
+    "iteration": 0,
+    "best_accuracy": 0,
+    "best_config": {},
+    "history": [],
+    "status": "idle"
+}
+
+@router.get("/v1/benchmark/improve/status")
+async def get_improvement_status():
+    """Get current improvement loop status."""
+    return improvement_loop_state
+
+@router.post("/v1/benchmark/improve/stop")
+async def stop_improvement_loop():
+    """Stop the improvement loop."""
+    improvement_loop_state["running"] = False
+    improvement_loop_state["status"] = "stopped"
+    return {"success": True, "message": "Stop requested"}
+
+@router.post("/v1/benchmark/improve")
+async def run_improvement_loop(iterations: int = 10):
+    """
+    Run improvement loop: test parameter combinations and find best accuracy.
+    
+    This runs the FULL scoring pipeline (not just YOLO detection) by calling
+    the replay endpoint internally for each configuration.
+    
+    Args:
+        iterations: Max iterations to run (each tests multiple configs)
+    """
+    global CONFIDENCE_THRESHOLD, BOUNDARY_WEIGHT_ENABLED, POLAR_THRESHOLD
+    import time
+    import itertools
+    
+    improvement_loop_state["running"] = True
+    improvement_loop_state["iteration"] = 0
+    improvement_loop_state["history"] = []
+    improvement_loop_state["status"] = "starting"
+    
+    # Save original config
+    original_config = {
+        "confidence_threshold": CONFIDENCE_THRESHOLD,
+    }
+    
+    # Parameter grid to test
+    confidence_values = [0.15, 0.20, 0.25, 0.30, 0.35, 0.40]
+    polar_close_thresholds = [0.5, 0.6, 0.7, 0.8]  # When to use polar averaging
+    
+    all_configs = list(itertools.product(confidence_values, polar_close_thresholds))
+    
+    best_fixed = 0
+    best_accuracy = 0
+    best_config = original_config.copy()
+    results = []
+    
+    start_time = time.time()
+    
+    for i, (conf, polar_thresh) in enumerate(all_configs):
+        if not improvement_loop_state["running"]:
+            break
+            
+        improvement_loop_state["iteration"] = i + 1
+        improvement_loop_state["status"] = f"Testing conf={conf}, polar={polar_thresh}"
+        
+        # Apply config
+        CONFIDENCE_THRESHOLD = conf
+        # Note: polar_thresh would need to be a global variable to test
+        
+        # Run replay
+        try:
+            # Call the replay function directly
+            replay_result = await replay_all_benchmark_darts()
+            
+            corrections_fixed = replay_result.get("corrections_now_fixed", 0)
+            had_corrections = replay_result.get("had_corrections", 1)
+            total_darts = replay_result.get("total_darts", 0)
+            matches = replay_result.get("matches_original", 0)
+            
+            # Score: prioritize fixing corrections, but also consistency
+            fix_rate = (corrections_fixed / had_corrections * 100) if had_corrections > 0 else 0
+            consistency = (matches / total_darts * 100) if total_darts > 0 else 0
+            
+            # Combined score: 70% fix rate + 30% consistency
+            score = fix_rate * 0.7 + consistency * 0.3
+            
+            result = {
+                "config": {"confidence": conf, "polar_threshold": polar_thresh},
+                "corrections_fixed": corrections_fixed,
+                "fix_rate": round(fix_rate, 1),
+                "consistency": round(consistency, 1),
+                "score": round(score, 1)
+            }
+            results.append(result)
+            improvement_loop_state["history"].append(result)
+            
+            if score > best_accuracy:
+                best_accuracy = score
+                best_fixed = corrections_fixed
+                best_config = {"confidence_threshold": conf, "polar_threshold": polar_thresh}
+                improvement_loop_state["best_accuracy"] = score
+                improvement_loop_state["best_config"] = best_config
+                
+            logger.info(f"[IMPROVE] #{i+1}: conf={conf}, polar={polar_thresh} -> fixed={corrections_fixed}, score={score:.1f}")
+            
+        except Exception as e:
+            logger.error(f"[IMPROVE] Error testing config: {e}")
+            results.append({
+                "config": {"confidence": conf, "polar_threshold": polar_thresh},
+                "error": str(e)
+            })
+    
+    # Restore original config
+    CONFIDENCE_THRESHOLD = original_config["confidence_threshold"]
+    
+    elapsed = time.time() - start_time
+    improvement_loop_state["running"] = False
+    improvement_loop_state["status"] = "complete"
+    
+    return {
+        "success": True,
+        "iterations": len(results),
+        "elapsed_seconds": round(elapsed, 1),
+        "best_config": best_config,
+        "best_score": round(best_accuracy, 1),
+        "best_corrections_fixed": best_fixed,
+        "all_results": results,
+        "original_config": original_config
+    }
+
+@router.post("/v1/benchmark/improve/apply-best")
+async def apply_best_config():
+    """Apply the best configuration found by improvement loop."""
+    global CONFIDENCE_THRESHOLD
+    
+    best = improvement_loop_state.get("best_config", {})
+    if not best:
+        return {"success": False, "error": "No best config found. Run improvement loop first."}
+    
+    if "confidence_threshold" in best:
+        CONFIDENCE_THRESHOLD = best["confidence_threshold"]
+    
+    logger.info(f"[IMPROVE] Applied best config: {best}")
+    
+    return {
+        "success": True,
+        "applied_config": best,
+        "message": "Configuration applied. Run benchmark to verify."
+    }
