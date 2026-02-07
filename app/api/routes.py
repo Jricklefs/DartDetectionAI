@@ -1335,10 +1335,13 @@ async def detect_tips(
     start_time = time.time()
     timings = {}  # Track timing for each step
     
-    request_id = str(uuid.uuid4())[:12]
+    # Generate request_id if not provided in payload (for cross-API correlation)
+    incoming_request_id = getattr(request, 'request_id', None)
+    request_id = incoming_request_id or str(uuid.uuid4())[:8]
     import time as timing_module
     endpoint_start = timing_module.time()
-    logger.info(f"[TIMING] /v1/detect called at {endpoint_start}")
+    epoch_ms = int(endpoint_start * 1000)
+    logger.info(f"[TIMING][{request_id}] DD: Start @ epoch={epoch_ms}")
     
     board_id = request.board_id or "default"
     dart_number = request.dart_number or 1
@@ -1779,7 +1782,8 @@ async def detect_tips(
     
     # Log timing breakdown
     timing_str = ", ".join([f"{k}={v}ms" for k, v in timings.items()])
-    logger.info(f"[TIMING] {timing_str}")
+    epoch_end = int(time.time() * 1000)
+    logger.info(f"[TIMING][{request_id}] DD: Complete @ epoch={epoch_end} | {timing_str}")
     
     # Clear result summary
     if detected_tips:
