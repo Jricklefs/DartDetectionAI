@@ -1031,19 +1031,19 @@ def point_in_ellipse(point, ellipse):
     return (px_rot / a) ** 2 + (py_rot / b) ** 2 <= 1.0
 
 
-def get_segment_from_boundaries(point_angle_deg: float, segment_angles: List[float], rotation_offset_deg: float) -> Tuple[int, float]:
+def get_segment_from_boundaries(point_angle_deg: float, segment_angles: List[float], segment_20_index: int) -> Tuple[int, float]:
     """
     Determine which segment a point is in using actual wire boundary angles.
     
     MATCHES MACHINE DARTS LOGIC EXACTLY:
     1. segment_angles are in DEGREES (converted from radians if needed)
     2. Find which boundary pair contains the point
-    3. Apply rotation_offset_deg as segment steps: (index - rotation_steps) % 20
+    3. Apply segment_20_index offset: (boundary_index - segment_20_index) % 20
     
     Args:
         point_angle_deg: The angle from center to the dart tip (0-360 degrees)
         segment_angles: List of wire boundary angles (in radians, will convert to degrees)
-        rotation_offset_deg: Rotation offset in degrees (angle to center of segment 20)
+        segment_20_index: Index (0-19) of the boundary where segment 20 starts
     
     Returns:
         Tuple of (segment number 1-20, boundary_distance_deg)
@@ -1099,12 +1099,13 @@ def get_segment_from_boundaries(point_angle_deg: float, segment_angles: List[flo
         dist_to_end = end - point_angle
     boundary_distance_deg = min(abs(dist_to_start), abs(dist_to_end))
     
-    # KEY: Apply rotation_offset_deg as segment steps (Machine Darts logic)
-    rotation_steps = int(round(rotation_offset_deg / 18.0)) % 20
-    adjusted_index = (segment_index - rotation_steps) % 20
+    # KEY: Use segment_20_index directly (the boundary index where segment 20 starts)
+    # This is the correct formula: dart in boundary_idx, segment_20 at index segment_20_index
+    # Offset = (boundary_idx - segment_20_index) % 20 gives the segment position
+    adjusted_index = (segment_index - segment_20_index) % 20
     
     segment = segments[adjusted_index]
-    logger.info(f"[SCORE] point={point_angle:.1f}°, boundary_idx={segment_index}, rot_steps={rotation_steps}, adj_idx={adjusted_index}, segment={segment}, dist={boundary_distance_deg:.1f}°")
+    logger.info(f"[SCORE] point={point_angle:.1f}°, boundary_idx={segment_index}, seg20_idx={segment_20_index}, adj_idx={adjusted_index}, segment={segment}, dist={boundary_distance_deg:.1f}°")
     
     return segment, boundary_distance_deg
 
@@ -1156,11 +1157,12 @@ def score_with_calibration(tip_data: Dict[str, Any], calibration_data: Dict[str,
     # This uses the SAME boundaries that the overlay shows, ensuring consistency
     segment_angles = calibration_data.get("segment_angles", [])
     rotation_offset_deg = calibration_data.get("rotation_offset_deg", 0)
+    segment_20_index = calibration_data.get("segment_20_index", 0)
     boundary_distance_deg = None
     
     if segment_angles and len(segment_angles) >= 20:
         # Use the actual wire boundaries - Machine Darts logic
-        segment, boundary_distance_deg = get_segment_from_boundaries(angle_deg, segment_angles, rotation_offset_deg)
+        segment, boundary_distance_deg = get_segment_from_boundaries(angle_deg, segment_angles, segment_20_index)
         print(f"[SCORE] Using wire boundaries: segment={segment}, boundary_dist={boundary_distance_deg:.1f}°")
     else:
         # Fallback to simple 18° division if no boundaries available
