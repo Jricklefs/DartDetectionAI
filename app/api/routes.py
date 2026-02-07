@@ -3957,15 +3957,19 @@ async def select_model_and_recalibrate(request: Request):
     
     camera_images = {}
     async with httpx.AsyncClient(timeout=30.0) as client:
-        for cam_id in ["cam0", "cam1", "cam2"]:
+        for cam_idx in [0, 1, 2]:
+            cam_id = f"cam{cam_idx}"
             try:
-                # Get snapshot from DartSensor
-                resp = await client.get(f"{DARTSENSOR_URL}/snapshot/{cam_id[-1]}")
+                # Get snapshot from DartSensor - returns JSON with base64 image
+                resp = await client.get(f"{DARTSENSOR_URL}/cameras/{cam_idx}/snapshot")
                 if resp.status_code == 200:
-                    # Convert to base64
-                    img_b64 = base64.b64encode(resp.content).decode('utf-8')
-                    camera_images[cam_id] = img_b64
-                    logger.info(f"[RECAL] Got image from {cam_id}: {len(resp.content)} bytes")
+                    snap_data = resp.json()
+                    img_b64 = snap_data.get("image", "")
+                    if img_b64:
+                        camera_images[cam_id] = img_b64
+                        logger.info(f"[RECAL] Got image from {cam_id}: {len(img_b64)} chars")
+                    else:
+                        logger.warning(f"[RECAL] No image in response for {cam_id}")
                 else:
                     logger.warning(f"[RECAL] Failed to get {cam_id}: {resp.status_code}")
             except Exception as e:
