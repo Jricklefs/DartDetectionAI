@@ -29,6 +29,7 @@ from app.core.calibration import (
 )
 from app.core.stereo_calibration import StereoCalibrator, StereoCalibration, generate_checkerboard_pdf
 from app.core.scoring import scoring_system
+from app.core.skeleton_detection import detect_tip_skeleton, SkeletonTip
 from app.core.geometry import (
     DARTBOARD_SEGMENTS,
     BULL_RADIUS_MM,
@@ -1484,16 +1485,55 @@ async def detect_tips(
             # Track calibration for benchmark
             calibrations_used[cam.camera_id] = calibration_data
             
-            # Detect tips using YOLO - always on full image
-            logger.info(f"[TIMING] Before YOLO: {(timing_module.time() - endpoint_start)*1000:.0f}ms since start")
-            t_yolo = time.time()
-            tips = calibrator.detect_tips(
-                camera_id=cam.camera_id,
-                image_base64=cam.image,
-                calibration_data=calibration_data
-            )
-            yolo_ms = int((time.time() - t_yolo) * 1000)
-            yolo_total_ms += yolo_ms
+            # Detect tips using configured method
+            logger.info(f"[TIMING] Before detection ({DETECTION_METHOD}): {(timing_module.time() - endpoint_start)*1000:.0f}ms since start")
+            t_detect = time.time()
+            
+            if DETECTION_METHOD == "skeleton":
+                # === SKELETON-BASED DETECTION (Autodarts-style) ===
+                tips = []
+                try:
+                    # Get previous frame for differencing
+                    previous_images = get_previous_images(board_id)
+                    previous_img = previous_images.get(cam.camera_id)
+                    
+                    if previous_img is not None:
+                        # Get board center from calibration
+                        center = calibration_data.get('center', (current_img.shape[1]//2, current_img.shape[0]//2))
+                        
+                        # Detect tip using skeleton method
+                        skeleton_tip = detect_tip_skeleton(
+                            current_frame=current_img,
+                            previous_frame=previous_img,
+                            board_center=center,
+                            diff_threshold=30.0,
+                            min_contour_area=100
+                        )
+                        
+                        if skeleton_tip:
+                            tips = [{
+                                'x_px': skeleton_tip.x,
+                                'y_px': skeleton_tip.y,
+                                'confidence': skeleton_tip.confidence,
+                                'method': 'skeleton'
+                            }]
+                            logger.info(f"[SKELETON] Camera {cam.camera_id}: detected tip at ({skeleton_tip.x:.1f}, {skeleton_tip.y:.1f}), conf={skeleton_tip.confidence:.2f}")
+                        else:
+                            logger.warning(f"[SKELETON] Camera {cam.camera_id}: no tip detected")
+                    else:
+                        logger.warning(f"[SKELETON] Camera {cam.camera_id}: no previous frame for diff")
+                except Exception as e:
+                    logger.error(f"[SKELETON] Camera {cam.camera_id}: error - {e}")
+            else:
+                # === YOLO-BASED DETECTION (default) ===
+                tips = calibrator.detect_tips(
+                    camera_id=cam.camera_id,
+                    image_base64=cam.image,
+                    calibration_data=calibration_data
+                )
+            
+            detect_ms = int((time.time() - t_detect) * 1000)
+            yolo_total_ms += detect_ms  # Reusing the timing variable
             
             # === ADD MM COORDINATES TO ALL TIPS ===
             # Transform pixel coords to dartboard mm coords for cross-camera matching
@@ -3877,6 +3917,9 @@ AVAILABLE_MODELS = {
 ACTIVE_MODEL = "default"
 # Detection confidence threshold (0.0 - 1.0)
 CONFIDENCE_THRESHOLD = 0.25
+
+# Detection method: "yolo" (default) or "skeleton" (Autodarts-style classical CV)
+DETECTION_METHOD = "yolo"
 
 
 @router.get("/v1/settings/threshold")
