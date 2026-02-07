@@ -29,6 +29,74 @@ from app.core.geometry import (
 )
 from app.models.schemas import DetectResponse, DartScore, DartPosition
 
+def letterbox_image(image: np.ndarray, target_size: Tuple[int, int], 
+                    color: Tuple[int, int, int] = (114, 114, 114)) -> Tuple[np.ndarray, float, Tuple[int, int]]:
+    """
+    Resize image with letterboxing to maintain aspect ratio.
+    Like Machine Darts / Ultralytics preprocessing.
+    
+    Args:
+        image: Input image (H, W, C)
+        target_size: (height, width) the model expects
+        color: Padding color (default gray)
+    
+    Returns:
+        (letterboxed_image, scale, (pad_x, pad_y))
+        - scale: factor used to resize
+        - pad_x, pad_y: padding added on each side
+    """
+    img_h, img_w = image.shape[:2]
+    target_h, target_w = target_size
+    
+    # Calculate scale to fit image in target while maintaining aspect ratio
+    scale = min(target_w / img_w, target_h / img_h)
+    
+    # New dimensions after scaling
+    new_w = int(img_w * scale)
+    new_h = int(img_h * scale)
+    
+    # Resize image
+    resized = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+    
+    # Calculate padding
+    pad_w = target_w - new_w
+    pad_h = target_h - new_h
+    
+    # Pad evenly on both sides
+    pad_left = pad_w // 2
+    pad_right = pad_w - pad_left
+    pad_top = pad_h // 2
+    pad_bottom = pad_h - pad_top
+    
+    # Apply padding
+    letterboxed = cv2.copyMakeBorder(
+        resized, pad_top, pad_bottom, pad_left, pad_right,
+        cv2.BORDER_CONSTANT, value=color
+    )
+    
+    return letterboxed, scale, (pad_left, pad_top)
+
+
+def unletterbox_coords(x: float, y: float, scale: float, 
+                        pad: Tuple[int, int]) -> Tuple[float, float]:
+    """
+    Convert coordinates from letterboxed image back to original image space.
+    
+    Args:
+        x, y: Coordinates in letterboxed image
+        scale: Scale factor used in letterboxing
+        pad: (pad_x, pad_y) padding added
+    
+    Returns:
+        (orig_x, orig_y) in original image coordinates
+    """
+    pad_x, pad_y = pad
+    orig_x = (x - pad_x) / scale
+    orig_y = (y - pad_y) / scale
+    return orig_x, orig_y
+
+
+
 # Get the models directory
 MODELS_DIR = Path(__file__).parent.parent.parent / "models"
 
@@ -261,9 +329,9 @@ class DartTipDetector:
             self.model = YOLO(str(model_path), task=task)
             self.is_initialized = True
             
-            # Adjust image size for rect models
-            if "rect" in self.model_name:
-                self.image_size = (1280, 736)
+            # Read image size from model metadata
+            self.image_size = self._get_model_imgsz(model_path)
+            self.model_imgsz = self.image_size  # Store for letterboxing
             
             print(f"Loaded tip model from {model_path} (pose={self.is_pose_model})")
             
@@ -298,6 +366,30 @@ class DartTipDetector:
         except Exception:
             pass
         return False
+    
+    def _get_model_imgsz(self, model_path: Path) -> tuple:
+        """Read imgsz from model metadata.yaml.
+        
+        Returns:
+            (height, width) tuple or default (640, 640)
+        """
+        try:
+            import yaml
+            meta_file = model_path / "metadata.yaml"
+            if meta_file.exists():
+                with open(meta_file, 'r') as f:
+                    meta = yaml.safe_load(f)
+                imgsz = meta.get('imgsz', [640, 640])
+                if isinstance(imgsz, list) and len(imgsz) == 2:
+                    h, w = imgsz[0], imgsz[1]
+                    print(f"[MODEL] Read imgsz from metadata: {h}x{w}")
+                    return (h, w)
+                elif isinstance(imgsz, int):
+                    print(f"[MODEL] Read imgsz from metadata: {imgsz}x{imgsz}")
+                    return (imgsz, imgsz)
+        except Exception as e:
+            print(f"[MODEL] Could not read imgsz from metadata: {e}")
+        return (640, 640)  # Default
     
     def warmup(self):
         """Run a warmup inference to keep the model hot."""
@@ -345,9 +437,25 @@ class DartTipDetector:
         if self._warmup_image is None and image is not None:
             self._warmup_image = image.copy()
         
+        # Apply letterboxing for non-square models
+        # This maintains aspect ratio and pads to model's expected size
+        orig_h, orig_w = image.shape[:2]
+        target_h, target_w = self.image_size if isinstance(self.image_size, tuple) else (self.image_size, self.image_size)
+        
+        # Check if letterboxing is needed (model expects different size)
+        needs_letterbox = (target_h != target_w) or (orig_h != target_h or orig_w != target_w)
+        
+        if needs_letterbox:
+            letterboxed, lb_scale, lb_pad = letterbox_image(image, (target_h, target_w))
+            inference_image = letterboxed
+        else:
+            inference_image = image
+            lb_scale = 1.0
+            lb_pad = (0, 0)
+        
         # Run inference
         results = self.model(
-            image, 
+            inference_image, 
             imgsz=self.image_size, 
             conf=confidence_threshold, 
             verbose=False
@@ -374,10 +482,17 @@ class DartTipDetector:
                 # Get bounding box
                 x1, y1, x2, y2 = boxes.xyxy[i].cpu().numpy()
                 
-                # Default to box center
+                # Default to box center (in letterboxed coords)
                 box_cx = (x1 + x2) / 2
                 box_cy = (y1 + y2) / 2
                 cx, cy = box_cx, box_cy
+                
+                # Convert letterboxed coordinates back to original image space
+                if needs_letterbox:
+                    x1, y1 = unletterbox_coords(x1, y1, lb_scale, lb_pad)
+                    x2, y2 = unletterbox_coords(x2, y2, lb_scale, lb_pad)
+                    box_cx, box_cy = unletterbox_coords(box_cx, box_cy, lb_scale, lb_pad)
+                    cx, cy = box_cx, box_cy
                 used_keypoint = False
                 
                 # Prefer keypoint if available with good confidence
@@ -388,10 +503,14 @@ class DartTipDetector:
                         if len(kp_data) > 0:
                             tip_kp = kp_data[0][0]  # First keypoint
                             kp_conf = tip_kp[2] if len(tip_kp) > 2 else 0
-                            print(f"[YOLO] Box=({box_cx:.1f},{box_cy:.1f}) KP=({tip_kp[0]:.1f},{tip_kp[1]:.1f}) kp_conf={kp_conf:.2f} box_conf={conf:.2f}")
+                            kp_x, kp_y = tip_kp[0], tip_kp[1]
+                            # Unletterbox keypoint coordinates
+                            if needs_letterbox:
+                                kp_x, kp_y = unletterbox_coords(kp_x, kp_y, lb_scale, lb_pad)
+                            print(f"[YOLO] Box=({box_cx:.1f},{box_cy:.1f}) KP=({kp_x:.1f},{kp_y:.1f}) kp_conf={kp_conf:.2f} box_conf={conf:.2f}")
                             # Use keypoint if confident and valid
-                            if kp_conf > 0.3 and tip_kp[0] > 0 and tip_kp[1] > 0:
-                                cx, cy = tip_kp[0], tip_kp[1]
+                            if kp_conf > 0.3 and kp_x > 0 and kp_y > 0:
+                                cx, cy = kp_x, kp_y
                                 used_keypoint = True
                             kp = kp_data[0]
                     except Exception as e:
