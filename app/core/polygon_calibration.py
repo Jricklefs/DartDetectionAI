@@ -219,6 +219,21 @@ def score_from_polygon_calibration(
         bullseye_radius = 15
         bull_radius = 35
     
+    # Check if OUTSIDE the double ring first (miss)
+    if calibration.double_outers:
+        double_outer_dists = [math.sqrt((p[0] - bull[0])**2 + (p[1] - bull[1])**2)
+                              for p in calibration.double_outers]
+        avg_double_outer = sum(double_outer_dists) / len(double_outer_dists)
+        
+        if dist_from_bull > avg_double_outer:
+            return {
+                "segment": 0,
+                "zone": "miss",
+                "score": 0,
+                "multiplier": 0,
+                "ring": "miss"
+            }
+    
     # Check bullseye first
     if dist_from_bull <= bullseye_radius:
         return {
@@ -309,21 +324,6 @@ def score_from_polygon_calibration(
                 "score": segment_value,
                 "multiplier": 1,
                 "ring": "single"
-            }
-    
-    # Check if outside double ring (miss)
-    if calibration.double_outers:
-        double_outer_dists = [math.sqrt((p[0] - bull[0])**2 + (p[1] - bull[1])**2)
-                              for p in calibration.double_outers]
-        avg_double_outer = sum(double_outer_dists) / len(double_outer_dists)
-        
-        if dist_from_bull > avg_double_outer:
-            return {
-                "segment": 0,
-                "zone": "miss",
-                "score": 0,
-                "multiplier": 0,
-                "ring": "miss"
             }
     
     # Default: inner single
