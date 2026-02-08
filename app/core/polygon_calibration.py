@@ -220,12 +220,9 @@ def score_from_polygon_calibration(
         bull_radius = 35
     
     # Check if OUTSIDE the double ring first (miss)
-    if calibration.double_outers:
-        double_outer_dists = [math.sqrt((p[0] - bull[0])**2 + (p[1] - bull[1])**2)
-                              for p in calibration.double_outers]
-        avg_double_outer = sum(double_outer_dists) / len(double_outer_dists)
-        
-        if dist_from_bull > avg_double_outer:
+    # Use point-in-polygon on the full double_outers boundary
+    if calibration.double_outers and len(calibration.double_outers) >= 3:
+        if not point_in_polygon((x, y), calibration.double_outers):
             return {
                 "segment": 0,
                 "zone": "miss",
