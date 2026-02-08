@@ -134,12 +134,18 @@ def detect_dart_hough(
     
     # 8. Extrapolate along line until diff signal drops significantly
     # The tip is where we see a large drop in diff signal (dart ends, board begins)
+    # But limit extrapolation to reasonable distance (darts aren't infinitely long)
     extended_tip = tip_end.copy()
+    
+    # Calculate max extrapolation based on detected line length
+    # Typically the tip is within 50% of the detected line length beyond the detected end
+    line_length = np.linalg.norm(tip_end - flight_end)
+    max_extrapolation = min(100, int(line_length * 0.5))  # Max 100px or 50% of line length
     
     # Sample diff along line from detected end toward center
     signal_history = []
     
-    for step in range(1, 150):
+    for step in range(1, max_extrapolation + 50):  # Add some buffer
         test_point = tip_end + dart_dir * step
         tx, ty = int(test_point[0]), int(test_point[1])
         

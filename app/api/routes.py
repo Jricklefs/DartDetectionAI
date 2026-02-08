@@ -1825,12 +1825,26 @@ async def detect_tips(
         votes_summary = ", ".join([f"{t.get('camera_id')}={t.get('segment')}x{t.get('multiplier')}" for t in all_tips])
         logger.info(f"[VOTE] Camera votes: {votes_summary}")
     
-    # If all cameras see 1 dart each but clustering failed (mm coords don't match),
-    # do segment-based voting across all tips
-    if len(clustered_tips) > 1 and all(len(c) == 1 for c in clustered_tips):
-        logger.info(f"[DETECT] All cameras see 1 dart each - combining for segment voting")
-        all_single_tips = [c[0] for c in clustered_tips]
-        clustered_tips = [all_single_tips]
+    # IMPORTANT: When cameras disagree on segment, we need to MERGE clusters and vote
+    # If cam0=12, cam1=13, cam2=13, clustering gives us:
+    #   - Cluster 1: [cam0] (12)
+    #   - Cluster 2: [cam1, cam2] (13)
+    # These need to be merged and voted on together!
+    
+    # Check if each camera appears only once across all clusters
+    tips_per_camera = {}
+    for cluster in clustered_tips:
+        for tip in cluster:
+            cam = tip.get('camera_id')
+            tips_per_camera[cam] = tips_per_camera.get(cam, 0) + 1
+    
+    # If each camera has exactly 1 tip and we have multiple clusters,
+    # merge into a single cluster for proper voting
+    if len(clustered_tips) > 1 and all(count == 1 for count in tips_per_camera.values()):
+        logger.info(f"[DETECT] Multiple clusters from disagreeing cameras - merging for voting")
+        all_tips_merged = [tip for cluster in clustered_tips for tip in cluster]
+        clustered_tips = [all_tips_merged]
+        logger.info(f"[DETECT] Merged into 1 cluster with {len(all_tips_merged)} tips")
     
     detected_tips = vote_on_scores(clustered_tips)
     
