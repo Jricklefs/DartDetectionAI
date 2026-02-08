@@ -4886,3 +4886,195 @@ async def replay_benchmark_with_polygon():
         "details": details[:20]  # First 20 disagreements
     }
 
+
+@router.post("/v1/benchmark/replay-polygon-voted")
+async def replay_benchmark_polygon_with_voting():
+    """
+    Replay benchmark darts comparing polygon vs ellipse scoring WITH VOTING.
+    
+    For each dart:
+    1. Get tip positions from all cameras
+    2. Score each camera with BOTH ellipse and polygon
+    3. Vote across cameras for each method
+    4. Compare voted results to corrected/expected score
+    """
+    from pathlib import Path
+    from collections import Counter
+    
+    # Load polygon calibrations
+    try:
+        load_polygon_calibrations(POLYGON_CALIBRATION_FILE)
+    except:
+        pass
+    
+    poly_cals = get_all_polygon_calibrations()
+    
+    total_darts = 0
+    polygon_correct = 0
+    ellipse_correct = 0
+    both_correct = 0
+    both_wrong = 0
+    polygon_better = 0
+    ellipse_better = 0
+    
+    details = []
+    
+    # Process all benchmark games
+    for board_dir in BENCHMARK_DIR.iterdir():
+        if not board_dir.is_dir():
+            continue
+        
+        for game_dir in board_dir.iterdir():
+            if not game_dir.is_dir():
+                continue
+            
+            for round_dir in game_dir.iterdir():
+                if not round_dir.is_dir():
+                    continue
+                
+                for dart_dir in round_dir.iterdir():
+                    if not dart_dir.is_dir():
+                        continue
+                    
+                    meta_path = dart_dir / "metadata.json"
+                    if not meta_path.exists():
+                        continue
+                    
+                    with open(meta_path) as f:
+                        metadata = json.load(f)
+                    
+                    # Get expected score (corrected if exists, else original)
+                    correction_path = dart_dir / "correction.json"
+                    if correction_path.exists():
+                        with open(correction_path) as f:
+                            correction = json.load(f)
+                        expected = correction.get("corrected", correction.get("correct_score", {}))
+                    else:
+                        expected = metadata.get("final_result", {})
+                    
+                    expected_segment = expected.get("segment", 0)
+                    expected_multiplier = expected.get("multiplier", 1)
+                    
+                    # Get stored calibrations for ellipse
+                    stored_cals = metadata.get("calibrations", {})
+                    pipeline = metadata.get("pipeline", {})
+                    
+                    # Collect scores from all cameras
+                    ellipse_votes = []
+                    polygon_votes = []
+                    camera_details = []
+                    
+                    for cam_id in ["cam0", "cam1", "cam2"]:
+                        cam_pipeline = pipeline.get(cam_id, {})
+                        selected_tip = cam_pipeline.get("selected_tip", {})
+                        
+                        if not selected_tip:
+                            continue
+                        
+                        tip_x = selected_tip.get("x_px")
+                        tip_y = selected_tip.get("y_px")
+                        
+                        if tip_x is None or tip_y is None:
+                            continue
+                        
+                        # Score with ellipse
+                        ellipse_cal = stored_cals.get(cam_id, {})
+                        if ellipse_cal:
+                            ellipse_result = score_with_calibration({"x": tip_x, "y": tip_y}, ellipse_cal)
+                            ellipse_votes.append((ellipse_result.get("segment", 0), ellipse_result.get("multiplier", 1)))
+                        
+                        # Score with polygon
+                        poly_cal = poly_cals.get(cam_id)
+                        if poly_cal:
+                            poly_result = score_from_polygon_calibration((tip_x, tip_y), poly_cal)
+                            polygon_votes.append((poly_result.get("segment", 0), poly_result.get("multiplier", 1)))
+                        
+                        camera_details.append({
+                            "cam": cam_id,
+                            "tip": (tip_x, tip_y),
+                            "ellipse": ellipse_result.get("score", 0) if ellipse_cal else None,
+                            "polygon": poly_result.get("score", 0) if poly_cal else None
+                        })
+                    
+                    if not ellipse_votes and not polygon_votes:
+                        continue
+                    
+                    total_darts += 1
+                    
+                    # Vote for ellipse
+                    if ellipse_votes:
+                        ellipse_counter = Counter(ellipse_votes)
+                        ellipse_winner = ellipse_counter.most_common(1)[0][0]
+                        ellipse_seg, ellipse_mult = ellipse_winner
+                    else:
+                        ellipse_seg, ellipse_mult = 0, 0
+                    
+                    # Vote for polygon
+                    if polygon_votes:
+                        polygon_counter = Counter(polygon_votes)
+                        polygon_winner = polygon_counter.most_common(1)[0][0]
+                        polygon_seg, polygon_mult = polygon_winner
+                    else:
+                        polygon_seg, polygon_mult = 0, 0
+                    
+                    # Compare to expected
+                    ellipse_match = (ellipse_seg == expected_segment and ellipse_mult == expected_multiplier)
+                    polygon_match = (polygon_seg == expected_segment and polygon_mult == expected_multiplier)
+                    
+                    if ellipse_match:
+                        ellipse_correct += 1
+                    if polygon_match:
+                        polygon_correct += 1
+                    
+                    if ellipse_match and polygon_match:
+                        both_correct += 1
+                    elif not ellipse_match and not polygon_match:
+                        both_wrong += 1
+                    elif polygon_match and not ellipse_match:
+                        polygon_better += 1
+                        details.append({
+                            "game": game_dir.name[:8],
+                            "round": round_dir.name,
+                            "dart": dart_dir.name,
+                            "expected": f"{expected_segment}x{expected_multiplier}",
+                            "polygon": f"{polygon_seg}x{polygon_mult}",
+                            "ellipse": f"{ellipse_seg}x{ellipse_mult}",
+                            "cameras": camera_details,
+                            "winner": "polygon"
+                        })
+                    elif ellipse_match and not polygon_match:
+                        ellipse_better += 1
+                        details.append({
+                            "game": game_dir.name[:8],
+                            "round": round_dir.name,
+                            "dart": dart_dir.name,
+                            "expected": f"{expected_segment}x{expected_multiplier}",
+                            "polygon": f"{polygon_seg}x{polygon_mult}",
+                            "ellipse": f"{ellipse_seg}x{ellipse_mult}",
+                            "cameras": camera_details,
+                            "winner": "ellipse"
+                        })
+    
+    polygon_accuracy = (polygon_correct / total_darts * 100) if total_darts > 0 else 0
+    ellipse_accuracy = (ellipse_correct / total_darts * 100) if total_darts > 0 else 0
+    
+    return {
+        "total_darts": total_darts,
+        "polygon": {
+            "correct": polygon_correct,
+            "accuracy": round(polygon_accuracy, 1)
+        },
+        "ellipse": {
+            "correct": ellipse_correct,
+            "accuracy": round(ellipse_accuracy, 1)
+        },
+        "comparison": {
+            "both_correct": both_correct,
+            "both_wrong": both_wrong,
+            "polygon_better": polygon_better,
+            "ellipse_better": ellipse_better,
+            "net_improvement": polygon_better - ellipse_better,
+            "recommendation": "polygon" if polygon_correct > ellipse_correct else "ellipse"
+        },
+        "details": details[:30]
+    }
