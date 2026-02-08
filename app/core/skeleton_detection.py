@@ -68,7 +68,7 @@ def detect_dart_skeleton(
     
     for contour in contours:
         area = cv2.contourArea(contour)
-        if area < 300 or area > 50000:
+        if area < 200 or area > 50000:
             continue
         
         rect = cv2.minAreaRect(contour)

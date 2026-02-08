@@ -1241,6 +1241,7 @@ class CameraInput(BaseModel):
 class DetectRequest(BaseModel):
     """Detection request with calibrations inline."""
     cameras: List[CameraInput]
+    before_images: Optional[List[BeforeImage]] = None  # Frames before dart landed
     rotation_offset_degrees: Optional[float] = 0.0
     board_id: Optional[str] = "default"  # For caching/differential detection
     dart_number: Optional[int] = 1  # 1, 2, or 3 - which dart we're detecting
@@ -1503,8 +1504,18 @@ async def detect_tips(
                 center = calibration_data.get('center', (320, 240))
                 mask = masks.get(cam.camera_id)
                 
-                # Get previous frame from cache
-                prev_images = get_previous_images(board_id)
+                # Get previous frame - prefer from request, fall back to cache
+                if request.before_images:
+                    # Use before images from request (most accurate - from frame buffer)
+                    prev_images = {}
+                    for bi in request.before_images:
+                        img_data = base64.b64decode(bi.image.split(',')[-1] if ',' in bi.image else bi.image)
+                        nparr = np.frombuffer(img_data, np.uint8)
+                        prev_images[bi.camera_id] = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                    logger.info(f"[DETECT] Using {len(prev_images)} before images from request")
+                else:
+                    # Fall back to cached previous images
+                    prev_images = get_previous_images(board_id)
                 prev_img = prev_images.get(cam.camera_id) if prev_images else None
                 
                 if prev_img is not None:
