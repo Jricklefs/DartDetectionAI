@@ -5022,8 +5022,8 @@ async def set_method(request: dict):
     """Set detection method."""
     method = request.get("method", "yolo")
     
-    if method not in ("yolo", "skeleton"):
-        raise HTTPException(400, f"Invalid method: {method}. Use 'yolo' or 'skeleton'")
+    if method not in ("yolo", "skeleton", "hough"):
+        raise HTTPException(400, f"Invalid method: {method}. Use 'yolo', 'skeleton', or 'hough'")
     
     success = set_detection_method(method)
     
@@ -5031,6 +5031,65 @@ async def set_method(request: dict):
         return {"success": True, "method": method, "message": f"Detection method set to {method}"}
     else:
         raise HTTPException(500, "Failed to set detection method")
+
+
+@router.post("/v1/recalibrate-all")
+async def recalibrate_all_cameras():
+    """
+    Recalibrate all cameras with fresh images.
+    Used when switching detection methods to refresh overlays.
+    """
+    import requests as req
+    import base64
+    
+    results = []
+    calibrator = get_calibrator()
+    
+    # Camera URLs (from config or defaults)
+    camera_urls = {
+        0: "http://192.168.0.82:8080",
+        1: "http://192.168.0.83:8080", 
+        2: "http://192.168.0.84:8080"
+    }
+    
+    for cam_index, cam_url in camera_urls.items():
+        cam_id = f"cam{cam_index}"
+        try:
+            # Grab fresh frame
+            snap_resp = req.get(f"{cam_url}/snapshot", timeout=5)
+            if snap_resp.status_code == 200:
+                snap_data = snap_resp.json()
+                image_data = snap_data.get("image", "")
+                
+                if image_data:
+                    # Decode image
+                    if "base64," in image_data:
+                        image_data = image_data.split("base64,")[1]
+                    
+                    image_bytes = base64.b64decode(image_data)
+                    nparr = np.frombuffer(image_bytes, np.uint8)
+                    image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                    
+                    if image is not None:
+                        # Run calibration
+                        result = calibrator.calibrate(image, cam_id)
+                        results.append({"camera": cam_id, "success": True})
+                    else:
+                        results.append({"camera": cam_id, "success": False, "error": "Failed to decode image"})
+                else:
+                    results.append({"camera": cam_id, "success": False, "error": "No image data"})
+            else:
+                results.append({"camera": cam_id, "success": False, "error": f"HTTP {snap_resp.status_code}"})
+        except Exception as e:
+            results.append({"camera": cam_id, "success": False, "error": str(e)})
+    
+    success_count = sum(1 for r in results if r.get("success"))
+    return {
+        "success": success_count > 0,
+        "cameras_calibrated": success_count,
+        "total_cameras": len(camera_urls),
+        "results": results
+    }
 
 
 @router.post("/v1/benchmark/replay-polygon-voted")
