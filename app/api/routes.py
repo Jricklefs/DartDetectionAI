@@ -4763,7 +4763,7 @@ async def replay_benchmark_with_polygon():
                     if correction_path.exists():
                         with open(correction_path) as f:
                             correction = json.load(f)
-                        expected = correction.get("correct_score", {})
+                        expected = correction.get("corrected", correction.get("correct_score", {}))
                     else:
                         expected = metadata.get("final_result", {})
                     
