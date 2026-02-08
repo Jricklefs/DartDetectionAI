@@ -3001,6 +3001,7 @@ class ReplayRequest(BaseModel):
 
 class ReplayAllRequest(BaseModel):
     board_id: str = "default"
+    game_id: Optional[str] = None  # Specific game to replay (None = all games)
     limit: int = 100  # Max darts to replay
 
 
@@ -3371,6 +3372,198 @@ class StereoStatusResponse(BaseModel):
     reprojection_error: Optional[float]
 
 
+
+
+@router.post("/v1/benchmark/replay-skeleton")
+async def replay_with_skeleton(request: ReplayAllRequest = None):
+    """
+    Replay ALL benchmark darts using SKELETON detection instead of YOLO.
+    Tests skeleton algorithm on saved images without throwing darts.
+    """
+    if request is None:
+        request = ReplayAllRequest()
+    
+    board_id = request.board_id or "default"
+    game_id = request.game_id
+    
+    benchmark_base = Path("C:/Users/clawd/DartBenchmark") / board_id
+    
+    if not benchmark_base.exists():
+        return {"error": "No benchmark data found", "path": str(benchmark_base)}
+    
+    # Find game directories
+    if game_id:
+        game_dirs = [benchmark_base / game_id]
+    else:
+        game_dirs = [d for d in benchmark_base.iterdir() if d.is_dir()]
+    
+    results = []
+    total_darts = 0
+    correct_count = 0
+    
+    for game_dir in game_dirs:
+        round_dirs = sorted([d for d in game_dir.iterdir() if d.is_dir() and d.name.startswith("round_")])
+        
+        for round_dir in round_dirs:
+            dart_dirs = sorted([d for d in round_dir.iterdir() if d.is_dir() and d.name.startswith("dart_")])
+            
+            for dart_dir in dart_dirs:
+                meta_path = dart_dir / "metadata.json"
+                if not meta_path.exists():
+                    continue
+                
+                with open(meta_path) as f:
+                    metadata = json.load(f)
+                
+                # Load correction if exists
+                correction = None
+                correction_path = dart_dir / "correction.json"
+                if correction_path.exists():
+                    with open(correction_path) as f:
+                        correction = json.load(f)
+                
+                total_darts += 1
+                
+                # Expected: correction if exists, else original
+                if correction:
+                    expected = correction.get("corrected", {})
+                    had_correction = True
+                else:
+                    expected = metadata.get("final_result", {})
+                    had_correction = False
+                
+                # Load images
+                images = {}
+                for cam_file in dart_dir.glob("*_raw.jpg"):
+                    cam_id = cam_file.stem.replace("_raw", "")
+                    img = cv2.imread(str(cam_file))
+                    if img is not None:
+                        images[cam_id] = img
+                
+                baselines = {}
+                for cam_file in dart_dir.glob("*_previous.jpg"):
+                    cam_id = cam_file.stem.replace("_previous", "")
+                    img = cv2.imread(str(cam_file))
+                    if img is not None:
+                        baselines[cam_id] = img
+                
+                if not images or not baselines:
+                    results.append({
+                        "dart_path": str(dart_dir),
+                        "error": "Missing images or baselines",
+                        "expected": expected,
+                        "correct": False,
+                        "had_correction": had_correction
+                    })
+                    continue
+                
+                # Get calibrations
+                raw_calibrations = metadata.get("calibrations", {})
+                saved_calibrations = {}
+                for cam_id, cal in raw_calibrations.items():
+                    saved_calibrations[cam_id] = {
+                        **cal,
+                        "outer_double_ellipse": cal.get("outer_double_ellipse") or cal.get("double_ellipse"),
+                        "inner_double_ellipse": cal.get("inner_double_ellipse") or cal.get("inner_single_ellipse"),
+                        "outer_triple_ellipse": cal.get("outer_triple_ellipse") or cal.get("triple_ellipse"),
+                        "inner_triple_ellipse": cal.get("inner_triple_ellipse") or cal.get("outer_single_ellipse"),
+                    }
+                
+                from app.core.detection import score_from_ellipse_calibration
+                
+                # Run SKELETON detection on each camera
+                camera_votes = []
+                
+                for cam_id, img in images.items():
+                    cal = saved_calibrations.get(cam_id)
+                    if not cal:
+                        continue
+                    
+                    baseline = baselines.get(cam_id)
+                    if baseline is None:
+                        continue
+                    
+                    center = cal.get('center', (img.shape[1]//2, img.shape[0]//2))
+                    
+                    # Use skeleton detection
+                    skeleton_tip = detect_tip_skeleton(
+                        current_frame=img,
+                        previous_frame=baseline,
+                        board_center=center,
+                        diff_threshold=30.0,
+                        min_contour_area=100
+                    )
+                    
+                    if skeleton_tip is None:
+                        continue
+                    
+                    tip_x, tip_y = skeleton_tip.x, skeleton_tip.y
+                    
+                    # Score using calibration
+                    result = score_from_ellipse_calibration((tip_x, tip_y), cal)
+                    
+                    if result:
+                        camera_votes.append({
+                            "camera_id": cam_id,
+                            "segment": result["segment"],
+                            "multiplier": result["multiplier"],
+                            "tip_x": tip_x,
+                            "tip_y": tip_y
+                        })
+                
+                if not camera_votes:
+                    results.append({
+                        "dart_path": str(dart_dir),
+                        "error": "No skeleton detections",
+                        "expected": expected,
+                        "correct": False,
+                        "had_correction": had_correction
+                    })
+                    continue
+                
+                # Vote for final result
+                from collections import Counter
+                vote_keys = [(v["segment"], v["multiplier"]) for v in camera_votes]
+                vote_counts = Counter(vote_keys)
+                winning_vote = vote_counts.most_common(1)[0][0]
+                new_segment, new_multiplier = winning_vote
+                
+                # Compare to expected
+                expected_segment = expected.get("segment")
+                expected_multiplier = expected.get("multiplier")
+                
+                is_correct = (new_segment == expected_segment and new_multiplier == expected_multiplier)
+                if is_correct:
+                    correct_count += 1
+                
+                results.append({
+                    "dart_path": str(dart_dir),
+                    "skeleton_result": {"segment": new_segment, "multiplier": new_multiplier},
+                    "expected": expected,
+                    "correct": is_correct,
+                    "had_correction": had_correction,
+                    "votes": len(camera_votes)
+                })
+    
+    accuracy = (correct_count / total_darts * 100) if total_darts > 0 else 0
+    
+    # Summary stats
+    corrections_correct = sum(1 for r in results if r.get('had_correction') and r.get('correct'))
+    corrections_total = sum(1 for r in results if r.get('had_correction'))
+    originals_correct = sum(1 for r in results if not r.get('had_correction') and r.get('correct'))
+    originals_total = sum(1 for r in results if not r.get('had_correction'))
+    no_detection = sum(1 for r in results if r.get('error'))
+    
+    return {
+        "method": "skeleton",
+        "total_darts": total_darts,
+        "correct": correct_count,
+        "accuracy": f"{accuracy:.1f}%",
+        "originally_correct": f"{originals_correct}/{originals_total}",
+        "corrections_now_correct": f"{corrections_correct}/{corrections_total}",
+        "no_detection": no_detection,
+        "results": results
+    }
 
 
 # ==================== AUTO-TUNING ====================
