@@ -1489,17 +1489,24 @@ async def detect_tips(
             logger.info(f"[TIMING] Before detection ({DETECTION_METHOD}): {(timing_module.time() - endpoint_start)*1000:.0f}ms since start")
             t_detect = time.time()
             
-            if DETECTION_METHOD == "skeleton":
+            if DETECTION_METHOD == "skeleton" and dart_number > 1:
                 # === SKELETON-BASED DETECTION (Autodarts-style) ===
+                # Only for dart 2+ (dart 1 has no "before" frame to diff from)
                 tips = []
                 try:
-                    # Get previous frame for differencing
+                    logger.info(f"[SKELETON] Camera {cam.camera_id}: Starting skeleton detection for dart {dart_number}...")
+                    
+                    # Get previous frame for differencing (dart N-1 images)
                     previous_images = get_previous_images(board_id)
+                    logger.info(f"[SKELETON] Camera {cam.camera_id}: Got previous images for cameras: {list(previous_images.keys())}")
                     previous_img = previous_images.get(cam.camera_id)
                     
                     if previous_img is not None:
+                        logger.info(f"[SKELETON] Camera {cam.camera_id}: Previous frame shape={previous_img.shape}, current shape={current_img.shape}")
+                        
                         # Get board center from calibration
                         center = calibration_data.get('center', (current_img.shape[1]//2, current_img.shape[0]//2))
+                        logger.info(f"[SKELETON] Camera {cam.camera_id}: Board center={center}")
                         
                         # Detect tip using skeleton method
                         skeleton_tip = detect_tip_skeleton(
@@ -1517,13 +1524,39 @@ async def detect_tips(
                                 'confidence': skeleton_tip.confidence,
                                 'method': 'skeleton'
                             }]
-                            logger.info(f"[SKELETON] Camera {cam.camera_id}: detected tip at ({skeleton_tip.x:.1f}, {skeleton_tip.y:.1f}), conf={skeleton_tip.confidence:.2f}")
+                            logger.info(f"[SKELETON] Camera {cam.camera_id}: ✓ detected tip at ({skeleton_tip.x:.1f}, {skeleton_tip.y:.1f}), conf={skeleton_tip.confidence:.2f}")
                         else:
-                            logger.warning(f"[SKELETON] Camera {cam.camera_id}: no tip detected")
+                            logger.warning(f"[SKELETON] Camera {cam.camera_id}: ✗ no tip detected from skeleton, falling back to YOLO")
+                            # Fall back to YOLO
+                            tips = calibrator.detect_tips(
+                                camera_id=cam.camera_id,
+                                image_base64=cam.image,
+                                calibration_data=calibration_data
+                            )
                     else:
-                        logger.warning(f"[SKELETON] Camera {cam.camera_id}: no previous frame for diff")
+                        logger.warning(f"[SKELETON] Camera {cam.camera_id}: ✗ no previous frame, falling back to YOLO")
+                        tips = calibrator.detect_tips(
+                            camera_id=cam.camera_id,
+                            image_base64=cam.image,
+                            calibration_data=calibration_data
+                        )
                 except Exception as e:
-                    logger.error(f"[SKELETON] Camera {cam.camera_id}: error - {e}")
+                    import traceback
+                    logger.error(f"[SKELETON] Camera {cam.camera_id}: ERROR - {e}, falling back to YOLO")
+                    logger.error(f"[SKELETON] Traceback: {traceback.format_exc()}")
+                    tips = calibrator.detect_tips(
+                        camera_id=cam.camera_id,
+                        image_base64=cam.image,
+                        calibration_data=calibration_data
+                    )
+            elif DETECTION_METHOD == "skeleton" and dart_number == 1:
+                # Dart 1 in skeleton mode - must use YOLO (no previous frame exists)
+                logger.info(f"[SKELETON] Camera {cam.camera_id}: Dart 1 - using YOLO (no previous frame for skeleton)")
+                tips = calibrator.detect_tips(
+                    camera_id=cam.camera_id,
+                    image_base64=cam.image,
+                    calibration_data=calibration_data
+                )
             else:
                 # === YOLO-BASED DETECTION (default) ===
                 tips = calibrator.detect_tips(
@@ -1533,7 +1566,8 @@ async def detect_tips(
                 )
             
             detect_ms = int((time.time() - t_detect) * 1000)
-            yolo_total_ms += detect_ms  # Reusing the timing variable
+            yolo_ms = detect_ms  # For timing reporting
+            yolo_total_ms += detect_ms
             
             # === ADD MM COORDINATES TO ALL TIPS ===
             # Transform pixel coords to dartboard mm coords for cross-camera matching
