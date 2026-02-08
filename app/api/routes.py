@@ -4809,7 +4809,7 @@ async def replay_benchmark_with_polygon():
                         # Score with ellipse (existing method)
                         ellipse_cal = stored_cals.get(cam_id, {})
                         if ellipse_cal:
-                            ellipse_result = score_with_calibration({"x": tip_x, "y": tip_y}, ellipse_cal)
+                            ellipse_result = score_with_calibration({"x_px": tip_x, "y_px": tip_y}, ellipse_cal)
                             ellipse_score_val = ellipse_result.get("score", 0)
                         else:
                             ellipse_score_val = -1
@@ -4980,7 +4980,7 @@ async def replay_benchmark_polygon_with_voting():
                         # Score with ellipse
                         ellipse_cal = stored_cals.get(cam_id, {})
                         if ellipse_cal:
-                            ellipse_result = score_with_calibration({"x": tip_x, "y": tip_y}, ellipse_cal)
+                            ellipse_result = score_with_calibration({"x_px": tip_x, "y_px": tip_y}, ellipse_cal)
                             ellipse_votes.append((ellipse_result.get("segment", 0), ellipse_result.get("multiplier", 1)))
                         
                         # Score with polygon
