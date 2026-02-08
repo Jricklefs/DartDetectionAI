@@ -132,8 +132,12 @@ def detect_dart_hough(
     dart_dir = tip_end - flight_end
     dart_dir = dart_dir / (np.linalg.norm(dart_dir) + 1e-6)
     
-    # 8. Extrapolate along line until diff signal ends
+    # 8. Extrapolate along line until diff signal drops significantly
+    # The tip is where we see a large drop in diff signal (dart ends, board begins)
     extended_tip = tip_end.copy()
+    
+    # Sample diff along line from detected end toward center
+    signal_history = []
     
     for step in range(1, 150):
         test_point = tip_end + dart_dir * step
@@ -151,11 +155,27 @@ def detect_dart_hough(
         local_diff = gray_diff[y_lo:y_hi, x_lo:x_hi]
         max_diff = np.max(local_diff)
         
-        if max_diff < 10:
-            extended_tip = tip_end + dart_dir * max(0, step - 1)
-            break
-        else:
-            extended_tip = test_point
+        signal_history.append((step, max_diff, test_point.copy()))
+        
+        # Look for significant drop: current signal < 50% of recent peak
+        if len(signal_history) >= 5:
+            recent_peak = max(s[1] for s in signal_history[-10:])
+            
+            # If we had strong signal and it dropped significantly
+            if recent_peak > 50 and max_diff < recent_peak * 0.4:
+                # Go back to where signal was still strong
+                for prev_step, prev_signal, prev_point in reversed(signal_history[:-3]):
+                    if prev_signal > recent_peak * 0.6:
+                        extended_tip = prev_point
+                        break
+                break
+        
+        # Safety: if signal is very low for several steps, stop
+        if len(signal_history) >= 8:
+            recent_signals = [s[1] for s in signal_history[-8:]]
+            if max(recent_signals) < 30:
+                extended_tip = signal_history[-8][2]  # Go back 8 steps
+                break
     
     result["tip"] = (float(extended_tip[0]), float(extended_tip[1]))
     result["confidence"] = min(1.0, alignment * (length / 100.0))
