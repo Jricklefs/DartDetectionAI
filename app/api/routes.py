@@ -1484,14 +1484,56 @@ async def detect_tips(
             # Track calibration for benchmark
             calibrations_used[cam.camera_id] = calibration_data
             
-            # Detect tips using YOLO - always on full image
-            logger.info(f"[TIMING] Before YOLO: {(timing_module.time() - endpoint_start)*1000:.0f}ms since start")
+            # Detect tips using selected method (YOLO or Skeleton)
+            detection_method = get_detection_method()
+            logger.info(f"[TIMING] Before detection ({detection_method}): {(timing_module.time() - endpoint_start)*1000:.0f}ms since start")
             t_yolo = time.time()
-            tips = calibrator.detect_tips(
-                camera_id=cam.camera_id,
-                image_base64=cam.image,
-                calibration_data=calibration_data
-            )
+            
+            if detection_method == "skeleton":
+                # Use skeleton-based detection
+                center = calibration_data.get('center', (320, 240))
+                mask = masks.get(cam.camera_id)
+                
+                # Get previous frame from cache
+                prev_images = get_previous_images(board_id)
+                prev_img = prev_images.get(cam.camera_id) if prev_images else None
+                
+                if prev_img is not None:
+                    skel_result = detect_dart_skeleton(
+                        current_img, 
+                        prev_img, 
+                        center=tuple(center),
+                        mask=mask
+                    )
+                    
+                    if skel_result.get("tip"):
+                        tip_x, tip_y = skel_result["tip"]
+                        tips = [{
+                            "x_px": tip_x,
+                            "y_px": tip_y,
+                            "confidence": skel_result.get("confidence", 0.5),
+                            "method": "skeleton"
+                        }]
+                        logger.info(f"[DETECT] Skeleton found tip at ({tip_x:.1f}, {tip_y:.1f})")
+                    else:
+                        tips = []
+                        logger.info(f"[DETECT] Skeleton found no tip")
+                else:
+                    # No previous frame - fall back to YOLO for first dart
+                    tips = calibrator.detect_tips(
+                        camera_id=cam.camera_id,
+                        image_base64=cam.image,
+                        calibration_data=calibration_data
+                    )
+                    logger.info(f"[DETECT] No previous frame, using YOLO fallback")
+            else:
+                # Use YOLO detection (default)
+                tips = calibrator.detect_tips(
+                    camera_id=cam.camera_id,
+                    image_base64=cam.image,
+                    calibration_data=calibration_data
+                )
+            
             yolo_ms = int((time.time() - t_yolo) * 1000)
             yolo_total_ms += yolo_ms
             
