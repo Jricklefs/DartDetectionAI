@@ -4545,3 +4545,283 @@ async def apply_best_config():
         "applied_config": best,
         "message": "Configuration applied. Run benchmark to verify."
     }
+
+
+# =============================================================================
+# POLYGON CALIBRATION - Autodarts-style 20-point polygon calibration
+# =============================================================================
+
+from app.core.polygon_calibration import (
+    import_autodarts_config,
+    load_polygon_calibrations_from_autodarts,
+    save_polygon_calibrations,
+    load_polygon_calibrations,
+    get_polygon_calibration,
+    get_all_polygon_calibrations,
+    set_calibration_mode,
+    get_calibration_mode,
+    score_from_polygon_calibration,
+    PolygonCalibration,
+)
+
+# Default Autodarts config path
+AUTODARTS_CONFIG_PATH = "C:/Users/clawd/AppData/Roaming/Autodarts Desktop/autodarts/config.toml"
+POLYGON_CALIBRATION_FILE = "C:/Users/clawd/DartDetectionAI/polygon_calibrations.json"
+
+
+@router.get("/v1/calibration/mode")
+async def get_current_calibration_mode():
+    """Get the current calibration mode (ellipse or polygon)."""
+    return {
+        "mode": get_calibration_mode(),
+        "options": ["ellipse", "polygon"],
+        "description": {
+            "ellipse": "4-ring ellipse fitting (current default)",
+            "polygon": "Autodarts-style 20-point polygon calibration"
+        }
+    }
+
+
+@router.post("/v1/calibration/mode")
+async def set_current_calibration_mode(request: dict):
+    """Set the calibration mode."""
+    mode = request.get("mode", "ellipse")
+    if set_calibration_mode(mode):
+        return {"success": True, "mode": mode}
+    else:
+        raise HTTPException(400, f"Invalid mode: {mode}. Use 'ellipse' or 'polygon'")
+
+
+@router.get("/v1/calibration/polygon")
+async def get_polygon_calibrations():
+    """Get all polygon calibrations."""
+    calibrations = get_all_polygon_calibrations()
+    return {
+        "mode": get_calibration_mode(),
+        "cameras": {
+            cam_id: cal.to_dict() for cam_id, cal in calibrations.items()
+        },
+        "count": len(calibrations)
+    }
+
+
+@router.post("/v1/calibration/polygon/import-autodarts")
+async def import_autodarts_calibration(request: dict = None):
+    """
+    Import polygon calibration from Autodarts config.toml.
+    
+    Optionally specify a custom config path.
+    """
+    config_path = AUTODARTS_CONFIG_PATH
+    if request and "config_path" in request:
+        config_path = request["config_path"]
+    
+    try:
+        count = load_polygon_calibrations_from_autodarts(config_path)
+        
+        # Save to our format
+        save_polygon_calibrations(POLYGON_CALIBRATION_FILE)
+        
+        # Return imported data
+        calibrations = get_all_polygon_calibrations()
+        
+        return {
+            "success": True,
+            "imported": count,
+            "config_path": config_path,
+            "saved_to": POLYGON_CALIBRATION_FILE,
+            "cameras": {
+                cam_id: {
+                    "bull": cal.bull,
+                    "double_outers_count": len(cal.double_outers),
+                    "double_inners_count": len(cal.double_inners),
+                    "treble_outers_count": len(cal.treble_outers),
+                    "treble_inners_count": len(cal.treble_inners),
+                }
+                for cam_id, cal in calibrations.items()
+            }
+        }
+    except FileNotFoundError:
+        raise HTTPException(404, f"Autodarts config not found at: {config_path}")
+    except Exception as e:
+        raise HTTPException(500, f"Failed to import: {e}")
+
+
+@router.post("/v1/calibration/polygon/load")
+async def load_saved_polygon_calibrations():
+    """Load polygon calibrations from saved JSON file."""
+    try:
+        count = load_polygon_calibrations(POLYGON_CALIBRATION_FILE)
+        return {
+            "success": True,
+            "loaded": count,
+            "file": POLYGON_CALIBRATION_FILE
+        }
+    except FileNotFoundError:
+        raise HTTPException(404, f"No saved calibrations at: {POLYGON_CALIBRATION_FILE}")
+    except Exception as e:
+        raise HTTPException(500, f"Failed to load: {e}")
+
+
+@router.post("/v1/calibration/polygon/test-scoring")
+async def test_polygon_scoring(request: dict):
+    """
+    Test polygon-based scoring with a specific pixel coordinate.
+    
+    Request body:
+    {
+        "camera_id": "0",
+        "x": 500,
+        "y": 300
+    }
+    """
+    camera_id = request.get("camera_id", "0")
+    x = request.get("x", 0)
+    y = request.get("y", 0)
+    
+    calibration = get_polygon_calibration(camera_id)
+    if not calibration:
+        raise HTTPException(404, f"No polygon calibration for camera {camera_id}")
+    
+    result = score_from_polygon_calibration((x, y), calibration)
+    
+    return {
+        "camera_id": camera_id,
+        "tip": {"x": x, "y": y},
+        "score": result,
+        "calibration_mode": "polygon"
+    }
+
+
+@router.post("/v1/benchmark/replay-polygon")
+async def replay_benchmark_with_polygon():
+    """
+    Replay all benchmark darts using polygon calibration for scoring.
+    
+    Compares polygon scoring to ellipse scoring to see if it improves accuracy.
+    """
+    from pathlib import Path
+    
+    # Load polygon calibrations
+    try:
+        load_polygon_calibrations(POLYGON_CALIBRATION_FILE)
+    except:
+        # Try importing from Autodarts if no saved file
+        load_polygon_calibrations_from_autodarts(AUTODARTS_CONFIG_PATH)
+    
+    calibrations = get_all_polygon_calibrations()
+    if not calibrations:
+        raise HTTPException(400, "No polygon calibrations available. Import from Autodarts first.")
+    
+    # Get all benchmark games
+    board_ids = [d.name for d in BENCHMARK_DIR.iterdir() if d.is_dir()]
+    
+    total_darts = 0
+    polygon_matches = 0
+    ellipse_matches = 0
+    improvements = 0  # Where polygon is correct but ellipse was wrong
+    regressions = 0   # Where ellipse was correct but polygon is wrong
+    
+    results = []
+    
+    for board_id in board_ids:
+        board_dir = BENCHMARK_DIR / board_id
+        games = [d.name for d in board_dir.iterdir() if d.is_dir()]
+        
+        for game_id in games:
+            game_dir = board_dir / game_id
+            
+            # Load metadata
+            meta_path = game_dir / "metadata.json"
+            if not meta_path.exists():
+                continue
+            
+            with open(meta_path) as f:
+                metadata = json.load(f)
+            
+            stored_calibrations = metadata.get("calibrations", {})
+            
+            # Process each round
+            for round_name in sorted(game_dir.iterdir()):
+                if not round_name.is_dir():
+                    continue
+                
+                for dart_dir in sorted(round_name.iterdir()):
+                    if not dart_dir.is_dir():
+                        continue
+                    
+                    result_path = dart_dir / "result.json"
+                    if not result_path.exists():
+                        continue
+                    
+                    with open(result_path) as f:
+                        dart_result = json.load(f)
+                    
+                    # Get original/corrected score
+                    corrected = dart_result.get("corrected_score")
+                    original = dart_result.get("original_score", {})
+                    expected_score = corrected if corrected else original.get("score", 0)
+                    
+                    # Get tip positions from each camera
+                    camera_results = dart_result.get("camera_results", [])
+                    
+                    for cam_result in camera_results:
+                        cam_id = cam_result.get("camera_id", "0")
+                        tip = cam_result.get("selected_tip")
+                        
+                        if not tip:
+                            continue
+                        
+                        x, y = tip.get("x", 0), tip.get("y", 0)
+                        
+                        # Score with polygon
+                        poly_cal = calibrations.get(cam_id)
+                        if poly_cal:
+                            poly_result = score_from_polygon_calibration((x, y), poly_cal)
+                            poly_score = poly_result.get("score", 0)
+                        else:
+                            poly_score = -1
+                        
+                        # Score with ellipse (existing method)
+                        ellipse_cal = stored_calibrations.get(cam_id, {})
+                        if ellipse_cal:
+                            ellipse_result = score_with_calibration({"x": x, "y": y}, ellipse_cal)
+                            ellipse_score = ellipse_result.get("score", 0)
+                        else:
+                            ellipse_score = -1
+                        
+                        total_darts += 1
+                        
+                        poly_correct = (poly_score == expected_score)
+                        ellipse_correct = (ellipse_score == expected_score)
+                        
+                        if poly_correct:
+                            polygon_matches += 1
+                        if ellipse_correct:
+                            ellipse_matches += 1
+                        
+                        if poly_correct and not ellipse_correct:
+                            improvements += 1
+                        if ellipse_correct and not poly_correct:
+                            regressions += 1
+    
+    polygon_accuracy = (polygon_matches / total_darts * 100) if total_darts > 0 else 0
+    ellipse_accuracy = (ellipse_matches / total_darts * 100) if total_darts > 0 else 0
+    
+    return {
+        "total_darts": total_darts,
+        "polygon": {
+            "matches": polygon_matches,
+            "accuracy": round(polygon_accuracy, 1)
+        },
+        "ellipse": {
+            "matches": ellipse_matches,
+            "accuracy": round(ellipse_accuracy, 1)
+        },
+        "comparison": {
+            "improvements": improvements,
+            "regressions": regressions,
+            "net_improvement": improvements - regressions,
+            "recommendation": "polygon" if improvements > regressions else "ellipse"
+        }
+    }
