@@ -4551,6 +4551,12 @@ async def apply_best_config():
 # POLYGON CALIBRATION - Autodarts-style 20-point polygon calibration
 # =============================================================================
 
+from app.core.skeleton_detection import (
+    detect_dart_skeleton,
+    set_detection_method,
+    get_detection_method
+)
+
 from app.core.polygon_calibration import (
     import_autodarts_config,
     load_polygon_calibrations_from_autodarts,
@@ -4885,6 +4891,40 @@ async def replay_benchmark_with_polygon():
         },
         "details": details[:20]  # First 20 disagreements
     }
+
+
+
+
+# ==================== DETECTION METHOD ====================
+
+@router.get("/v1/settings/method")
+async def get_method():
+    """Get current detection method."""
+    method = get_detection_method()
+    return {
+        "method": method,
+        "options": ["yolo", "skeleton"],
+        "description": {
+            "yolo": "YOLO neural network for dart tip detection",
+            "skeleton": "Classical CV with frame diff + skeletonization (Autodarts-style)"
+        }
+    }
+
+
+@router.post("/v1/settings/method")
+async def set_method(request: dict):
+    """Set detection method."""
+    method = request.get("method", "yolo")
+    
+    if method not in ("yolo", "skeleton"):
+        raise HTTPException(400, f"Invalid method: {method}. Use 'yolo' or 'skeleton'")
+    
+    success = set_detection_method(method)
+    
+    if success:
+        return {"success": True, "method": method, "message": f"Detection method set to {method}"}
+    else:
+        raise HTTPException(500, "Failed to set detection method")
 
 
 @router.post("/v1/benchmark/replay-polygon-voted")
