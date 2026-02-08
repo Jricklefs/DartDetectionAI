@@ -40,19 +40,25 @@ def detect_dart_skeleton(
         "debug": {}
     }
     
-    # 1. Frame differencing
-    diff = cv2.absdiff(current_frame, previous_frame)
-    gray_diff = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
-    
-    # Apply Gaussian blur to reduce noise
-    blurred = cv2.GaussianBlur(gray_diff, (5, 5), 0)
-    
-    # Threshold to get binary mask of changes
-    _, thresh = cv2.threshold(blurred, 25, 255, cv2.THRESH_BINARY)
-    
-    # Apply board mask if provided
-    if mask is not None:
-        thresh = cv2.bitwise_and(thresh, mask)
+    # 1. Use provided mask if available (from pipeline's differential detection)
+    # The mask already identifies NEW dart pixels (value=76 for NEW region)
+    if mask is not None and np.any(mask > 0):
+        # Pipeline mask uses: 0=background, 76=NEW, 152=OLD
+        # Extract just the NEW region
+        thresh = np.where(mask == 76, 255, 0).astype(np.uint8)
+        
+        # If no NEW pixels, fall back to frame diff
+        if np.sum(thresh) == 0:
+            diff = cv2.absdiff(current_frame, previous_frame)
+            gray_diff = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
+            blurred = cv2.GaussianBlur(gray_diff, (5, 5), 0)
+            _, thresh = cv2.threshold(blurred, 25, 255, cv2.THRESH_BINARY)
+    else:
+        # No mask - use frame differencing
+        diff = cv2.absdiff(current_frame, previous_frame)
+        gray_diff = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
+        blurred = cv2.GaussianBlur(gray_diff, (5, 5), 0)
+        _, thresh = cv2.threshold(blurred, 25, 255, cv2.THRESH_BINARY)
     
     # Morphological operations to clean up
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
