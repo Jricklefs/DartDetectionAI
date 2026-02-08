@@ -1510,15 +1510,20 @@ async def detect_tips(
                 center = calibration_data.get('center', (320, 240))
                 mask = masks.get(cam.camera_id)
                 
+                # DEBUG: Write to file
+                with open(r"C:\Users\clawd\skel_debug.txt", "a") as dbg:
+                    dbg.write(f"Camera {cam.camera_id}: before_images={request.before_images is not None and len(request.before_images) if request.before_images else 0}\n")
+                
                 # Get previous frame - prefer from request, fall back to cache
                 if request.before_images:
                     # Use before images from request (most accurate - from frame buffer)
                     prev_images = {}
                     for bi in request.before_images:
+                        logger.info(f"[DETECT] Before image camera_id: '{bi.camera_id}' (looking for '{cam.camera_id}')")
                         img_data = base64.b64decode(bi.image.split(',')[-1] if ',' in bi.image else bi.image)
                         nparr = np.frombuffer(img_data, np.uint8)
                         prev_images[bi.camera_id] = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-                    logger.info(f"[DETECT] Using {len(prev_images)} before images from request")
+                    logger.info(f"[DETECT] Using {len(prev_images)} before images: keys={list(prev_images.keys())}")
                 else:
                     # Fall back to cached previous images
                     prev_images = get_previous_images(board_id)
@@ -1531,6 +1536,10 @@ async def detect_tips(
                         center=tuple(center),
                         mask=mask
                     )
+                    
+                    # DEBUG: Log skeleton result
+                    with open(r"C:\Users\clawd\skel_debug.txt", "a") as dbg:
+                        dbg.write(f"  {cam.camera_id} skeleton: tip={skel_result.get('tip')}, conf={skel_result.get('confidence'):.3f}\n")
                     
                     if skel_result.get("tip"):
                         tip_x, tip_y = skel_result["tip"]
@@ -1757,6 +1766,9 @@ async def detect_tips(
                 
                 tip['camera_id'] = cam.camera_id
                 tip['segment'] = score_info.get('segment', 0)
+                # DEBUG: Log score
+                with open(r"C:\Users\clawd\skel_debug.txt", "a") as dbg:
+                    dbg.write(f"    {cam.camera_id} scored: {score_info.get('segment')}x{score_info.get('multiplier')} = {score_info.get('score')}\n")
                 tip['multiplier'] = score_info.get('multiplier', 1)
                 tip['zone'] = score_info.get('zone', 'miss')
                 tip['score'] = score_info.get('score', 0)
@@ -1778,10 +1790,23 @@ async def detect_tips(
                 
                 logger.info(f"[DETECT] {cam.camera_id}: segment={tip['segment']}, multiplier={tip['multiplier']}, zone={tip['zone']}, score={tip['score']}, conf={tip.get('confidence', 0):.3f}")
             
-            camera_results.append(CameraResult(
-                camera_id=cam.camera_id,
-                tips_detected=len(tips)
-            ))
+            # Include best tip info in camera_results for benchmark
+            if tips and len(tips) > 0:
+                best_tip = tips[0]  # Take first (usually only) tip
+                camera_results.append(CameraResult(
+                    camera_id=cam.camera_id,
+                    tips_detected=len(tips),
+                    segment=best_tip.get('segment'),
+                    multiplier=best_tip.get('multiplier'),
+                    tip_x=best_tip.get('x_px'),
+                    tip_y=best_tip.get('y_px'),
+                    score=best_tip.get('score')
+                ))
+            else:
+                camera_results.append(CameraResult(
+                    camera_id=cam.camera_id,
+                    tips_detected=0
+                ))
             
         except Exception as e:
             logger.error(f"[DETECT] Camera {cam.camera_id}: Error - {e}", exc_info=True)
