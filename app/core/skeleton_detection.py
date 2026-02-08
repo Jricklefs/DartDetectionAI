@@ -82,8 +82,57 @@ def detect_dart_skeleton(
     if not valid_contours:
         return result
     
-    # Take largest contour as the dart
-    dart_contour = max(valid_contours, key=cv2.contourArea)
+    # Find the most dart-like contour (elongated shape pointing toward center)
+    cx, cy = center
+    best_contour = None
+    best_score = -1
+    
+    for contour in valid_contours:
+        # Fit minimum bounding rectangle
+        rect = cv2.minAreaRect(contour)
+        (rx, ry), (w, h), angle = rect
+        
+        # Calculate aspect ratio (elongation)
+        if w == 0 or h == 0:
+            continue
+        aspect = max(w, h) / min(w, h)
+        
+        # Darts are elongated - aspect ratio > 2
+        if aspect < 1.5:
+            continue
+        
+        # Check if contour points toward center
+        # Find the two endpoints of the bounding rect
+        box = cv2.boxPoints(rect)
+        
+        # Get the long axis endpoints (midpoints of short sides)
+        if w > h:
+            # Long axis is along width
+            mid1 = ((box[0][0] + box[1][0])/2, (box[0][1] + box[1][1])/2)
+            mid2 = ((box[2][0] + box[3][0])/2, (box[2][1] + box[3][1])/2)
+        else:
+            # Long axis is along height  
+            mid1 = ((box[1][0] + box[2][0])/2, (box[1][1] + box[2][1])/2)
+            mid2 = ((box[0][0] + box[3][0])/2, (box[0][1] + box[3][1])/2)
+        
+        # Which end is closer to center?
+        d1 = np.sqrt((mid1[0] - cx)**2 + (mid1[1] - cy)**2)
+        d2 = np.sqrt((mid2[0] - cx)**2 + (mid2[1] - cy)**2)
+        
+        # Score = elongation * (distance ratio - tip should be closer to center than flight)
+        # Higher aspect ratio is good, and larger distance difference is good
+        dist_ratio = max(d1, d2) / (min(d1, d2) + 1)  # Flight should be further than tip
+        score = aspect * dist_ratio
+        
+        if score > best_score:
+            best_score = score
+            best_contour = contour
+    
+    # Fallback to largest if no good elongated contour found
+    if best_contour is None:
+        best_contour = max(valid_contours, key=cv2.contourArea)
+    
+    dart_contour = best_contour
     
     # 3. Create mask for just the dart
     dart_mask = np.zeros(thresh.shape, dtype=np.uint8)
