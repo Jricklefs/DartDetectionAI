@@ -1,39 +1,26 @@
 #!/usr/bin/env python3
 """
-Dart tip detection - find the skeleton endpoint closest to board center.
-NOT just any skeleton point, but specifically an ENDPOINT of the skeleton.
+Dart tip detection using medial axis + local width.
+The TIP is the narrowest part of the skeleton.
 """
 
 import cv2
 import numpy as np
-from datetime import datetime
 import os
 import logging
 
 logger = logging.getLogger(__name__)
 
 
-def find_skeleton_endpoints(skeleton: np.ndarray) -> list:
-    """
-    Find endpoints of skeleton (pixels with exactly 1 neighbor).
-    These are the termination points of the skeleton line.
-    """
-    endpoints = []
-    
-    # Pad to avoid edge issues
-    padded = np.pad(skeleton, 1, mode='constant', constant_values=0)
-    
-    # 8-connectivity kernel (exclude center)
-    for y in range(1, padded.shape[0] - 1):
-        for x in range(1, padded.shape[1] - 1):
-            if padded[y, x] > 0:
-                # Count neighbors in 8-connectivity
-                neighbors = np.sum(padded[y-1:y+2, x-1:x+2] > 0) - 1  # -1 for self
-                if neighbors == 1:
-                    # This is an endpoint (only 1 connected neighbor)
-                    endpoints.append((x - 1, y - 1))  # Adjust for padding
-    
-    return endpoints
+def find_skeleton_endpoints(skeleton):
+    """Find endpoints (pixels with exactly 1 neighbor)."""
+    skel = (skeleton > 0).astype(np.uint8)
+    kernel = np.array([[1, 1, 1],
+                       [1, 0, 1],
+                       [1, 1, 1]], dtype=np.uint8)
+    neighbor_count = cv2.filter2D(skel, -1, kernel)
+    endpoints = np.where((skel == 1) & (neighbor_count == 1))
+    return list(zip(endpoints[1], endpoints[0]))  # (x, y)
 
 
 def detect_dart_skeleton(
@@ -44,10 +31,10 @@ def detect_dart_skeleton(
     debug: bool = True
 ) -> dict:
     """
-    Detect dart tip by finding skeleton endpoints and picking the one
-    closest to board center.
+    Detect dart tip using skeleton + distance transform.
+    The tip is at the skeleton endpoint with MINIMUM width.
     """
-    result = {"tip": None, "confidence": 0.0, "method": "skeleton_endpoint"}
+    result = {"tip": None, "confidence": 0.0, "method": "skeleton_width"}
     
     if current_frame is None or previous_frame is None:
         return result
@@ -81,7 +68,7 @@ def detect_dart_skeleton(
     
     for contour in contours:
         area = cv2.contourArea(contour)
-        if area < 200 or area > 50000:
+        if area < 300 or area > 50000:
             continue
         
         rect = cv2.minAreaRect(contour)
@@ -94,20 +81,23 @@ def detect_dart_skeleton(
             best_aspect = aspect
             best_contour = contour
     
-    if best_contour is None:
+    if best_contour is None or best_aspect < 2.0:
         return result
     
-    # 4. Isolate this contour
+    # 4. Create mask for this contour
     contour_mask = np.zeros(thresh.shape, dtype=np.uint8)
     cv2.drawContours(contour_mask, [best_contour], -1, 255, -1)
-    isolated = cv2.bitwise_and(thresh, contour_mask)
     
-    # 5. Skeletonize
+    # 5. Compute distance transform (distance to nearest edge)
+    # This gives us "width" at each point
+    dist_transform = cv2.distanceTransform(contour_mask, cv2.DIST_L2, 5)
+    
+    # 6. Skeletonize
     try:
-        skeleton = cv2.ximgproc.thinning(isolated, thinningType=cv2.ximgproc.THINNING_ZHANGSUEN)
+        skeleton = cv2.ximgproc.thinning(contour_mask, thinningType=cv2.ximgproc.THINNING_ZHANGSUEN)
     except AttributeError:
-        skeleton = np.zeros(isolated.shape, dtype=np.uint8)
-        temp = isolated.copy()
+        skeleton = np.zeros(contour_mask.shape, dtype=np.uint8)
+        temp = contour_mask.copy()
         k = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
         while True:
             eroded = cv2.erode(temp, k)
@@ -118,51 +108,80 @@ def detect_dart_skeleton(
             if cv2.countNonZero(temp) == 0:
                 break
     
-    # 6. Find skeleton endpoints
+    # 7. Get distance values along skeleton
+    dist_on_skel = dist_transform * (skeleton > 0)
+    
+    # 8. Find skeleton endpoints
     endpoints = find_skeleton_endpoints(skeleton)
     
     if len(endpoints) < 2:
-        # Fallback: use all skeleton points
+        # Fallback: pick point on skeleton closest to center
         skel_points = np.column_stack(np.where(skeleton > 0))[:, ::-1]
-        if len(skel_points) < 5:
-            return result
-        # Pick point closest to center
-        distances = np.sqrt((skel_points[:, 0] - cx)**2 + (skel_points[:, 1] - cy)**2)
-        idx = np.argmin(distances)
-        tip_x, tip_y = float(skel_points[idx][0]), float(skel_points[idx][1])
-    else:
-        # 7. Pick the endpoint closest to center = the TIP
-        # (Flight end is further from center)
-        endpoints = np.array(endpoints)
-        distances = np.sqrt((endpoints[:, 0] - cx)**2 + (endpoints[:, 1] - cy)**2)
-        tip_idx = np.argmin(distances)
-        tip_x, tip_y = float(endpoints[tip_idx][0]), float(endpoints[tip_idx][1])
+        if len(skel_points) > 0:
+            distances = np.sqrt((skel_points[:, 0] - cx)**2 + (skel_points[:, 1] - cy)**2)
+            idx = np.argmin(distances)
+            tip_x, tip_y = float(skel_points[idx][0]), float(skel_points[idx][1])
+            result["tip"] = (tip_x, tip_y)
+            result["confidence"] = 0.5
+        return result
+    
+    # 9. For each endpoint, measure local width (average in small radius)
+    endpoint_widths = []
+    for (x, y) in endpoints:
+        # Sample width in 7x7 neighborhood
+        y_min, y_max = max(0, y-3), min(dist_transform.shape[0], y+4)
+        x_min, x_max = max(0, x-3), min(dist_transform.shape[1], x+4)
+        local_region = dist_transform[y_min:y_max, x_min:x_max]
+        
+        # Only consider skeleton pixels for width
+        skel_region = skeleton[y_min:y_max, x_min:x_max]
+        skel_pixels = local_region[skel_region > 0]
+        
+        if len(skel_pixels) > 0:
+            avg_width = np.mean(skel_pixels)
+        else:
+            avg_width = dist_transform[y, x] if 0 <= y < dist_transform.shape[0] and 0 <= x < dist_transform.shape[1] else 0
+        
+        endpoint_widths.append(avg_width)
+    
+    # 10. TIP is the endpoint with MINIMUM width
+    min_width_idx = np.argmin(endpoint_widths)
+    tip_x, tip_y = float(endpoints[min_width_idx][0]), float(endpoints[min_width_idx][1])
+    
+    # Confidence based on width difference (bigger diff = more certain)
+    width_ratio = min(endpoint_widths) / (max(endpoint_widths) + 1e-6)
+    result["confidence"] = 1.0 - width_ratio  # 0 = same width, 1 = very different
     
     result["tip"] = (tip_x, tip_y)
-    result["confidence"] = min(best_aspect / 5.0, 1.0)
-    result["num_endpoints"] = len(endpoints) if 'endpoints' in dir() and isinstance(endpoints, np.ndarray) else 0
+    result["widths"] = endpoint_widths
     
     # Debug
     if debug:
         debug_dir = r"C:\Users\clawd\DartDetectionAI\skeleton_debug"
         os.makedirs(debug_dir, exist_ok=True)
+        from datetime import datetime
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         
-        cv2.imwrite(os.path.join(debug_dir, f"{timestamp}_1_diff.jpg"), thresh)
-        cv2.imwrite(os.path.join(debug_dir, f"{timestamp}_2_skeleton.jpg"), skeleton)
+        cv2.imwrite(os.path.join(debug_dir, f"{timestamp}_1_thresh.jpg"), thresh)
+        
+        # Visualize distance transform
+        dist_vis = (dist_transform / dist_transform.max() * 255).astype(np.uint8)
+        cv2.imwrite(os.path.join(debug_dir, f"{timestamp}_2_dist.jpg"), dist_vis)
+        
+        cv2.imwrite(os.path.join(debug_dir, f"{timestamp}_3_skel.jpg"), skeleton)
         
         result_img = current_frame.copy()
         cv2.drawContours(result_img, [best_contour], -1, (0, 255, 0), 2)
         
-        # Draw all endpoints (yellow)
-        if 'endpoints' in dir() and len(endpoints) > 0:
-            for ep in endpoints:
-                cv2.circle(result_img, (int(ep[0]), int(ep[1])), 5, (0, 255, 255), -1)
+        # Mark all endpoints with their widths
+        for i, (ex, ey) in enumerate(endpoints):
+            color = (0, 0, 255) if i == min_width_idx else (0, 255, 255)  # Red=tip, Yellow=flight
+            cv2.circle(result_img, (int(ex), int(ey)), 6, color, -1)
+            cv2.putText(result_img, f"w={endpoint_widths[i]:.1f}", 
+                        (int(ex)+5, int(ey)-5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
         
         cv2.circle(result_img, (int(cx), int(cy)), 5, (255, 0, 0), -1)
-        cv2.circle(result_img, (int(tip_x), int(tip_y)), 8, (0, 0, 255), -1)
         
-        cv2.imwrite(os.path.join(debug_dir, f"{timestamp}_3_result.jpg"), result_img)
-        logger.info(f"[SKELETON] tip=({tip_x:.1f}, {tip_y:.1f})")
+        cv2.imwrite(os.path.join(debug_dir, f"{timestamp}_4_result.jpg"), result_img)
     
     return result
