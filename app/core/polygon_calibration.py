@@ -418,3 +418,159 @@ def load_polygon_calibrations(file_path: str) -> int:
     except Exception as e:
         print(f"[CALIBRATION] Error loading calibrations: {e}")
         return 0
+"""
+Convert YOLO-detected calibration points to ordered 20-point polygons.
+
+YOLO detects ring intersection points, but they come in random order.
+This module sorts them into the correct clockwise order starting from
+the 20/1 segment boundary, matching the Autodarts format.
+"""
+
+import math
+from typing import List, Tuple, Dict, Any, Optional
+
+# Dartboard segment order (clockwise from top, starting at 20)
+SEGMENT_ORDER = [20, 1, 18, 4, 13, 6, 10, 15, 2, 17, 3, 19, 7, 16, 8, 11, 14, 9, 12, 5]
+
+
+def points_to_ordered_polygon(
+    points: List[Tuple[float, float, float]],  # (x, y, confidence)
+    center: Tuple[float, float],
+    twenty_angle_rad: float
+) -> List[Tuple[float, float]]:
+    """
+    Convert unordered ring points to ordered 20-point polygon.
+    
+    Args:
+        points: Detected points (x, y, confidence) - should have ~20 points
+        center: Dartboard center (x, y)
+        twenty_angle_rad: Angle to segment 20 center in radians
+        
+    Returns:
+        List of 20 (x, y) points, ordered clockwise from 20/1 boundary
+    """
+    if len(points) < 15:
+        # Not enough points - can't make a reliable polygon
+        return []
+    
+    # Calculate angle from center for each point
+    point_angles = []
+    for p in points:
+        x, y = p[0], p[1]
+        angle = math.atan2(y - center[1], x - center[0])
+        point_angles.append((angle, x, y, p[2]))  # (angle, x, y, conf)
+    
+    # Sort by angle
+    point_angles.sort(key=lambda pa: pa[0])
+    
+    # The 20/1 boundary is 9 degrees CCW from the 20 center
+    # (each segment is 18 degrees, so boundary is at segment_center - 9°)
+    boundary_20_1_rad = twenty_angle_rad - math.radians(9)
+    
+    # Normalize to [-pi, pi]
+    while boundary_20_1_rad > math.pi:
+        boundary_20_1_rad -= 2 * math.pi
+    while boundary_20_1_rad < -math.pi:
+        boundary_20_1_rad += 2 * math.pi
+    
+    # Find the point closest to the 20/1 boundary angle - this is our starting point
+    def angle_diff(a1, a2):
+        diff = abs(a1 - a2)
+        if diff > math.pi:
+            diff = 2 * math.pi - diff
+        return diff
+    
+    start_idx = 0
+    min_diff = float('inf')
+    for i, pa in enumerate(point_angles):
+        diff = angle_diff(pa[0], boundary_20_1_rad)
+        if diff < min_diff:
+            min_diff = diff
+            start_idx = i
+    
+    # Reorder starting from the 20/1 boundary point
+    ordered = point_angles[start_idx:] + point_angles[:start_idx]
+    
+    # If we have exactly 20 points, we're done
+    if len(ordered) == 20:
+        return [(p[1], p[2]) for p in ordered]
+    
+    # If we have more than 20, we need to pick the best 20
+    # Use angular spacing - expect points every 18 degrees
+    if len(ordered) > 20:
+        selected = []
+        expected_angles = []
+        for i in range(20):
+            expected = boundary_20_1_rad + math.radians(i * 18)
+            # Normalize
+            while expected > math.pi:
+                expected -= 2 * math.pi
+            while expected < -math.pi:
+                expected += 2 * math.pi
+            expected_angles.append(expected)
+        
+        # For each expected angle, find the closest detected point
+        used = set()
+        for exp_angle in expected_angles:
+            best_idx = -1
+            best_diff = float('inf')
+            for i, pa in enumerate(point_angles):
+                if i in used:
+                    continue
+                diff = angle_diff(pa[0], exp_angle)
+                if diff < best_diff:
+                    best_diff = diff
+                    best_idx = i
+            if best_idx >= 0:
+                used.add(best_idx)
+                selected.append((point_angles[best_idx][1], point_angles[best_idx][2]))
+        
+        return selected
+    
+    # If we have fewer than 20, interpolate missing points
+    # For now, just return what we have with a warning
+    print(f"Warning: Only {len(ordered)} points detected, expected 20")
+    return [(p[1], p[2]) for p in ordered]
+
+
+def generate_polygon_calibration_from_yolo(
+    cal_points: List[Tuple[float, float, float]],   # Outer double (board edge)
+    cal1_points: List[Tuple[float, float, float]],  # Outer triple
+    cal2_points: List[Tuple[float, float, float]],  # Inner double
+    cal3_points: List[Tuple[float, float, float]],  # Inner triple
+    center: Tuple[float, float],
+    twenty_angle_rad: float,
+    image_width: int = 1280,
+    image_height: int = 720
+) -> Dict[str, Any]:
+    """
+    Generate polygon calibration from YOLO-detected points.
+    
+    Maps YOLO classes to Autodarts polygon format:
+    - cal (class 3)  -> double_outers (board edge)
+    - cal1 (class 4) -> treble_outers (outer triple)
+    - cal2 (class 5) -> double_inners (inner double)
+    - cal3 (class 6) -> treble_inners (inner triple)
+    
+    Returns dict matching PolygonCalibration format.
+    """
+    double_outers = points_to_ordered_polygon(cal_points, center, twenty_angle_rad)
+    treble_outers = points_to_ordered_polygon(cal1_points, center, twenty_angle_rad)
+    double_inners = points_to_ordered_polygon(cal2_points, center, twenty_angle_rad)
+    treble_inners = points_to_ordered_polygon(cal3_points, center, twenty_angle_rad)
+    
+    return {
+        "bull": center,
+        "double_outers": double_outers,
+        "double_inners": double_inners,
+        "treble_outers": treble_outers,
+        "treble_inners": treble_inners,
+        "image_width": image_width,
+        "image_height": image_height,
+        "valid": (
+            len(double_outers) >= 18 and 
+            len(double_inners) >= 18 and
+            len(treble_outers) >= 18 and
+            len(treble_inners) >= 18
+        )
+    }

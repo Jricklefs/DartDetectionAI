@@ -29,6 +29,11 @@ from app.core.geometry import (
     SEGMENT_ANGLE_OFFSET,
 )
 from app.core.scoring import scoring_system
+from app.core.polygon_calibration import (
+    generate_polygon_calibration_from_yolo,
+    set_polygon_calibration,
+    PolygonCalibration,
+)
 from app.models.schemas import CameraCalibrationResult, DetectResponse, DartScore, DartPosition
 
 # Get the models directory
@@ -622,6 +627,45 @@ class DartboardCalibrator:
                 "quality": quality,
                 "segment_at_top": segment_at_top,
             }
+            
+            # === POLYGON CALIBRATION (Autodarts-style 20-point) ===
+            # Generate polygon calibration from the same YOLO-detected points
+            try:
+                twenty_angle_rad = math.radians(rotation_offset_deg)
+                polygon_data = generate_polygon_calibration_from_yolo(
+                    cal_points=cal_points,      # outer double (board edge)
+                    cal1_points=cal1_points,    # outer triple
+                    cal2_points=cal2_points,    # inner double  
+                    cal3_points=cal3_points,    # inner triple
+                    center=center,
+                    twenty_angle_rad=twenty_angle_rad,
+                    image_width=w,
+                    image_height=h
+                )
+                
+                # Add polygon data to calibration_data
+                calibration_data["polygon"] = polygon_data
+                
+                # Also store in global polygon calibrations for use during detection
+                if polygon_data.get("valid", False):
+                    poly_cal = PolygonCalibration(
+                        camera_id=camera_id,
+                        bull=center,
+                        double_outers=polygon_data["double_outers"],
+                        double_inners=polygon_data["double_inners"],
+                        treble_outers=polygon_data["treble_outers"],
+                        treble_inners=polygon_data["treble_inners"],
+                        image_width=w,
+                        image_height=h
+                    )
+                    set_polygon_calibration(camera_id, poly_cal)
+                    print(f"[CAL] Generated polygon calibration for camera {camera_id}: {len(polygon_data['double_outers'])} points per ring")
+                else:
+                    print(f"[CAL] Polygon calibration incomplete for camera {camera_id} - not enough points detected")
+                    
+            except Exception as e:
+                print(f"[CAL] Failed to generate polygon calibration: {e}")
+                calibration_data["polygon"] = None
             
             # Generate overlay image
             overlay = self._draw_calibration_overlay(
