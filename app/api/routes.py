@@ -1238,6 +1238,12 @@ class CameraInput(BaseModel):
     calibration: Optional[Dict[str, Any]] = None  # Made optional for backwards compat
 
 
+class BeforeImage(BaseModel):
+    """Before image for clean differential detection."""
+    camera_id: str
+    image: str  # Base64
+
+
 class DetectRequest(BaseModel):
     """Detection request with calibrations inline."""
     cameras: List[CameraInput]
@@ -1932,7 +1938,19 @@ async def detect_tips(
             })
         
         # Save benchmark data (including previous images for replay diff)
-        previous_imgs = get_previous_images(board_id)
+        # Prefer before_images from request (frame buffer) over cache
+        if request.before_images and len(request.before_images) > 0:
+            previous_imgs = {}
+            for bi in request.before_images:
+                try:
+                    img = decode_image(bi.image)
+                    previous_imgs[bi.camera_id] = img
+                except Exception as e:
+                    logger.warning(f"[BENCHMARK] Failed to decode before_image for {bi.camera_id}: {e}")
+            logger.debug(f"[BENCHMARK] Using {len(previous_imgs)} before_images from request frame buffer")
+        else:
+            previous_imgs = get_previous_images(board_id)
+            logger.debug(f"[BENCHMARK] Using cached previous images (no before_images in request)")
         benchmark_path = save_benchmark_data(
             dart_number=dart_number,
             request_id=request_id,

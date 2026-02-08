@@ -11,6 +11,23 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+# Detection method switching
+_DETECTION_METHOD = "skeleton"  # "yolo" or "skeleton"
+
+def set_detection_method(method: str) -> bool:
+    """Set the detection method (yolo or skeleton)."""
+    global _DETECTION_METHOD
+    if method.lower() in ("yolo", "skeleton"):
+        _DETECTION_METHOD = method.lower()
+        logger.info(f"Detection method set to: {_DETECTION_METHOD}")
+        return True
+    return False
+
+def get_detection_method() -> str:
+    """Get the current detection method."""
+    return _DETECTION_METHOD
+
+
 
 def find_skeleton_endpoints(skeleton):
     """Find endpoints (pixels with exactly 1 neighbor)."""
