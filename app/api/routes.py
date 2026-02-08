@@ -282,7 +282,8 @@ def save_benchmark_data(
     calibrations: Dict[str, Dict],  # camera_id -> calibration data
     timings: Dict[str, int],
     pipeline_data: Dict[str, Dict] = None,  # camera_id -> detailed pipeline info
-    baseline_images: Dict[str, np.ndarray] = None  # camera_id -> baseline image for diff
+    baseline_images: Dict[str, np.ndarray] = None,  # camera_id -> baseline image for diff
+    masks: Dict[str, np.ndarray] = None  # camera_id -> differential mask (for skeleton)
 ):
     """
     Save complete benchmark data for a dart detection.
@@ -314,6 +315,14 @@ def save_benchmark_data(
                     cv2.imwrite(str(dart_path / f"{cam_id}_previous.jpg"), img)
                 except Exception as e:
                     logger.warning(f"[BENCHMARK] Failed to save baseline image for {cam_id}: {e}")
+        
+        # Save differential masks (for skeleton detection replay)
+        if masks:
+            for cam_id, mask in masks.items():
+                try:
+                    cv2.imwrite(str(dart_path / f"{cam_id}_mask.png"), mask)
+                except Exception as e:
+                    logger.warning(f"[BENCHMARK] Failed to save mask for {cam_id}: {e}")
         
         # Save debug images (with annotations)
         for cam_id, img in debug_images.items():
@@ -1923,7 +1932,8 @@ async def detect_tips(
             calibrations=calibrations_used,
             timings=timings,
             pipeline_data=pipeline_data,
-            baseline_images=previous_imgs  # Actually "previous" images for diff
+            baseline_images=previous_imgs,  # Actually "previous" images for diff
+            masks=masks  # Differential masks for skeleton detection
         )
         
         # Store current images as "previous" for next dart
