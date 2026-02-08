@@ -4696,9 +4696,12 @@ async def test_polygon_scoring(request: dict):
 @router.post("/v1/benchmark/replay-polygon")
 async def replay_benchmark_with_polygon():
     """
-    Replay all benchmark darts using polygon calibration for scoring.
+    Replay benchmark darts comparing polygon vs ellipse scoring.
     
-    Compares polygon scoring to ellipse scoring to see if it improves accuracy.
+    For each dart:
+    1. Re-detect tip position from stored images
+    2. Score using BOTH ellipse and polygon calibration
+    3. Compare to corrected/original score
     """
     from pathlib import Path
     
@@ -4706,122 +4709,188 @@ async def replay_benchmark_with_polygon():
     try:
         load_polygon_calibrations(POLYGON_CALIBRATION_FILE)
     except:
-        # Try importing from Autodarts if no saved file
-        load_polygon_calibrations_from_autodarts(AUTODARTS_CONFIG_PATH)
+        try:
+            load_polygon_calibrations_from_autodarts(AUTODARTS_CONFIG_PATH)
+        except:
+            pass
     
-    calibrations = get_all_polygon_calibrations()
-    if not calibrations:
-        raise HTTPException(400, "No polygon calibrations available. Import from Autodarts first.")
+    poly_cals = get_all_polygon_calibrations()
+    if not poly_cals:
+        raise HTTPException(400, "No polygon calibrations available")
     
-    # Get all benchmark games
-    board_ids = [d.name for d in BENCHMARK_DIR.iterdir() if d.is_dir()]
+    # Map camera IDs - Autodarts uses "0","1","2", we use "cam0","cam1","cam2"
+    poly_cals_mapped = {}
+    for k, v in poly_cals.items():
+        poly_cals_mapped[f"cam{k}"] = v
+        poly_cals_mapped[k] = v  # Keep original too
     
     total_darts = 0
-    polygon_matches = 0
-    ellipse_matches = 0
-    improvements = 0  # Where polygon is correct but ellipse was wrong
-    regressions = 0   # Where ellipse was correct but polygon is wrong
+    polygon_correct = 0
+    ellipse_correct = 0
+    both_correct = 0
+    both_wrong = 0
+    polygon_better = 0  # polygon right, ellipse wrong
+    ellipse_better = 0  # ellipse right, polygon wrong
     
-    results = []
+    details = []
     
-    for board_id in board_ids:
-        board_dir = BENCHMARK_DIR / board_id
-        games = [d.name for d in board_dir.iterdir() if d.is_dir()]
+    # Process all benchmark games
+    for board_dir in BENCHMARK_DIR.iterdir():
+        if not board_dir.is_dir():
+            continue
         
-        for game_id in games:
-            game_dir = board_dir / game_id
-            
-            # Load metadata
-            meta_path = game_dir / "metadata.json"
-            if not meta_path.exists():
+        for game_dir in board_dir.iterdir():
+            if not game_dir.is_dir():
                 continue
             
-            with open(meta_path) as f:
-                metadata = json.load(f)
-            
-            stored_calibrations = metadata.get("calibrations", {})
-            
-            # Process each round
-            for round_name in sorted(game_dir.iterdir()):
-                if not round_name.is_dir():
+            for round_dir in game_dir.iterdir():
+                if not round_dir.is_dir():
                     continue
                 
-                for dart_dir in sorted(round_name.iterdir()):
+                for dart_dir in round_dir.iterdir():
                     if not dart_dir.is_dir():
                         continue
                     
-                    result_path = dart_dir / "result.json"
-                    if not result_path.exists():
+                    meta_path = dart_dir / "metadata.json"
+                    if not meta_path.exists():
                         continue
                     
-                    with open(result_path) as f:
-                        dart_result = json.load(f)
+                    with open(meta_path) as f:
+                        metadata = json.load(f)
                     
-                    # Get original/corrected score
-                    corrected = dart_result.get("corrected_score")
-                    original = dart_result.get("original_score", {})
-                    expected_score = corrected if corrected else original.get("score", 0)
+                    # Get expected score (corrected if exists, else original)
+                    correction_path = dart_dir / "correction.json"
+                    if correction_path.exists():
+                        with open(correction_path) as f:
+                            correction = json.load(f)
+                        expected = correction.get("correct_score", {})
+                    else:
+                        expected = metadata.get("final_result", {})
                     
-                    # Get tip positions from each camera
-                    camera_results = dart_result.get("camera_results", [])
+                    expected_segment = expected.get("segment", 0)
+                    expected_multiplier = expected.get("multiplier", 1)
+                    expected_score = expected_segment * expected_multiplier
+                    
+                    # Get stored calibrations
+                    stored_cals = metadata.get("calibrations", {})
+                    
+                    # For each camera, compare scoring
+                    camera_results = metadata.get("camera_results", [])
                     
                     for cam_result in camera_results:
-                        cam_id = cam_result.get("camera_id", "0")
-                        tip = cam_result.get("selected_tip")
+                        cam_id = cam_result.get("camera_id", "cam0")
                         
-                        if not tip:
+                        # Load image and re-detect tip
+                        raw_img_path = dart_dir / f"{cam_id}_raw.jpg"
+                        prev_img_path = dart_dir / f"{cam_id}_previous.jpg"
+                        
+                        if not raw_img_path.exists() or not prev_img_path.exists():
                             continue
                         
-                        x, y = tip.get("x", 0), tip.get("y", 0)
-                        
-                        # Score with polygon
-                        poly_cal = calibrations.get(cam_id)
-                        if poly_cal:
-                            poly_result = score_from_polygon_calibration((x, y), poly_cal)
-                            poly_score = poly_result.get("score", 0)
-                        else:
-                            poly_score = -1
-                        
-                        # Score with ellipse (existing method)
-                        ellipse_cal = stored_calibrations.get(cam_id, {})
-                        if ellipse_cal:
-                            ellipse_result = score_with_calibration({"x": x, "y": y}, ellipse_cal)
-                            ellipse_score = ellipse_result.get("score", 0)
-                        else:
-                            ellipse_score = -1
+                        # Re-detect using mask-based detection
+                        try:
+                            raw_img = cv2.imread(str(raw_img_path))
+                            prev_img = cv2.imread(str(prev_img_path))
+                            
+                            if raw_img is None or prev_img is None:
+                                continue
+                            
+                            # Simple frame diff to find dart region
+                            diff = cv2.absdiff(raw_img, prev_img)
+                            gray = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
+                            _, mask = cv2.threshold(gray, 20, 255, cv2.THRESH_BINARY)
+                            
+                            # Find contours
+                            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                            
+                            if not contours:
+                                continue
+                            
+                            # Find largest contour, get centroid
+                            largest = max(contours, key=cv2.contourArea)
+                            M = cv2.moments(largest)
+                            if M["m00"] == 0:
+                                continue
+                            
+                            tip_x = M["m10"] / M["m00"]
+                            tip_y = M["m01"] / M["m00"]
+                            
+                        except Exception as e:
+                            continue
                         
                         total_darts += 1
                         
-                        poly_correct = (poly_score == expected_score)
-                        ellipse_correct = (ellipse_score == expected_score)
+                        # Score with ellipse (existing method)
+                        ellipse_cal = stored_cals.get(cam_id, {})
+                        if ellipse_cal:
+                            ellipse_result = score_with_calibration({"x": tip_x, "y": tip_y}, ellipse_cal)
+                            ellipse_score_val = ellipse_result.get("score", 0)
+                        else:
+                            ellipse_score_val = -1
                         
-                        if poly_correct:
-                            polygon_matches += 1
-                        if ellipse_correct:
-                            ellipse_matches += 1
+                        # Score with polygon
+                        poly_cal = poly_cals_mapped.get(cam_id)
+                        if poly_cal:
+                            poly_result = score_from_polygon_calibration((tip_x, tip_y), poly_cal)
+                            poly_score_val = poly_result.get("score", 0)
+                        else:
+                            poly_score_val = -1
                         
-                        if poly_correct and not ellipse_correct:
-                            improvements += 1
-                        if ellipse_correct and not poly_correct:
-                            regressions += 1
+                        # Compare
+                        ellipse_match = (ellipse_score_val == expected_score)
+                        polygon_match = (poly_score_val == expected_score)
+                        
+                        if ellipse_match:
+                            ellipse_correct += 1
+                        if polygon_match:
+                            polygon_correct += 1
+                        
+                        if ellipse_match and polygon_match:
+                            both_correct += 1
+                        elif not ellipse_match and not polygon_match:
+                            both_wrong += 1
+                        elif polygon_match and not ellipse_match:
+                            polygon_better += 1
+                            details.append({
+                                "dart": str(dart_dir.name),
+                                "cam": cam_id,
+                                "expected": expected_score,
+                                "polygon": poly_score_val,
+                                "ellipse": ellipse_score_val,
+                                "winner": "polygon"
+                            })
+                        elif ellipse_match and not polygon_match:
+                            ellipse_better += 1
+                            details.append({
+                                "dart": str(dart_dir.name),
+                                "cam": cam_id,
+                                "expected": expected_score,
+                                "polygon": poly_score_val,
+                                "ellipse": ellipse_score_val,
+                                "winner": "ellipse"
+                            })
     
-    polygon_accuracy = (polygon_matches / total_darts * 100) if total_darts > 0 else 0
-    ellipse_accuracy = (ellipse_matches / total_darts * 100) if total_darts > 0 else 0
+    polygon_accuracy = (polygon_correct / total_darts * 100) if total_darts > 0 else 0
+    ellipse_accuracy = (ellipse_correct / total_darts * 100) if total_darts > 0 else 0
     
     return {
         "total_darts": total_darts,
         "polygon": {
-            "matches": polygon_matches,
+            "correct": polygon_correct,
             "accuracy": round(polygon_accuracy, 1)
         },
         "ellipse": {
-            "matches": ellipse_matches,
+            "correct": ellipse_correct, 
             "accuracy": round(ellipse_accuracy, 1)
         },
         "comparison": {
-            "improvements": improvements,
-            "regressions": regressions,
-            "net_improvement": improvements - regressions,
-            "recommendation": "polygon" if improvements > regressions else "ellipse"
-        }
+            "both_correct": both_correct,
+            "both_wrong": both_wrong,
+            "polygon_better": polygon_better,
+            "ellipse_better": ellipse_better,
+            "net_improvement": polygon_better - ellipse_better,
+            "recommendation": "polygon" if polygon_better > ellipse_better else "ellipse"
+        },
+        "details": details[:20]  # First 20 disagreements
     }
+
