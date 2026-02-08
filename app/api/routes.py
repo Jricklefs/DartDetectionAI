@@ -4789,7 +4789,7 @@ async def replay_benchmark_with_polygon():
                         
                         # Use stored tip position from debug info
                         try:
-                            debug_info = metadata.get("debug", {}).get(cam_id, {})
+                            debug_info = metadata.get("pipeline", {}).get(cam_id, {})
                             selected_tip = debug_info.get("selected_tip", {})
                             
                             if not selected_tip:
