@@ -102,49 +102,113 @@ def detect_dart_skeleton(
             result["confidence"] = 0.3
         return result
     
-    # 6. Fit line to skeleton
+    # 6. Fit line to skeleton to get dart axis direction
     # Convert to (x, y) format for cv2.fitLine
     points_xy = skel_points[:, ::-1].astype(np.float32)  # (x, y)
     
     try:
-        vx, vy, x0, y0 = cv2.fitLine(points_xy, cv2.DIST_L2, 0, 0.01, 0.01).flatten()
+        line_params = cv2.fitLine(points_xy, cv2.DIST_L2, 0, 0.01, 0.01).flatten()
+        vx, vy, x0, y0 = line_params
     except:
-        # Fallback
+        # Fallback to centroid
         M = cv2.moments(dart_contour)
         if M["m00"] > 0:
-            cx = M["m10"] / M["m00"]
-            cy = M["m01"] / M["m00"]
-            result["tip"] = (cx, cy)
+            cx_contour = M["m10"] / M["m00"]
+            cy_contour = M["m01"] / M["m00"]
+            result["tip"] = (cx_contour, cy_contour)
             result["confidence"] = 0.3
         return result
     
-    # 7. Find the point on skeleton closest to board center
-    # (the tip is the end pointing toward the center)
+    # 7. Find the two endpoints of the skeleton along the fitted line
+    # Project all skeleton points onto the line direction
     cx, cy = center
     
-    # Calculate distance from each skeleton point to center
-    distances = np.sqrt((points_xy[:, 0] - cx)**2 + (points_xy[:, 1] - cy)**2)
+    # Line direction vector (normalized)
+    line_vec = np.array([vx, vy])
+    line_vec = line_vec / np.linalg.norm(line_vec)
     
-    # The tip is the skeleton point closest to center
-    tip_idx = np.argmin(distances)
-    tip_x, tip_y = points_xy[tip_idx]
+    # Project each skeleton point onto the line
+    projections = []
+    for pt in points_xy:
+        # Vector from line point to skeleton point
+        diff = pt - np.array([x0, y0])
+        proj_dist = np.dot(diff, line_vec)
+        projections.append(proj_dist)
     
-    # Refine tip position using contour
-    # Find contour point closest to the skeleton tip
-    contour_points = dart_contour.reshape(-1, 2)
-    contour_dists = np.sqrt((contour_points[:, 0] - tip_x)**2 + (contour_points[:, 1] - tip_y)**2)
-    closest_contour_idx = np.argmin(contour_dists)
-    refined_tip = contour_points[closest_contour_idx]
+    projections = np.array(projections)
+    
+    # Find the two extreme points (endpoints of skeleton)
+    min_idx = np.argmin(projections)
+    max_idx = np.argmax(projections)
+    
+    endpoint1 = points_xy[min_idx]
+    endpoint2 = points_xy[max_idx]
+    
+    # 8. The TIP is the endpoint CLOSER to the board center
+    dist1 = np.sqrt((endpoint1[0] - cx)**2 + (endpoint1[1] - cy)**2)
+    dist2 = np.sqrt((endpoint2[0] - cx)**2 + (endpoint2[1] - cy)**2)
+    
+    if dist1 < dist2:
+        tip_endpoint = endpoint1
+    else:
+        tip_endpoint = endpoint2
+    
+    # 9. EXTEND the line beyond the detected contour toward board center
+    # The actual metal tip is not visible in frame diff - extend ~40px along dart axis
+    
+    # Direction from flight toward tip (toward center)
+    if dist1 < dist2:
+        # endpoint1 is closer to center, endpoint2 is flight
+        tip_direction = endpoint1 - endpoint2
+    else:
+        # endpoint2 is closer to center, endpoint1 is flight  
+        tip_direction = endpoint2 - endpoint1
+    
+    # Normalize direction
+    dir_len = np.linalg.norm(tip_direction)
+    if dir_len > 0:
+        tip_direction = tip_direction / dir_len
+    
+    # Extend 40 pixels beyond the detected endpoint toward center
+    extension_px = 40
+    extended_tip = tip_endpoint + tip_direction * extension_px
+    
+    # Make sure we don't go past the center
+    dist_to_center = np.sqrt((extended_tip[0] - cx)**2 + (extended_tip[1] - cy)**2)
+    if dist_to_center < 20:  # Too close to center, pull back
+        extended_tip = tip_endpoint + tip_direction * (extension_px / 2)
+    
+    refined_tip = extended_tip
     
     result["tip"] = (float(refined_tip[0]), float(refined_tip[1]))
     result["confidence"] = 0.7
     
+    # Always save debug images for now (to diagnose issues)
+    import os
+    from datetime import datetime
+    debug_dir = r"C:\Users\clawd\DartDetectionAI\skeleton_debug"
+    os.makedirs(debug_dir, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    
+    # Save diff mask
+    cv2.imwrite(os.path.join(debug_dir, f"{timestamp}_1_diff.jpg"), thresh)
+    
+    # Save skeleton
+    cv2.imwrite(os.path.join(debug_dir, f"{timestamp}_2_skeleton.jpg"), skeleton)
+    
+    # Save visualization with contour and detected tip
+    debug_img = current_frame.copy()
+    cv2.drawContours(debug_img, [dart_contour], -1, (0, 255, 0), 2)
+    cv2.circle(debug_img, (int(refined_tip[0]), int(refined_tip[1])), 8, (0, 0, 255), -1)  # Red = detected tip
+    cv2.circle(debug_img, (int(cx), int(cy)), 8, (255, 0, 0), -1)  # Blue = center
+    # Draw skeleton points
+    for pt in points_xy[:20]:  # First 20 skeleton points
+        cv2.circle(debug_img, (int(pt[0]), int(pt[1])), 2, (0, 255, 255), -1)  # Yellow
+    cv2.imwrite(os.path.join(debug_dir, f"{timestamp}_3_result.jpg"), debug_img)
+    
+    print(f"[SKELETON] Debug saved: {timestamp}, tip=({refined_tip[0]:.1f}, {refined_tip[1]:.1f})")
+    
     if debug:
-        # Draw debug visualization
-        debug_img = current_frame.copy()
-        cv2.drawContours(debug_img, [dart_contour], -1, (0, 255, 0), 2)
-        cv2.circle(debug_img, (int(refined_tip[0]), int(refined_tip[1])), 5, (0, 0, 255), -1)
-        cv2.circle(debug_img, (int(cx), int(cy)), 5, (255, 0, 0), -1)
         result["debug"]["visualization"] = debug_img
     
     return result
