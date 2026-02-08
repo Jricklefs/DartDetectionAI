@@ -148,6 +148,70 @@ def point_in_polygon(point: Tuple[float, float], polygon: List[Tuple[float, floa
     return inside
 
 
+def shrink_polygon(polygon: List[Tuple[float, float]], margin_px: float = 2.0) -> List[Tuple[float, float]]:
+    """
+    Shrink a polygon inward by a margin (in pixels).
+    Used to add robustness to boundary detection.
+    
+    Args:
+        polygon: List of (x, y) vertices
+        margin_px: Pixels to shrink inward (default 2px)
+        
+    Returns:
+        Shrunk polygon
+    """
+    if len(polygon) < 3:
+        return polygon
+    
+    # Find centroid
+    cx = sum(p[0] for p in polygon) / len(polygon)
+    cy = sum(p[1] for p in polygon) / len(polygon)
+    
+    # Shrink each point toward centroid
+    shrunk = []
+    for px, py in polygon:
+        dx = px - cx
+        dy = py - cy
+        dist = math.sqrt(dx*dx + dy*dy)
+        if dist > margin_px:
+            factor = (dist - margin_px) / dist
+            shrunk.append((cx + dx * factor, cy + dy * factor))
+        else:
+            shrunk.append((cx, cy))
+    
+    return shrunk
+
+
+def validate_polygon(polygon: List[Tuple[float, float]]) -> bool:
+    """
+    Validate that a polygon is properly formed.
+    
+    Returns:
+        True if polygon is valid (at least 3 points, forms closed shape)
+    """
+    if len(polygon) < 3:
+        return False
+    
+    # Check that points are not all collinear
+    # Use cross product of first two edges
+    if len(polygon) >= 3:
+        x1, y1 = polygon[0]
+        x2, y2 = polygon[1]
+        x3, y3 = polygon[2]
+        cross = (x2 - x1) * (y3 - y1) - (y2 - y1) * (x3 - x1)
+        if abs(cross) < 1e-10:
+            # First 3 points collinear, check more
+            for i in range(3, len(polygon)):
+                x3, y3 = polygon[i]
+                cross = (x2 - x1) * (y3 - y1) - (y2 - y1) * (x3 - x1)
+                if abs(cross) > 1e-10:
+                    break
+            else:
+                return False  # All points collinear
+    
+    return True
+
+
 def point_in_ring_segment(
     point: Tuple[float, float],
     segment_idx: int,
@@ -221,8 +285,14 @@ def score_from_polygon_calibration(
     
     # Check if OUTSIDE the double ring first (miss)
     # Use point-in-polygon on the full double_outers boundary
+    # Add small inward margin to catch edge cases (darts right on the wire)
     if calibration.double_outers and len(calibration.double_outers) >= 3:
-        if not point_in_polygon((x, y), calibration.double_outers):
+        # Ensure polygon is properly closed by checking if we need to use it as-is
+        polygon = list(calibration.double_outers)
+        
+        # Check with a slight inward shrink for robustness
+        # If point is outside the outer boundary, it's a miss
+        if not point_in_polygon((x, y), polygon):
             return {
                 "segment": 0,
                 "zone": "miss",

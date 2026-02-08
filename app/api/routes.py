@@ -4838,8 +4838,11 @@ async def replay_benchmark_with_polygon():
                         elif polygon_match and not ellipse_match:
                             polygon_better += 1
                             details.append({
+                                "game": game_dir.name[:8],
+                                "round": round_dir.name,
                                 "dart": str(dart_dir.name),
                                 "cam": cam_id,
+                                "tip_px": (tip_x, tip_y),
                                 "expected": expected_score,
                                 "polygon": poly_score_val,
                                 "ellipse": ellipse_score_val,
@@ -4848,8 +4851,11 @@ async def replay_benchmark_with_polygon():
                         elif ellipse_match and not polygon_match:
                             ellipse_better += 1
                             details.append({
+                                "game": game_dir.name[:8],
+                                "round": round_dir.name,
                                 "dart": str(dart_dir.name),
                                 "cam": cam_id,
+                                "tip_px": (tip_x, tip_y),
                                 "expected": expected_score,
                                 "polygon": poly_score_val,
                                 "ellipse": ellipse_score_val,
