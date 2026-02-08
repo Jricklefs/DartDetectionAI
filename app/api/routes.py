@@ -4787,33 +4787,19 @@ async def replay_benchmark_with_polygon():
                         if not raw_img_path.exists() or not prev_img_path.exists():
                             continue
                         
-                        # Re-detect using mask-based detection
+                        # Use stored tip position from debug info
                         try:
-                            raw_img = cv2.imread(str(raw_img_path))
-                            prev_img = cv2.imread(str(prev_img_path))
+                            debug_info = metadata.get("debug", {}).get(cam_id, {})
+                            selected_tip = debug_info.get("selected_tip", {})
                             
-                            if raw_img is None or prev_img is None:
+                            if not selected_tip:
                                 continue
                             
-                            # Simple frame diff to find dart region
-                            diff = cv2.absdiff(raw_img, prev_img)
-                            gray = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
-                            _, mask = cv2.threshold(gray, 20, 255, cv2.THRESH_BINARY)
+                            tip_x = selected_tip.get("x_px")
+                            tip_y = selected_tip.get("y_px")
                             
-                            # Find contours
-                            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                            
-                            if not contours:
+                            if tip_x is None or tip_y is None:
                                 continue
-                            
-                            # Find largest contour, get centroid
-                            largest = max(contours, key=cv2.contourArea)
-                            M = cv2.moments(largest)
-                            if M["m00"] == 0:
-                                continue
-                            
-                            tip_x = M["m10"] / M["m00"]
-                            tip_y = M["m01"] / M["m00"]
                             
                         except Exception as e:
                             continue
