@@ -1,57 +1,48 @@
-#!/usr/bin/env python3
-"""
-Dart tip detection using medial axis + local width.
-The TIP is the narrowest part of the skeleton.
-"""
-
 import cv2
 import numpy as np
 import os
-import logging
 
-logger = logging.getLogger(__name__)
-
-# Detection method switching
-_DETECTION_METHOD = "skeleton"  # "yolo" or "skeleton"
+# Current detection method: 'skeleton' (legacy) or 'hough' (new)
+_detection_method = "hough"
 
 def set_detection_method(method: str) -> bool:
-    """Set the detection method (yolo or skeleton)."""
-    global _DETECTION_METHOD
-    if method.lower() in ("yolo", "skeleton"):
-        _DETECTION_METHOD = method.lower()
-        logger.info(f"Detection method set to: {_DETECTION_METHOD}")
+    """Set the detection method to use."""
+    global _detection_method
+    if method in ("skeleton", "hough", "yolo"):
+        _detection_method = method
         return True
     return False
 
 def get_detection_method() -> str:
     """Get the current detection method."""
-    return _DETECTION_METHOD
-
-
+    return _detection_method
 
 def find_skeleton_endpoints(skeleton):
-    """Find endpoints (pixels with exactly 1 neighbor)."""
+    """Find endpoints of a skeletonized line (pixels with 1 neighbor)."""
     skel = (skeleton > 0).astype(np.uint8)
-    kernel = np.array([[1, 1, 1],
-                       [1, 0, 1],
-                       [1, 1, 1]], dtype=np.uint8)
+    kernel = np.array([[1, 1, 1], [1, 0, 1], [1, 1, 1]], dtype=np.uint8)
     neighbor_count = cv2.filter2D(skel, -1, kernel)
     endpoints = np.where((skel == 1) & (neighbor_count == 1))
-    return list(zip(endpoints[1], endpoints[0]))  # (x, y)
+    return list(zip(endpoints[1], endpoints[0]))
 
 
-def detect_dart_skeleton(
+def detect_dart_hough(
     current_frame: np.ndarray,
     previous_frame: np.ndarray,
     center: tuple = None,
     mask: np.ndarray = None,
-    debug: bool = True
+    debug: bool = False
 ) -> dict:
     """
-    Detect dart tip using skeleton + distance transform.
-    The tip is at the skeleton endpoint with MINIMUM width.
+    Detect dart tip using Hough line detection on Canny edges.
+    
+    Algorithm:
+    1. Canny edge detection on frame diff (captures dart shaft)
+    2. Hough line transform to find line segments
+    3. Filter for lines pointing toward board center
+    4. Extrapolate along line direction until diff signal ends
     """
-    result = {"tip": None, "confidence": 0.0, "method": "skeleton_width"}
+    result = {"tip": None, "confidence": 0.0, "method": "hough"}
     
     if current_frame is None or previous_frame is None:
         return result
@@ -61,79 +52,146 @@ def detect_dart_skeleton(
     
     cx, cy = center
     
-    # 1. Get differential mask
-    if mask is not None:
-        thresh = np.where(mask == 76, 255, 0).astype(np.uint8)
+    # 1. Compute frame difference
+    diff = cv2.absdiff(current_frame, previous_frame)
+    gray_diff = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
+    
+    # 2. Motion mask for region of interest
+    _, motion_mask = cv2.threshold(gray_diff, 20, 255, cv2.THRESH_BINARY)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    motion_mask = cv2.dilate(motion_mask, kernel, iterations=1)
+    
+    # 3. Canny edges (low thresholds to catch faint dart shaft)
+    edges = cv2.Canny(gray_diff, 15, 50)
+    edges_masked = cv2.bitwise_and(edges, motion_mask)
+    
+    # 4. Hough line detection
+    lines = cv2.HoughLinesP(edges_masked, 
+                             rho=1, 
+                             theta=np.pi/180, 
+                             threshold=30,
+                             minLineLength=50,
+                             maxLineGap=10)
+    
+    if lines is None:
+        return result
+    
+    # 5. Filter for dart-like lines
+    dart_lines = []
+    for line in lines:
+        x1, y1, x2, y2 = line[0]
+        length = np.sqrt((x2-x1)**2 + (y2-y1)**2)
+        
+        # Angle from horizontal (0-90 degrees)
+        angle = abs(np.arctan2(y2-y1, x2-x1) * 180 / np.pi)
+        if angle > 90:
+            angle = 180 - angle
+        
+        # Skip nearly horizontal lines (not dart-like)
+        if angle < 30:
+            continue
+        
+        # Check if line points toward center
+        mid_x, mid_y = (x1 + x2) / 2, (y1 + y2) / 2
+        to_center = np.array([cx - mid_x, cy - mid_y])
+        to_center_len = np.linalg.norm(to_center)
+        if to_center_len < 1:
+            continue
+        to_center_norm = to_center / to_center_len
+        
+        line_dir = np.array([x2 - x1, y2 - y1])
+        line_len = np.linalg.norm(line_dir)
+        if line_len < 1:
+            continue
+        line_dir_norm = line_dir / line_len
+        
+        alignment = abs(np.dot(to_center_norm, line_dir_norm))
+        if alignment < 0.5:
+            continue
+        
+        dart_lines.append((x1, y1, x2, y2, length, alignment))
+    
+    if not dart_lines:
+        return result
+    
+    # 6. Select best line (longest that points at center)
+    best = max(dart_lines, key=lambda l: l[4] * l[5])
+    x1, y1, x2, y2, length, alignment = best
+    
+    # 7. Determine which endpoint is toward the tip (closer to center)
+    d1 = np.sqrt((x1 - cx)**2 + (y1 - cy)**2)
+    d2 = np.sqrt((x2 - cx)**2 + (y2 - cy)**2)
+    
+    if d1 < d2:
+        tip_end = np.array([x1, y1], dtype=float)
+        flight_end = np.array([x2, y2], dtype=float)
     else:
-        diff = cv2.absdiff(current_frame, previous_frame)
-        gray_diff = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
-        _, thresh = cv2.threshold(gray_diff, 20, 255, cv2.THRESH_BINARY)
+        tip_end = np.array([x2, y2], dtype=float)
+        flight_end = np.array([x1, y1], dtype=float)
     
-    # 2. Morphology cleanup
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
-    thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
+    dart_dir = tip_end - flight_end
+    dart_dir = dart_dir / (np.linalg.norm(dart_dir) + 1e-6)
     
-    # 3. Find contours - get most elongated
-    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # 8. Extrapolate along line until diff signal ends
+    extended_tip = tip_end.copy()
     
-    if not contours:
-        return result
-    
-    best_contour = None
-    best_aspect = 0
-    
-    for contour in contours:
-        area = cv2.contourArea(contour)
-        if area < 200 or area > 50000:
-            continue
+    for step in range(1, 150):
+        test_point = tip_end + dart_dir * step
+        tx, ty = int(test_point[0]), int(test_point[1])
         
-        rect = cv2.minAreaRect(contour)
-        w, h = rect[1]
-        if w == 0 or h == 0:
-            continue
+        if tx < 0 or tx >= gray_diff.shape[1] or ty < 0 or ty >= gray_diff.shape[0]:
+            break
         
-        aspect = max(w, h) / min(w, h)
-        if aspect > best_aspect:
-            best_aspect = aspect
-            best_contour = contour
+        # Sample diff intensity in small neighborhood
+        y_lo = max(0, ty - 3)
+        y_hi = min(gray_diff.shape[0], ty + 4)
+        x_lo = max(0, tx - 3)
+        x_hi = min(gray_diff.shape[1], tx + 4)
+        
+        local_diff = gray_diff[y_lo:y_hi, x_lo:x_hi]
+        max_diff = np.max(local_diff)
+        
+        if max_diff < 10:
+            extended_tip = tip_end + dart_dir * max(0, step - 1)
+            break
+        else:
+            extended_tip = test_point
     
-    if best_contour is None or best_aspect < 2.0:
-        return result
+    result["tip"] = (float(extended_tip[0]), float(extended_tip[1]))
+    result["confidence"] = min(1.0, alignment * (length / 100.0))
+    result["line"] = (x1, y1, x2, y2)
     
-    # 4. Simple approach: Find contour point closest to board center
-    # The tip is always the point closest to where it hits the board
-    contour_points = best_contour.reshape(-1, 2)
-    
-    # Calculate distance from each contour point to board center
-    distances = np.sqrt((contour_points[:, 0] - cx)**2 + (contour_points[:, 1] - cy)**2)
-    closest_idx = np.argmin(distances)
-    tip_x, tip_y = float(contour_points[closest_idx][0]), float(contour_points[closest_idx][1])
-    
-    # Confidence based on aspect ratio (more elongated = more confident)
-    result["confidence"] = min(1.0, best_aspect / 5.0)  # Max confidence at aspect 5:1
-    result["tip"] = (tip_x, tip_y)
-    
-    # Keep skeleton stuff for debug compatibility
-    endpoint_widths = []
-    endpoints = [(int(tip_x), int(tip_y))]
-    
-    # Debug - simplified for contour-based approach
+    # Debug output
     if debug:
-        debug_dir = r"C:\Users\clawd\DartDetectionAI\skeleton_debug"
+        debug_dir = r"C:\Users\clawd\DartDetectionAI\hough_debug"
         os.makedirs(debug_dir, exist_ok=True)
         from datetime import datetime
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         
-        cv2.imwrite(os.path.join(debug_dir, f"{timestamp}_1_thresh.jpg"), thresh)
-        
         result_img = current_frame.copy()
-        cv2.drawContours(result_img, [best_contour], -1, (0, 255, 0), 2)
-        
-        # Mark tip
-        cv2.circle(result_img, (int(tip_x), int(tip_y)), 8, (0, 0, 255), -1)  # Red=tip
-        cv2.circle(result_img, (int(cx), int(cy)), 5, (255, 0, 0), -1)  # Blue=center
-        
-        cv2.imwrite(os.path.join(debug_dir, f"{timestamp}_2_result.jpg"), result_img)
+        cv2.line(result_img, (int(flight_end[0]), int(flight_end[1])),
+                 (int(extended_tip[0]), int(extended_tip[1])), (0, 255, 0), 2)
+        cv2.circle(result_img, (int(extended_tip[0]), int(extended_tip[1])), 8, (0, 0, 255), -1)
+        cv2.circle(result_img, (cx, cy), 5, (255, 0, 0), -1)
+        cv2.imwrite(os.path.join(debug_dir, f"{timestamp}_result.jpg"), result_img)
     
     return result
+
+
+def detect_dart_skeleton(
+    current_frame: np.ndarray,
+    previous_frame: np.ndarray,
+    center: tuple = None,
+    mask: np.ndarray = None,
+    debug: bool = False
+) -> dict:
+    """
+    Main entry point - dispatches to appropriate detection method.
+    """
+    method = get_detection_method()
+    
+    if method == "hough":
+        return detect_dart_hough(current_frame, previous_frame, center, mask, debug)
+    else:
+        # Legacy skeleton method (mostly for backwards compat)
+        return detect_dart_hough(current_frame, previous_frame, center, mask, debug)
