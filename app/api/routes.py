@@ -2421,7 +2421,7 @@ def vote_on_scores(clusters: List[List[dict]]) -> List[DetectedTip]:
             zone = tip.get('zone', '')
             if zone in ('single_outer', 'double'):
                 # Outer zones - might be tip detection failure
-                zone_factor = 0.7  # Slight reduction
+                zone_factor = 0.3  # Slight reduction
             else:
                 zone_factor = 1.0
             weight *= zone_factor
