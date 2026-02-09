@@ -2416,6 +2416,16 @@ def vote_on_scores(clusters: List[List[dict]]) -> List[DetectedTip]:
                     boundary_factor = min(1.5, boundary_factor)
                 weight *= boundary_factor
             
+            # ZONE PLAUSIBILITY: outer zones suggest tip found too far from center
+            # This is a common failure mode - finding dart body instead of tip
+            zone = tip.get('zone', '')
+            if zone in ('single_outer', 'double'):
+                # Outer zones - might be tip detection failure
+                zone_factor = 0.7  # Slight reduction
+            else:
+                zone_factor = 1.0
+            weight *= zone_factor
+            
             votes[key] = votes.get(key, 0.0) + weight
             total_confidence += weight
             
@@ -2428,7 +2438,8 @@ def vote_on_scores(clusters: List[List[dict]]) -> List[DetectedTip]:
                 'boundary_dist': boundary_dist,
                 'in_new': tip.get('found_in_new_region', True),
                 'cal_quality': cal_quality,
-                'view_quality': view_quality
+                'view_quality': view_quality,
+                'zone': zone
             })
         
         # Find initial winning vote from weighted voting (always needed)
