@@ -1547,9 +1547,10 @@ async def detect_tips(
                             "x_px": tip_x,
                             "y_px": tip_y,
                             "confidence": skel_result.get("confidence", 0.5),
-                            "method": "skeleton"
+                            "method": "skeleton",
+                            "view_quality": skel_result.get("view_quality", 0.5)
                         }]
-                        logger.info(f"[DETECT] Skeleton found tip at ({tip_x:.1f}, {tip_y:.1f})")
+                        logger.info(f"[DETECT] Skeleton found tip at ({tip_x:.1f}, {tip_y:.1f}) view_quality={skel_result.get('view_quality', 0.5):.2f}")
                     else:
                         tips = []
                         logger.info(f"[DETECT] Skeleton found no tip")
@@ -2388,6 +2389,12 @@ def vote_on_scores(clusters: List[List[dict]]) -> List[DetectedTip]:
             quality_factor = 0.5 + cal_quality  # 0 quality = 0.5x, 1.0 quality = 1.5x
             weight *= quality_factor
             
+            # VIEW QUALITY WEIGHTING: Higher aspect ratio = better view of dart
+            # Cameras seeing dart from side (elongated) are more reliable
+            view_quality = tip.get('view_quality', 0.5)
+            view_factor = 0.5 + view_quality  # 0 quality = 0.5x, 1.0 quality = 1.5x
+            weight *= view_factor
+            
             # MAJOR weight reduction for tips NOT found in NEW region
             if not tip.get('found_in_new_region', True):
                 weight *= 0.1
@@ -2420,7 +2427,8 @@ def vote_on_scores(clusters: List[List[dict]]) -> List[DetectedTip]:
                 'weight': weight,
                 'boundary_dist': boundary_dist,
                 'in_new': tip.get('found_in_new_region', True),
-                'cal_quality': cal_quality
+                'cal_quality': cal_quality,
+                'view_quality': view_quality
             })
         
         # Find initial winning vote from weighted voting (always needed)
