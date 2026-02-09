@@ -3043,6 +3043,7 @@ async def get_benchmark_image(board_id: str, game_id: str, round_name: str, dart
 class ReplayRequest(BaseModel):
     dart_path: str  # Path to dart folder
     rescore_only: bool = False  # If true, use saved tip locations instead of re-detecting
+    method: str = "yolo"  # Detection method: yolo, skeleton, hough
 
 
 class ReplayAllRequest(BaseModel):
@@ -3050,6 +3051,7 @@ class ReplayAllRequest(BaseModel):
     limit: int = 100  # Max darts to replay
     rescore_only: bool = False  # If true, use saved tip locations
     game_id: str = None  # Optional: limit to specific game
+    method: str = "yolo"  # Detection method: yolo, skeleton, hough
 
 
 @router.post("/v1/benchmark/replay")
@@ -3138,35 +3140,56 @@ async def replay_single_dart(request: ReplayRequest):
             tip_x, tip_y = selected.get("x_px"), selected.get("y_px")
             tip_confidence = selected.get("confidence", 0)
         else:
-            # Re-run YOLO tip detection
-            tips = calibrator.tip_detector.detect_tips(img, confidence_threshold=CONFIDENCE_THRESHOLD)
+            # Re-run tip detection using requested method
+            tip_x, tip_y, tip_confidence = None, None, 0
             
-            if not tips:
-                continue
-            
-            # If we have baseline, use mask to filter for NEW dart only
-            if cam_id in baselines:
+            if request.method in ("skeleton", "hough") and cam_id in baselines:
+                # Use classical CV detection
                 baseline = baselines[cam_id]
-                # Compute diff mask
-                diff = cv2.absdiff(img, baseline)
-                gray_diff = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
-                _, mask = cv2.threshold(gray_diff, 40, 255, cv2.THRESH_BINARY)
+                center = (cal.get("center", [img.shape[1]//2, img.shape[0]//2]))
+                center = (int(center[0]), int(center[1]))
                 
-                # Filter tips to only those in the NEW region
+                if request.method == "hough":
+                    from app.core.skeleton_detection import detect_dart_hough
+                    result = detect_dart_hough(img, baseline, center=center, debug=False)
+                else:
+                    from app.core.skeleton_detection import detect_dart_skeleton
+                    result = detect_dart_skeleton(img, baseline, center=center)
+                
+                if result.get("tip"):
+                    tip_x, tip_y = result["tip"]
+                    tip_confidence = result.get("confidence", 0.5)
+            
+            # Fall back to YOLO if no tip found or YOLO method requested
+            if tip_x is None:
+                tips = calibrator.tip_detector.detect_tips(img, confidence_threshold=CONFIDENCE_THRESHOLD)
+                
+                if not tips:
+                    continue
+                
+                # If we have baseline, use mask to filter for NEW dart only
                 filtered_tips = []
-                for tip in tips:
-                    tx, ty = int(tip.x), int(tip.y)
-                    if 0 <= ty < mask.shape[0] and 0 <= tx < mask.shape[1]:
-                        if mask[ty, tx] > 0:
-                            filtered_tips.append(tip)
+                if cam_id in baselines:
+                    baseline = baselines[cam_id]
+                    # Compute diff mask
+                    diff = cv2.absdiff(img, baseline)
+                    gray_diff = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
+                    _, mask = cv2.threshold(gray_diff, 40, 255, cv2.THRESH_BINARY)
+                    
+                    # Filter tips to only those in the NEW region
+                    for tip in tips:
+                        tx, ty = int(tip.x), int(tip.y)
+                        if 0 <= ty < mask.shape[0] and 0 <= tx < mask.shape[1]:
+                            if mask[ty, tx] > 0:
+                                filtered_tips.append(tip)
                 
                 if filtered_tips:
                     tips = filtered_tips
-            
-            # Use highest confidence tip from filtered set
-            best_tip = max(tips, key=lambda t: t.confidence)
-            tip_x, tip_y = best_tip.x, best_tip.y
-            tip_confidence = best_tip.confidence
+                
+                # Use highest confidence tip from filtered set
+                best_tip = max(tips, key=lambda t: t.confidence)
+                tip_x, tip_y = best_tip.x, best_tip.y
+                tip_confidence = best_tip.confidence
         
         # Score using calibration data
         result = score_from_ellipse_calibration((tip_x, tip_y), cal)
@@ -3311,7 +3334,7 @@ async def replay_all_darts(request: ReplayAllRequest = None):
                 
                 # Replay this dart
                 try:
-                    replay_result = await replay_single_dart(ReplayRequest(dart_path=str(dart_dir), rescore_only=request.rescore_only))
+                    replay_result = await replay_single_dart(ReplayRequest(dart_path=str(dart_dir), rescore_only=request.rescore_only, method=request.method))
                     
                     if replay_result.get("success"):
                         if replay_result.get("matches_expected"):
@@ -3399,7 +3422,7 @@ async def replay_all_darts_full(request: ReplayAllRequest = None):
                 
                 # Replay this dart
                 try:
-                    replay_result = await replay_single_dart(ReplayRequest(dart_path=str(dart_dir), rescore_only=request.rescore_only))
+                    replay_result = await replay_single_dart(ReplayRequest(dart_path=str(dart_dir), rescore_only=request.rescore_only, method=request.method))
                     
                     if replay_result.get("success"):
                         original = replay_result.get("original", {})
