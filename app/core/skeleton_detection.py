@@ -221,6 +221,18 @@ def detect_dart_skeleton(
     if dart_contour is None:
         return result
     
+    # Calculate view quality based on contour aspect ratio
+    # Higher aspect ratio = better view (seeing dart from side)
+    rect = cv2.minAreaRect(dart_contour)
+    (_, _), (w, h), _ = rect
+    if w > 0 and h > 0:
+        aspect_ratio = max(w, h) / min(w, h)
+        # Normalize: aspect ratio of 3+ is excellent, 1.5 is minimum
+        view_quality = min(1.0, (aspect_ratio - 1.5) / 2.5)
+        result["view_quality"] = max(0.3, view_quality)  # Floor at 0.3
+    else:
+        result["view_quality"] = 0.5
+    
     # Create clean mask from dart contour
     dart_mask = np.zeros_like(motion_mask)
     cv2.drawContours(dart_mask, [dart_contour], -1, 255, -1)
@@ -348,6 +360,16 @@ def detect_dart_hough(
     
     if dart_contour is None:
         return result
+    
+    # Calculate view quality based on contour aspect ratio
+    rect = cv2.minAreaRect(dart_contour)
+    (_, _), (w, h), _ = rect
+    if w > 0 and h > 0:
+        aspect_ratio = max(w, h) / min(w, h)
+        view_quality = min(1.0, (aspect_ratio - 1.5) / 2.5)
+        result["view_quality"] = max(0.3, view_quality)
+    else:
+        result["view_quality"] = 0.5
     
     # Create mask from dart contour only
     dart_mask = np.zeros_like(motion_mask)
