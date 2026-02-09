@@ -1,16 +1,15 @@
 """
-Skeleton-based dart detection with improved tip finding.
+Skeleton-based dart detection with direction-aware tip finding.
 
 Key insight from debug images:
-- Frame differencing picks up dart PLUS noise (shadows, reflections)
-- The dart is an elongated shape; noise is scattered small blobs
-- Tip is at the END of the elongated shape that points toward center
+- Skeleton covers entire dart (flight+shaft+tip)
+- "Closest to center" picks wrong end because board center != dart tip location
+- Dart tip is at the END of the skeleton that points TOWARD the board center
 
 Approach:
-1. Morphological cleanup to reduce noise
-2. Find the largest elongated contour (aspect ratio filter)
-3. Skeletonize just that contour
-4. Find skeleton endpoint closest to center
+1. Fit line to skeleton
+2. The endpoint where the line vector points toward center is the TIP
+3. The endpoint where the line vector points away from center is the FLIGHT
 """
 
 import cv2
@@ -97,6 +96,49 @@ def find_dart_contour(motion_mask, min_area=500, min_aspect_ratio=2.0):
     return best_contour
 
 
+def find_tip_by_direction(endpoints, line_params, center):
+    """
+    Find the tip endpoint based on line direction.
+    
+    Key insight from camera geometry:
+    - Cameras are above/around the board at 45° angle
+    - The dart tip is always lower in the image (higher Y) than the flight
+    - The line direction vector points along the dart
+    - We want the endpoint in the direction that has positive vy (points downward)
+    
+    So: pick the endpoint that is in the +Y direction along the fitted line.
+    """
+    if len(endpoints) < 2 or line_params is None:
+        return None
+    
+    vx, vy, x0, y0 = line_params
+    cx, cy = center
+    
+    # Normalize line direction to point downward (+Y)
+    # If vy is negative, flip the direction
+    if vy < 0:
+        vx, vy = -vx, -vy
+    
+    # Now (vx, vy) points in the "tip direction" (toward higher Y = lower in image)
+    
+    # For each endpoint, check which is in the tip direction from line midpoint
+    best_endpoint = None
+    best_score = -float('inf')
+    
+    for (ex, ey) in endpoints:
+        # Vector from line midpoint to this endpoint
+        to_endpoint = np.array([ex - x0, ey - y0])
+        
+        # Dot product with tip direction
+        score = to_endpoint[0] * vx + to_endpoint[1] * vy
+        
+        if score > best_score:
+            best_score = score
+            best_endpoint = (ex, ey)
+    
+    return best_endpoint
+
+
 def detect_dart_skeleton(
     current_frame: np.ndarray,
     previous_frame: np.ndarray,
@@ -105,7 +147,7 @@ def detect_dart_skeleton(
     debug: bool = False
 ) -> dict:
     """
-    Detect dart using skeleton-based approach with improved noise filtering.
+    Detect dart using skeleton-based approach with direction-aware tip finding.
     """
     result = {
         "tip": None, 
@@ -174,20 +216,26 @@ def detect_dart_skeleton(
     if line_params:
         result["line"] = line_params
     
-    # 7. Find endpoints and pick the one closest to center
+    # 7. Find endpoints
     endpoints = find_skeleton_endpoints(skeleton)
     
-    if len(endpoints) >= 2:
-        # Pick endpoint closest to board center
-        distances = [np.sqrt((x - cx)**2 + (y - cy)**2) for (x, y) in endpoints]
-        closest_idx = np.argmin(distances)
-        tip = endpoints[closest_idx]
-        result["tip"] = (float(tip[0]), float(tip[1]))
-        result["confidence"] = 0.8
+    if len(endpoints) >= 2 and line_params:
+        # Use direction-based tip finding
+        tip = find_tip_by_direction(endpoints, line_params, center)
+        if tip:
+            result["tip"] = (float(tip[0]), float(tip[1]))
+            result["confidence"] = 0.8
     elif len(endpoints) == 1:
         tip = endpoints[0]
         result["tip"] = (float(tip[0]), float(tip[1]))
         result["confidence"] = 0.6
+    elif len(endpoints) >= 2:
+        # Fallback: closest to center
+        distances = [np.sqrt((x - cx)**2 + (y - cy)**2) for (x, y) in endpoints]
+        closest_idx = np.argmin(distances)
+        tip = endpoints[closest_idx]
+        result["tip"] = (float(tip[0]), float(tip[1]))
+        result["confidence"] = 0.5
     else:
         # Fallback: closest skeleton point to center
         skel_points = np.column_stack(np.where(skeleton > 0))
@@ -217,10 +265,13 @@ def detect_dart_skeleton(
         debug_img[skeleton > 0] = [255, 255, 0]
         # Draw center
         cv2.circle(debug_img, (int(cx), int(cy)), 10, (255, 0, 0), 2)
-        # Draw endpoints
+        # Draw endpoints with labels
         for i, (ex, ey) in enumerate(endpoints):
-            color = (0, 0, 255) if i == np.argmin([np.sqrt((x-cx)**2 + (y-cy)**2) for x,y in endpoints]) else (255, 255, 0)
-            cv2.circle(debug_img, (int(ex), int(ey)), 6, color, -1)
+            # Calculate if this is the tip (toward center)
+            to_center = np.array([cx - ex, cy - ey])
+            label = f"d={np.linalg.norm(to_center):.0f}"
+            cv2.circle(debug_img, (int(ex), int(ey)), 6, (255, 255, 0), -1)
+            cv2.putText(debug_img, label, (int(ex)+10, int(ey)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
         # Draw tip
         tip_x, tip_y = int(result["tip"][0]), int(result["tip"][1])
         cv2.circle(debug_img, (tip_x, tip_y), 10, (0, 0, 255), 3)
@@ -344,16 +395,19 @@ def detect_dart_hough(
     y0 = (y1 + y2) / 2
     result["line"] = (vx, vy, x0, y0)
     
-    # Find tip endpoint (closer to center)
-    d1 = np.sqrt((x1 - cx)**2 + (y1 - cy)**2)
-    d2 = np.sqrt((x2 - cx)**2 + (y2 - cy)**2)
+    # Find tip endpoint using direction toward center
+    endpoints = [(x1, y1), (x2, y2)]
+    tip = find_tip_by_direction(endpoints, (vx, vy, x0, y0), center)
     
-    if d1 < d2:
-        tip = (x1, y1)
+    if tip:
+        result["tip"] = (float(tip[0]), float(tip[1]))
+        result["confidence"] = min(1.0, alignment * (length / 80.0))
     else:
-        tip = (x2, y2)
-    
-    result["tip"] = (float(tip[0]), float(tip[1]))
-    result["confidence"] = min(1.0, alignment * (length / 80.0))
+        # Fallback: closer to center
+        d1 = np.sqrt((x1 - cx)**2 + (y1 - cy)**2)
+        d2 = np.sqrt((x2 - cx)**2 + (y2 - cy)**2)
+        tip = (x1, y1) if d1 < d2 else (x2, y2)
+        result["tip"] = (float(tip[0]), float(tip[1]))
+        result["confidence"] = min(1.0, alignment * (length / 80.0))
     
     return result
