@@ -318,7 +318,8 @@ def detect_dart_hough(
     center: tuple = None,
     mask: np.ndarray = None,
     existing_dart_locations: list = None,
-    debug: bool = False
+    debug: bool = False,
+    debug_name: str = "hough_debug"
 ) -> dict:
     """Detect dart using Hough line detection."""
     result = {"tip": None, "line": None, "confidence": 0.0, "method": "hough"}
