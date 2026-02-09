@@ -1,4 +1,10 @@
 import cv2
+try:
+    from skimage.morphology import skeletonize, medial_axis
+    HAS_SKIMAGE = True
+except ImportError:
+    HAS_SKIMAGE = False
+    # Fallback: use morphological thinning
 import numpy as np
 import os
 
@@ -30,16 +36,14 @@ def find_skeleton_endpoints(skeleton):
 def _find_tip_by_contour(mask: np.ndarray, center: tuple, gray_diff: np.ndarray = None) -> tuple:
     """
     Contour-based fallback for tip detection.
-    
-    Finds the point on the largest contour closest to board center
-    with strong diff signal. Used when Hough line detection fails.
+    Finds the point on the largest contour closest to board center.
     """
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
     if not contours:
         return None
     
-    # Get the largest contour (likely the dart)
+    # Get the largest contour (the dart)
     largest = max(contours, key=cv2.contourArea)
     
     if cv2.contourArea(largest) < 100:  # Too small to be a dart
@@ -47,63 +51,58 @@ def _find_tip_by_contour(mask: np.ndarray, center: tuple, gray_diff: np.ndarray 
     
     cx, cy = center
     
-    # Find point closest to center with strong diff signal
+    # Find point closest to center
     min_dist = float('inf')
     best_point = None
     
     for pt in largest:
         px, py = pt[0]
         dist = np.sqrt((px - cx)**2 + (py - cy)**2)
-        
-        # Prefer points with strong diff signal (actual dart, not noise)
-        if gray_diff is not None:
-            y_lo = max(0, py - 2)
-            y_hi = min(gray_diff.shape[0], py + 3)
-            x_lo = max(0, px - 2)
-            x_hi = min(gray_diff.shape[1], px + 3)
-            local_diff = np.mean(gray_diff[y_lo:y_hi, x_lo:x_hi])
-            
-            # Weight distance by inverse of diff (prefer strong signal)
-            if local_diff > 20:  # Minimum signal threshold
-                weighted_dist = dist / (local_diff / 50.0)
-                if weighted_dist < min_dist:
-                    min_dist = weighted_dist
-                    best_point = (float(px), float(py))
-        else:
-            if dist < min_dist:
-                min_dist = dist
-                best_point = (float(px), float(py))
+        if dist < min_dist:
+            min_dist = dist
+            best_point = (float(px), float(py))
     
-    # Fallback: find sharpest corner
-    if best_point is None:
-        epsilon = 0.02 * cv2.arcLength(largest, True)
-        approx = cv2.approxPolyDP(largest, epsilon, True)
-        
-        if len(approx) >= 3:
-            min_angle = float('inf')
-            sharpest = None
-            
-            for i in range(len(approx)):
-                p1 = approx[i-1][0]
-                p2 = approx[i][0]
-                p3 = approx[(i+1) % len(approx)][0]
-                
-                v1 = p1 - p2
-                v2 = p3 - p2
-                
-                len1 = np.linalg.norm(v1)
-                len2 = np.linalg.norm(v2)
-                if len1 < 1 or len2 < 1:
-                    continue
-                
-                cos_angle = np.dot(v1, v2) / (len1 * len2)
-                angle = np.arccos(np.clip(cos_angle, -1, 1))
-                
-                if angle < min_angle:
-                    min_angle = angle
-                    sharpest = (float(p2[0]), float(p2[1]))
-            
-            best_point = sharpest
+    return best_point
+
+
+def _find_tip_by_skeleton(mask: np.ndarray, center: tuple) -> tuple:
+    """
+    Skeleton tip detection: MAX Y point (Autodarts approach).
+    
+    The dart tip is the "lowest" point in the image (highest Y value)
+    because cameras are mounted level/above looking at the board.
+    More reliable than "closest to center" which fails for darts near center.
+    """
+    if mask is None or np.sum(mask) < 100:
+        return None
+    
+    cx, cy = center
+    
+    # Skeletonize the mask
+    if HAS_SKIMAGE:
+        skeleton = skeletonize(mask > 0).astype(np.uint8) * 255
+    else:
+        try:
+            skeleton = cv2.ximgproc.thinning(mask)
+        except AttributeError:
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+            skeleton = cv2.erode(mask, kernel, iterations=3)
+    
+    # Find all skeleton points
+    skel_points = np.column_stack(np.where(skeleton > 0))  # (y, x)
+    
+    if len(skel_points) == 0:
+        return None
+    
+    # Find the point closest to board center (the tip)
+    min_dist = float('inf')
+    best_point = None
+    
+    for y, x in skel_points:
+        dist = np.sqrt((x - cx)**2 + (y - cy)**2)
+        if dist < min_dist:
+            min_dist = dist
+            best_point = (float(x), float(y))
     
     return best_point
 
@@ -141,8 +140,21 @@ def detect_dart_hough(
     diff = cv2.absdiff(current_frame, previous_frame)
     gray_diff = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
     
-    # 2. Motion mask for region of interest
-    _, motion_mask = cv2.threshold(gray_diff, 20, 255, cv2.THRESH_BINARY)
+    # 2. Enhance contrast with CLAHE for better edge detection
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    enhanced_diff = clahe.apply(gray_diff)
+    
+    # 3. Slight blur to reduce noise before thresholding
+    blurred = cv2.GaussianBlur(enhanced_diff, (3, 3), 0)
+    
+    # 4. Adaptive threshold handles uneven lighting better
+    # Otsu finds optimal threshold automatically
+    _, motion_mask = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    
+    # 5. Morphological cleanup: remove noise speckles, fill small gaps
+    morph_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    motion_mask = cv2.morphologyEx(motion_mask, cv2.MORPH_OPEN, morph_kernel)   # remove noise
+    motion_mask = cv2.morphologyEx(motion_mask, cv2.MORPH_CLOSE, morph_kernel)  # fill gaps
     
     # FIX 1a: Only erode/dilate when there are existing darts to separate from
     if existing_dart_locations:
@@ -167,20 +179,33 @@ def detect_dart_hough(
     edges_masked = cv2.bitwise_and(edges, motion_mask)
     
     # 4. Hough line detection
+    # Scale params for resolution - higher res = larger dart appearance
+    h, w = edges_masked.shape[:2]
+    scale = max(w / 640.0, 1.0)  # Scale relative to 640px baseline
+    
     lines = cv2.HoughLinesP(edges_masked, 
                              rho=1, 
                              theta=np.pi/180, 
-                             threshold=30,
-                             minLineLength=50,
-                             maxLineGap=10)
+                             threshold=int(25 * scale),
+                             minLineLength=int(40 * scale),
+                             maxLineGap=int(8 * scale))
     
-    # FIX 2: Contour-based fallback if Hough finds nothing
+    # FIX 2: Fallback cascade if Hough finds no lines
     if lines is None or len(lines) == 0:
+        # Try skeleton lowest point first
+        skeleton_tip = _find_tip_by_skeleton(motion_mask, center)
+        if skeleton_tip is not None:
+            result["tip"] = skeleton_tip
+            result["confidence"] = 0.6
+            result["method"] = "skeleton_lowest"
+            return result
+        
+        # Then try contour-based
         contour_tip = _find_tip_by_contour(motion_mask, center, gray_diff)
         if contour_tip is not None:
             result["tip"] = contour_tip
             result["confidence"] = 0.5
-            result["method"] = "hough_contour_fallback"
+            result["method"] = "contour_fallback"
             return result
         return result
     

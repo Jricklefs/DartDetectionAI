@@ -3248,18 +3248,33 @@ async def replay_single_dart(request: ReplayRequest):
             "corrected": correction.get("corrected") if correction else None
         }
     
-    # Vote for final result using weighted voting (same as main detection)
+    # Vote for final result - SEGMENT first, then multiplier
+    # This prevents split votes: (20,1) + (20,3) should beat (0,0)
     from collections import Counter
     
-    # Weight votes by confidence
-    weighted_votes = {}
+    # Step 1: Vote on segment (combine all multipliers for same segment)
+    segment_votes = {}
     for v in camera_votes:
-        key = (v["segment"], v["multiplier"])
+        seg = v["segment"]
         weight = v.get("confidence", 1.0)
-        weighted_votes[key] = weighted_votes.get(key, 0) + weight
+        segment_votes[seg] = segment_votes.get(seg, 0) + weight
     
-    winning_vote = max(weighted_votes.keys(), key=lambda k: weighted_votes[k])
-    new_segment, new_multiplier = winning_vote
+    winning_segment = max(segment_votes.keys(), key=lambda k: segment_votes[k])
+    
+    # Step 2: Among cameras that voted for winning segment, vote on multiplier
+    multiplier_votes = {}
+    for v in camera_votes:
+        if v["segment"] == winning_segment:
+            mult = v["multiplier"]
+            weight = v.get("confidence", 1.0)
+            multiplier_votes[mult] = multiplier_votes.get(mult, 0) + weight
+    
+    if multiplier_votes:
+        winning_multiplier = max(multiplier_votes.keys(), key=lambda k: multiplier_votes[k])
+    else:
+        winning_multiplier = 1  # Default to single
+    
+    new_segment, new_multiplier = winning_segment, winning_multiplier
     
     # Calculate score (handle bulls specially)
     if new_segment == 0:
