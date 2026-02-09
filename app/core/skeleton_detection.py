@@ -1,12 +1,16 @@
 """
-Skeleton-based dart detection following Autodarts approach.
+Skeleton-based dart detection with improved tip finding.
 
-Pipeline:
-1. Frame differencing to isolate new dart
-2. Skeletonization (thinning) to get 1-pixel-wide dart representation
-3. Line fitting (cv2.fitLine) to get dart direction vector
-4. Project along line toward board center to find tip
-5. Return tip position and line direction
+Key insight from debug images:
+- Frame differencing picks up dart PLUS noise (shadows, reflections)
+- The dart is an elongated shape; noise is scattered small blobs
+- Tip is at the END of the elongated shape that points toward center
+
+Approach:
+1. Morphological cleanup to reduce noise
+2. Find the largest elongated contour (aspect ratio filter)
+3. Skeletonize just that contour
+4. Find skeleton endpoint closest to center
 """
 
 import cv2
@@ -31,64 +35,66 @@ def get_detection_method() -> str:
     return _detection_method
 
 
+def find_skeleton_endpoints(skeleton):
+    """Find endpoints of a skeletonized line (pixels with 1 neighbor)."""
+    skel = (skeleton > 0).astype(np.uint8)
+    kernel = np.array([[1, 1, 1], [1, 0, 1], [1, 1, 1]], dtype=np.uint8)
+    neighbor_count = cv2.filter2D(skel, -1, kernel)
+    endpoints = np.where((skel == 1) & (neighbor_count == 1))
+    return list(zip(endpoints[1], endpoints[0]))  # (x, y) format
+
+
 def fit_line_to_skeleton(skeleton):
     """Fit a line to skeleton points using cv2.fitLine."""
-    points = np.column_stack(np.where(skeleton > 0))  # (y, x) format
+    points = np.column_stack(np.where(skeleton > 0))
     if len(points) < 10:
         return None
-    
     points_xy = points[:, ::-1].reshape(-1, 1, 2).astype(np.float32)
     [vx, vy, x0, y0] = cv2.fitLine(points_xy, cv2.DIST_HUBER, 0, 0.01, 0.01)
     return float(vx[0]), float(vy[0]), float(x0[0]), float(y0[0])
 
 
-def find_tip_by_line_projection(skeleton, line_params, center, dart_mask):
+def find_dart_contour(motion_mask, min_area=500, min_aspect_ratio=2.0):
     """
-    Find tip by projecting along the fitted line toward the board center.
+    Find the dart contour from motion mask.
     
-    The line gives us the dart direction. We project from the line's midpoint
-    toward the center, and find where the projection intersects the dart edge.
+    Darts are elongated - filter by aspect ratio to avoid noise blobs.
     """
-    if line_params is None:
+    contours, _ = cv2.findContours(motion_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    if not contours:
         return None
     
-    vx, vy, x0, y0 = line_params
-    cx, cy = center
+    best_contour = None
+    best_score = 0
     
-    # Determine which direction along the line goes toward center
-    # Vector from line point to center
-    to_center = np.array([cx - x0, cy - y0])
-    line_dir = np.array([vx, vy])
-    
-    # If dot product > 0, line_dir points toward center
-    dot = np.dot(to_center, line_dir)
-    if dot < 0:
-        # Flip direction to point toward center
-        vx, vy = -vx, -vy
-        line_dir = np.array([vx, vy])
-    
-    # Project along line toward center, find where we exit the dart mask
-    # Start from a point on the skeleton and move toward center
-    max_steps = 500
-    tip_x, tip_y = x0, y0
-    
-    # First, find where the dart mask ends in the direction toward center
-    for step in range(1, max_steps):
-        test_x = int(x0 + step * vx)
-        test_y = int(y0 + step * vy)
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area < min_area:
+            continue
         
-        # Bounds check
-        if test_x < 0 or test_x >= dart_mask.shape[1] or test_y < 0 or test_y >= dart_mask.shape[0]:
-            break
+        # Get bounding rect to check aspect ratio
+        rect = cv2.minAreaRect(cnt)
+        (cx, cy), (w, h), angle = rect
         
-        # Check if still on dart
-        if dart_mask[test_y, test_x] > 0:
-            tip_x, tip_y = test_x, test_y
-        else:
-            # Just exited the dart - previous point is the tip
-            break
+        if w == 0 or h == 0:
+            continue
+        
+        # Aspect ratio (length / width)
+        aspect = max(w, h) / min(w, h)
+        
+        # Score by area * aspect ratio (prefer large elongated shapes)
+        score = area * aspect
+        
+        if score > best_score and aspect >= min_aspect_ratio:
+            best_score = score
+            best_contour = cnt
     
-    return (float(tip_x), float(tip_y))
+    # If no elongated contour found, fall back to largest
+    if best_contour is None and contours:
+        best_contour = max(contours, key=cv2.contourArea)
+    
+    return best_contour
 
 
 def detect_dart_skeleton(
@@ -99,7 +105,7 @@ def detect_dart_skeleton(
     debug: bool = False
 ) -> dict:
     """
-    Detect dart using skeleton-based approach.
+    Detect dart using skeleton-based approach with improved noise filtering.
     """
     result = {
         "tip": None, 
@@ -114,29 +120,37 @@ def detect_dart_skeleton(
     if center is None:
         center = (current_frame.shape[1] // 2, current_frame.shape[0] // 2)
     
+    cx, cy = center
+    
     # 1. Frame differencing
     diff = cv2.absdiff(current_frame, previous_frame)
     gray_diff = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
     
-    # 2. Threshold
-    _, motion_mask = cv2.threshold(gray_diff, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    # 2. Threshold with higher value to reduce noise
+    _, motion_mask = cv2.threshold(gray_diff, 30, 255, cv2.THRESH_BINARY)
     
-    # 3. Morphological cleanup
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    motion_mask = cv2.morphologyEx(motion_mask, cv2.MORPH_OPEN, kernel)
-    motion_mask = cv2.morphologyEx(motion_mask, cv2.MORPH_CLOSE, kernel)
+    # 3. Aggressive morphological cleanup
+    # First erode to remove small noise
+    erode_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    motion_mask = cv2.erode(motion_mask, erode_kernel, iterations=2)
     
-    # 4. Find largest contour
-    contours, _ = cv2.findContours(motion_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
+    # Then dilate to restore dart size
+    dilate_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    motion_mask = cv2.dilate(motion_mask, dilate_kernel, iterations=2)
+    
+    # Close to fill holes
+    close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    motion_mask = cv2.morphologyEx(motion_mask, cv2.MORPH_CLOSE, close_kernel)
+    
+    # 4. Find dart contour (elongated shape)
+    dart_contour = find_dart_contour(motion_mask, min_area=300, min_aspect_ratio=1.5)
+    
+    if dart_contour is None:
         return result
     
-    largest = max(contours, key=cv2.contourArea)
-    if cv2.contourArea(largest) < 200:
-        return result
-    
+    # Create clean mask from just the dart contour
     dart_mask = np.zeros_like(motion_mask)
-    cv2.drawContours(dart_mask, [largest], -1, 255, -1)
+    cv2.drawContours(dart_mask, [dart_contour], -1, 255, -1)
     
     # 5. Skeletonize
     if HAS_SKIMAGE:
@@ -159,13 +173,29 @@ def detect_dart_skeleton(
     line_params = fit_line_to_skeleton(skeleton)
     if line_params:
         result["line"] = line_params
-        
-        # 7. Find tip by projecting along line toward center
-        tip = find_tip_by_line_projection(skeleton, line_params, center, dart_mask)
-        
-        if tip:
-            result["tip"] = tip
-            result["confidence"] = 0.8
+    
+    # 7. Find endpoints and pick the one closest to center
+    endpoints = find_skeleton_endpoints(skeleton)
+    
+    if len(endpoints) >= 2:
+        # Pick endpoint closest to board center
+        distances = [np.sqrt((x - cx)**2 + (y - cy)**2) for (x, y) in endpoints]
+        closest_idx = np.argmin(distances)
+        tip = endpoints[closest_idx]
+        result["tip"] = (float(tip[0]), float(tip[1]))
+        result["confidence"] = 0.8
+    elif len(endpoints) == 1:
+        tip = endpoints[0]
+        result["tip"] = (float(tip[0]), float(tip[1]))
+        result["confidence"] = 0.6
+    else:
+        # Fallback: closest skeleton point to center
+        skel_points = np.column_stack(np.where(skeleton > 0))
+        if len(skel_points) > 0:
+            distances = np.sqrt((skel_points[:, 1] - cx)**2 + (skel_points[:, 0] - cy)**2)
+            closest_idx = np.argmin(distances)
+            result["tip"] = (float(skel_points[closest_idx, 1]), float(skel_points[closest_idx, 0]))
+            result["confidence"] = 0.4
     
     if debug and result["tip"]:
         debug_dir = r"C:\Users\clawd\DartDetectionAI\skeleton_debug"
@@ -173,17 +203,28 @@ def detect_dart_skeleton(
         from datetime import datetime
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         
+        # Save threshold image
+        cv2.imwrite(os.path.join(debug_dir, f"{timestamp}_1_thresh.jpg"), motion_mask)
+        
+        # Save skeleton
+        cv2.imwrite(os.path.join(debug_dir, f"{timestamp}_3_skel.jpg"), skeleton)
+        
+        # Save result overlay
         debug_img = current_frame.copy()
-        debug_img[skeleton > 0] = [0, 255, 0]
+        # Draw dart contour
+        cv2.drawContours(debug_img, [dart_contour], -1, (0, 255, 0), 2)
+        # Draw skeleton
+        debug_img[skeleton > 0] = [255, 255, 0]
+        # Draw center
+        cv2.circle(debug_img, (int(cx), int(cy)), 10, (255, 0, 0), 2)
+        # Draw endpoints
+        for i, (ex, ey) in enumerate(endpoints):
+            color = (0, 0, 255) if i == np.argmin([np.sqrt((x-cx)**2 + (y-cy)**2) for x,y in endpoints]) else (255, 255, 0)
+            cv2.circle(debug_img, (int(ex), int(ey)), 6, color, -1)
+        # Draw tip
         tip_x, tip_y = int(result["tip"][0]), int(result["tip"][1])
-        cv2.circle(debug_img, (tip_x, tip_y), 8, (0, 0, 255), -1)
-        cv2.circle(debug_img, (int(center[0]), int(center[1])), 10, (255, 255, 0), 2)
-        if result["line"]:
-            vx, vy, x0, y0 = result["line"]
-            pt1 = (int(x0 - 100*vx), int(y0 - 100*vy))
-            pt2 = (int(x0 + 100*vx), int(y0 + 100*vy))
-            cv2.line(debug_img, pt1, pt2, (255, 0, 0), 2)
-        cv2.imwrite(os.path.join(debug_dir, f"skeleton_{timestamp}.jpg"), debug_img)
+        cv2.circle(debug_img, (tip_x, tip_y), 10, (0, 0, 255), 3)
+        cv2.imwrite(os.path.join(debug_dir, f"{timestamp}_4_result.jpg"), debug_img)
     
     return result
 
@@ -220,27 +261,31 @@ def detect_dart_hough(
     
     # Threshold
     blurred = cv2.GaussianBlur(enhanced_diff, (3, 3), 0)
-    _, motion_mask = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    _, motion_mask = cv2.threshold(blurred, 30, 255, cv2.THRESH_BINARY)
     
     # Morphological cleanup
-    morph_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    motion_mask = cv2.morphologyEx(motion_mask, cv2.MORPH_OPEN, morph_kernel)
-    motion_mask = cv2.morphologyEx(motion_mask, cv2.MORPH_CLOSE, morph_kernel)
+    erode_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    motion_mask = cv2.erode(motion_mask, erode_kernel, iterations=1)
+    dilate_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    motion_mask = cv2.dilate(motion_mask, dilate_kernel, iterations=2)
     
     if existing_dart_locations:
-        erode_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        motion_mask = cv2.erode(motion_mask, erode_kernel, iterations=1)
-        dilate_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        motion_mask = cv2.dilate(motion_mask, dilate_kernel, iterations=1)
         for (ex, ey) in existing_dart_locations:
             cv2.circle(motion_mask, (int(ex), int(ey)), 40, 0, -1)
-    else:
-        dilate_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-        motion_mask = cv2.dilate(motion_mask, dilate_kernel, iterations=1)
     
-    # Canny + Hough
+    # Find dart contour
+    dart_contour = find_dart_contour(motion_mask, min_area=300, min_aspect_ratio=1.5)
+    
+    if dart_contour is None:
+        return result
+    
+    # Create mask from dart contour only
+    dart_mask = np.zeros_like(motion_mask)
+    cv2.drawContours(dart_mask, [dart_contour], -1, 255, -1)
+    
+    # Canny + Hough on dart region only
     edges = cv2.Canny(gray_diff, 15, 50)
-    edges_masked = cv2.bitwise_and(edges, motion_mask)
+    edges_masked = cv2.bitwise_and(edges, dart_mask)
     
     h, w = edges_masked.shape[:2]
     scale = max(w / 640.0, 1.0)
@@ -248,9 +293,9 @@ def detect_dart_hough(
     lines = cv2.HoughLinesP(edges_masked, 
                              rho=1, 
                              theta=np.pi/180, 
-                             threshold=int(25 * scale),
-                             minLineLength=int(40 * scale),
-                             maxLineGap=int(8 * scale))
+                             threshold=int(20 * scale),
+                             minLineLength=int(30 * scale),
+                             maxLineGap=int(10 * scale))
     
     if lines is None or len(lines) == 0:
         return detect_dart_skeleton(current_frame, previous_frame, center, mask, debug)
@@ -264,7 +309,7 @@ def detect_dart_hough(
         angle = abs(np.arctan2(y2-y1, x2-x1) * 180 / np.pi)
         if angle > 90:
             angle = 180 - angle
-        if angle < 30:
+        if angle < 20:  # Skip near-horizontal
             continue
         
         mid_x, mid_y = (x1 + x2) / 2, (y1 + y2) / 2
@@ -281,7 +326,7 @@ def detect_dart_hough(
         line_dir_norm = line_dir / line_len
         
         alignment = abs(np.dot(to_center_norm, line_dir_norm))
-        if alignment < 0.5:
+        if alignment < 0.4:
             continue
         
         dart_lines.append((x1, y1, x2, y2, length, alignment))
@@ -304,56 +349,11 @@ def detect_dart_hough(
     d2 = np.sqrt((x2 - cx)**2 + (y2 - cy)**2)
     
     if d1 < d2:
-        tip_end = np.array([x1, y1], dtype=float)
-        flight_end = np.array([x2, y2], dtype=float)
+        tip = (x1, y1)
     else:
-        tip_end = np.array([x2, y2], dtype=float)
-        flight_end = np.array([x1, y1], dtype=float)
+        tip = (x2, y2)
     
-    dart_dir = tip_end - flight_end
-    dart_dir = dart_dir / (np.linalg.norm(dart_dir) + 1e-6)
-    
-    # Extrapolate to find true tip
-    extended_tip = tip_end.copy()
-    line_length = np.linalg.norm(tip_end - flight_end)
-    max_extrapolation = min(100, int(line_length * 0.5))
-    
-    signal_history = []
-    
-    for step in range(1, max_extrapolation + 50):
-        test_point = tip_end + dart_dir * step
-        tx, ty = int(test_point[0]), int(test_point[1])
-        
-        if tx < 0 or tx >= gray_diff.shape[1] or ty < 0 or ty >= gray_diff.shape[0]:
-            break
-        
-        y_lo = max(0, ty - 3)
-        y_hi = min(gray_diff.shape[0], ty + 4)
-        x_lo = max(0, tx - 3)
-        x_hi = min(gray_diff.shape[1], tx + 4)
-        
-        local_diff = gray_diff[y_lo:y_hi, x_lo:x_hi]
-        max_diff = np.max(local_diff)
-        
-        signal_history.append((step, max_diff, test_point.copy()))
-        
-        if len(signal_history) >= 5:
-            recent_peak = max(s[1] for s in signal_history[-10:])
-            
-            if recent_peak > 50 and max_diff < recent_peak * 0.4:
-                for prev_step, prev_signal, prev_point in reversed(signal_history[:-3]):
-                    if prev_signal > recent_peak * 0.6:
-                        extended_tip = prev_point
-                        break
-                break
-        
-        if len(signal_history) >= 8:
-            recent_signals = [s[1] for s in signal_history[-8:]]
-            if max(recent_signals) < 30:
-                extended_tip = signal_history[-8][2]
-                break
-    
-    result["tip"] = (float(extended_tip[0]), float(extended_tip[1]))
-    result["confidence"] = min(1.0, alignment * (length / 100.0))
+    result["tip"] = (float(tip[0]), float(tip[1]))
+    result["confidence"] = min(1.0, alignment * (length / 80.0))
     
     return result
