@@ -3052,6 +3052,7 @@ class ReplayRequest(BaseModel):
     dart_path: str  # Path to dart folder
     rescore_only: bool = False  # If true, use saved tip locations instead of re-detecting
     method: str = "yolo"  # Detection method: yolo, skeleton, hough
+    debug: bool = False  # If true, save debug images for each camera
 
 
 class ReplayAllRequest(BaseModel):
@@ -3194,10 +3195,12 @@ async def replay_single_dart(request: ReplayRequest):
                     except (ValueError, AttributeError):
                         pass  # If dart number can't be parsed, skip
                     
+                    debug_name = f"{cam_id}_{dart_path.parent.name}_{dart_path.name}"
                     result = detect_dart_hough(
                         img, baseline, center=center, 
                         existing_dart_locations=existing_locations,
-                        debug=False
+                        debug=request.debug,
+                        debug_name=debug_name
                     )
                 else:
                     from app.core.skeleton_detection import detect_dart_skeleton

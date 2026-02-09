@@ -17,6 +17,69 @@ import os
 
 _detection_method = "hough"
 
+DEBUG_DIR = "C:/Users/clawd/DartDetectionAI/debug_images"
+
+def save_debug_image(name: str, current_frame: np.ndarray, previous_frame: np.ndarray, 
+                     motion_mask: np.ndarray, dart_contour, tip: tuple, center: tuple,
+                     original_mask: np.ndarray = None, line_result: tuple = None):
+    """Save a debug visualization showing the detection process."""
+    try:
+        os.makedirs(DEBUG_DIR, exist_ok=True)
+        
+        # Create visualization - 2x2 grid
+        h, w = current_frame.shape[:2]
+        viz = np.zeros((h * 2, w * 2, 3), dtype=np.uint8)
+        
+        # Top-left: Current frame with contour and tip
+        frame_copy = current_frame.copy()
+        if dart_contour is not None:
+            cv2.drawContours(frame_copy, [dart_contour], -1, (0, 255, 0), 2)
+        if tip is not None:
+            cv2.circle(frame_copy, (int(tip[0]), int(tip[1])), 8, (0, 0, 255), -1)
+            cv2.circle(frame_copy, (int(tip[0]), int(tip[1])), 10, (255, 255, 255), 2)
+        if center is not None:
+            cv2.circle(frame_copy, (int(center[0]), int(center[1])), 5, (255, 0, 0), -1)
+        if line_result is not None:
+            vx, vy, x0, y0 = line_result
+            # Draw line through image
+            pt1 = (int(x0 - vx * 200), int(y0 - vy * 200))
+            pt2 = (int(x0 + vx * 200), int(y0 + vy * 200))
+            cv2.line(frame_copy, pt1, pt2, (255, 255, 0), 2)
+        viz[0:h, 0:w] = frame_copy
+        
+        # Top-right: Frame difference
+        diff = cv2.absdiff(current_frame, previous_frame)
+        viz[0:h, w:w*2] = diff
+        
+        # Bottom-left: Motion mask (cleaned up)
+        mask_colored = cv2.cvtColor(motion_mask, cv2.COLOR_GRAY2BGR)
+        if dart_contour is not None:
+            cv2.drawContours(mask_colored, [dart_contour], -1, (0, 255, 0), 2)
+        viz[h:h*2, 0:w] = mask_colored
+        
+        # Bottom-right: Original mask (pre-erosion) if available
+        if original_mask is not None:
+            orig_colored = cv2.cvtColor(original_mask, cv2.COLOR_GRAY2BGR)
+            if tip is not None:
+                cv2.circle(orig_colored, (int(tip[0]), int(tip[1])), 8, (0, 0, 255), -1)
+            viz[h:h*2, w:w*2] = orig_colored
+        else:
+            viz[h:h*2, w:w*2] = mask_colored
+        
+        # Add labels
+        cv2.putText(viz, "Current + Contour + Tip", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        cv2.putText(viz, "Frame Diff", (w + 10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        cv2.putText(viz, "Motion Mask", (10, h + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        cv2.putText(viz, "Original Mask", (w + 10, h + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        
+        # Save
+        filepath = os.path.join(DEBUG_DIR, f"{name}.jpg")
+        cv2.imwrite(filepath, viz)
+        return filepath
+    except Exception as e:
+        print(f"Debug save failed: {e}")
+        return None
+
 def set_detection_method(method: str) -> bool:
     global _detection_method
     if method in ("skeleton", "hough", "yolo"):
@@ -313,7 +376,8 @@ def detect_dart_hough(
     center: tuple = None,
     mask: np.ndarray = None,
     existing_dart_locations: list = None,
-    debug: bool = False
+    debug: bool = False,
+    debug_name: str = "hough_debug"
 ) -> dict:
     """Detect dart using Hough line detection."""
     result = {"tip": None, "line": None, "confidence": 0.0, "method": "hough"}
@@ -450,5 +514,11 @@ def detect_dart_hough(
         tip = (x1, y1) if d1 < d2 else (x2, y2)
         result["tip"] = (float(tip[0]), float(tip[1]))
         result["confidence"] = min(1.0, alignment * (length / 80.0))
+    
+    # Save debug visualization if requested
+    if debug and result["tip"]:
+        save_debug_image(debug_name, current_frame, previous_frame, 
+                        motion_mask, dart_contour, result["tip"], center,
+                        original_mask, result.get("line"))
     
     return result
