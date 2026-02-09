@@ -196,19 +196,8 @@ def detect_dart_skeleton(
     diff = cv2.absdiff(current_frame, previous_frame)
     gray_diff = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
     
-    # 2. Adaptive thresholding - try multiple approaches and pick best
-    # First try OTSU to find optimal threshold for this specific image
-    otsu_thresh, motion_mask_otsu = cv2.threshold(gray_diff, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    
-    # Also try fixed low threshold to capture low-contrast tips
-    _, motion_mask_low = cv2.threshold(gray_diff, 15, 255, cv2.THRESH_BINARY)
-    
-    # Use OTSU if it found a reasonable threshold, otherwise use low
-    # OTSU can fail on low-contrast images (returns very low threshold)
-    if otsu_thresh > 10 and otsu_thresh < 100:
-        motion_mask_raw = motion_mask_otsu
-    else:
-        motion_mask_raw = motion_mask_low
+    # 2. Lower threshold to capture dart tip (tip is thin, low contrast)
+    _, motion_mask_raw = cv2.threshold(gray_diff, 20, 255, cv2.THRESH_BINARY)
     
     # Keep original for tip projection (before erosion)
     original_mask = motion_mask_raw.copy()
@@ -344,14 +333,8 @@ def detect_dart_hough(
     diff = cv2.absdiff(current_frame, previous_frame)
     gray_diff = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
     
-    # Adaptive thresholding for original mask (used for tip projection)
-    otsu_thresh, motion_mask_otsu = cv2.threshold(gray_diff, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    _, motion_mask_low = cv2.threshold(gray_diff, 15, 255, cv2.THRESH_BINARY)
-    
-    if otsu_thresh > 10 and otsu_thresh < 100:
-        motion_mask_raw = motion_mask_otsu
-    else:
-        motion_mask_raw = motion_mask_low
+    # Fixed low threshold for original mask (used for tip projection)
+    _, motion_mask_raw = cv2.threshold(gray_diff, 20, 255, cv2.THRESH_BINARY)
     original_mask = motion_mask_raw.copy()
     
     # CLAHE enhancement for better edge detection
