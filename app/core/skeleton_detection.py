@@ -500,12 +500,34 @@ def detect_dart_hough(
     y0 = (y1 + y2) / 2
     result["line"] = (vx, vy, x0, y0)
     
-    # Find tip endpoint and project
-    endpoints = [(x1, y1), (x2, y2)]
-    skeleton_tip = find_tip_endpoint(endpoints, (vx, vy, x0, y0))
+    # IMPROVED: Find contour extreme point in tip direction instead of Hough endpoints
+    # The tip is the contour point closest to board center in the line direction
     
-    if skeleton_tip:
-        tip = project_to_tip(skeleton_tip, (vx, vy, x0, y0), original_mask, max_extend=100)
+    # Normalize direction to point toward board center (usually +Y but verify)
+    to_center = np.array([cx - x0, cy - y0])
+    to_center_len = np.linalg.norm(to_center)
+    if to_center_len > 0:
+        to_center_norm = to_center / to_center_len
+        # Check if line direction aligns with toward-center direction
+        if vx * to_center_norm[0] + vy * to_center_norm[1] < 0:
+            # Line points away from center, flip it
+            vx, vy = -vx, -vy
+    
+    # Find contour point furthest in tip direction (toward center)
+    best_tip = None
+    best_score = -float('inf')
+    
+    for point in dart_contour.reshape(-1, 2):
+        px, py = point
+        # Score by how far along the line direction (toward center)
+        score = (px - x0) * vx + (py - y0) * vy
+        if score > best_score:
+            best_score = score
+            best_tip = (float(px), float(py))
+    
+    if best_tip:
+        # Project from contour extreme to find true tip
+        tip = project_to_tip(best_tip, (vx, vy, x0, y0), original_mask, max_extend=100)
         result["tip"] = tip
         result["confidence"] = min(1.0, alignment * (length / 80.0))
     else:
