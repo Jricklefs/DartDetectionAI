@@ -3048,6 +3048,8 @@ class ReplayRequest(BaseModel):
 class ReplayAllRequest(BaseModel):
     board_id: str = "default"
     limit: int = 100  # Max darts to replay
+    rescore_only: bool = False  # If true, use saved tip locations
+    game_id: str = None  # Optional: limit to specific game
 
 
 @router.post("/v1/benchmark/replay")
@@ -3286,6 +3288,10 @@ async def replay_all_darts(request: ReplayAllRequest = None):
         if not game_dir.is_dir():
             continue
         
+        # Filter by game_id if specified
+        if request.game_id and game_dir.name != request.game_id:
+            continue
+        
         for round_dir in game_dir.iterdir():
             if not round_dir.is_dir():
                 continue
@@ -3305,7 +3311,7 @@ async def replay_all_darts(request: ReplayAllRequest = None):
                 
                 # Replay this dart
                 try:
-                    replay_result = await replay_single_dart(ReplayRequest(dart_path=str(dart_dir)))
+                    replay_result = await replay_single_dart(ReplayRequest(dart_path=str(dart_dir), rescore_only=request.rescore_only))
                     
                     if replay_result.get("success"):
                         if replay_result.get("matches_expected"):
@@ -3364,6 +3370,10 @@ async def replay_all_darts_full(request: ReplayAllRequest = None):
         if not game_dir.is_dir():
             continue
         
+        # Filter by game_id if specified
+        if request.game_id and game_dir.name != request.game_id:
+            continue
+        
         for round_dir in game_dir.iterdir():
             if not round_dir.is_dir():
                 continue
@@ -3389,7 +3399,7 @@ async def replay_all_darts_full(request: ReplayAllRequest = None):
                 
                 # Replay this dart
                 try:
-                    replay_result = await replay_single_dart(ReplayRequest(dart_path=str(dart_dir)))
+                    replay_result = await replay_single_dart(ReplayRequest(dart_path=str(dart_dir), rescore_only=request.rescore_only))
                     
                     if replay_result.get("success"):
                         original = replay_result.get("original", {})
