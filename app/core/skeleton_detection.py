@@ -121,7 +121,7 @@ def project_to_tip(skeleton_endpoint, line_params, original_mask, max_extend=50)
     # Start from endpoint and walk in tip direction
     best_x, best_y = ex, ey
     gap_count = 0
-    max_gap = 50  # Allow up to 10 pixel gaps in the mask
+    max_gap = 10  # Allow up to 10 pixel gaps in the mask
     
     for step in range(1, max_extend + 1):
         nx = int(ex + vx * step)
@@ -272,12 +272,12 @@ def detect_dart_skeleton(
         skeleton_tip = find_tip_endpoint(endpoints, line_params)
         
         # Project along line to find true tip in original mask
-        tip = project_to_tip(skeleton_tip, line_params, original_mask, max_extend=200)
+        tip = project_to_tip(skeleton_tip, line_params, original_mask, max_extend=100)
         result["tip"] = tip
         result["confidence"] = 0.8
         
     elif len(endpoints) == 1:
-        tip = project_to_tip(endpoints[0], line_params, original_mask, max_extend=200)
+        tip = project_to_tip(endpoints[0], line_params, original_mask, max_extend=100)
         result["tip"] = tip
         result["confidence"] = 0.6
     else:
@@ -447,7 +447,7 @@ def detect_dart_hough(
     skeleton_tip = find_tip_endpoint(endpoints, (vx, vy, x0, y0))
     
     if skeleton_tip:
-        tip = project_to_tip(skeleton_tip, (vx, vy, x0, y0), original_mask, max_extend=200)
+        tip = project_to_tip(skeleton_tip, (vx, vy, x0, y0), original_mask, max_extend=100)
         result["tip"] = tip
         result["confidence"] = min(1.0, alignment * (length / 80.0))
     else:
