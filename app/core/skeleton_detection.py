@@ -500,8 +500,8 @@ def detect_dart_hough(
     y0 = (y1 + y2) / 2
     result["line"] = (vx, vy, x0, y0)
     
-    # IMPROVED: Find contour extreme point in tip direction instead of Hough endpoints
-    # The tip is the contour point closest to board center in the line direction
+    # IMPROVED: Find tip by projecting from processed contour through original mask
+    # The processed contour gives us the dart body, then we extend into original mask
     
     # Normalize direction to point toward board center (usually +Y but verify)
     to_center = np.array([cx - x0, cy - y0])
@@ -513,27 +513,24 @@ def detect_dart_hough(
             # Line points away from center, flip it
             vx, vy = -vx, -vy
     
-    # Find the extreme point in tip direction from ORIGINAL mask (not processed)
-    # This captures the full dart including tip that may be cut off from dart_contour
-    best_tip = None
-    best_score = -float('inf')
+    # First find the extreme point of the PROCESSED contour (dart body)
+    contour_tip = None
+    contour_best_score = -float('inf')
     
-    # Get all white pixels from original mask
-    white_pixels = np.argwhere(original_mask > 0)  # Returns (y, x) pairs
-    
-    # Filter to only consider pixels roughly along the dart line
-    # Use a corridor around the fitted line
-    for (py, px) in white_pixels:
-        # Check if pixel is near the line (within ~30 pixels)
-        dist_to_line = abs((px - x0) * (-vy) + (py - y0) * vx)
-        if dist_to_line > 30:
-            continue
-        
-        # Score by how far along the line direction (toward center)
+    for point in dart_contour.reshape(-1, 2):
+        px, py = point
         score = (px - x0) * vx + (py - y0) * vy
-        if score > best_score:
-            best_score = score
-            best_tip = (float(px), float(py))
+        if score > contour_best_score:
+            contour_best_score = score
+            contour_tip = (float(px), float(py))
+    
+    # Now extend from that contour tip along the line direction through original_mask
+    if contour_tip:
+        # Walk along the line from contour_tip until we exit original_mask
+        tip = project_to_tip(contour_tip, (vx, vy, x0, y0), original_mask, max_extend=150)
+        best_tip = tip
+    else:
+        best_tip = None
     
     if best_tip:
         # Project from contour extreme to find true tip
