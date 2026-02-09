@@ -3151,7 +3151,42 @@ async def replay_single_dart(request: ReplayRequest):
                 
                 if request.method == "hough":
                     from app.core.skeleton_detection import detect_dart_hough
-                    result = detect_dart_hough(img, baseline, center=center, debug=False)
+                    
+                    # Get existing dart locations from previous darts in this round
+                    existing_locations = []
+                    dart_folder = dart_path.name  # e.g., "dart_3"
+                    round_folder = dart_path.parent  # e.g., "round_13_Player_1"
+                    
+                    # Parse dart number
+                    try:
+                        current_dart_num = int(dart_folder.replace("dart_", ""))
+                        
+                        # Load tip locations from previous darts
+                        for prev_num in range(1, current_dart_num):
+                            prev_dart_path = round_folder / f"dart_{prev_num}"
+                            prev_meta_path = prev_dart_path / "metadata.json"
+                            
+                            if prev_meta_path.exists():
+                                with open(prev_meta_path) as pf:
+                                    prev_meta = json.load(pf)
+                                
+                                # Get this camera's tip from previous dart
+                                prev_pipeline = prev_meta.get("pipeline", {}).get(cam_id, {})
+                                prev_tip = prev_pipeline.get("selected_tip")
+                                
+                                if prev_tip and prev_tip.get("x_px") is not None:
+                                    existing_locations.append((
+                                        prev_tip["x_px"],
+                                        prev_tip["y_px"]
+                                    ))
+                    except (ValueError, AttributeError):
+                        pass  # If dart number can't be parsed, skip
+                    
+                    result = detect_dart_hough(
+                        img, baseline, center=center, 
+                        existing_dart_locations=existing_locations,
+                        debug=False
+                    )
                 else:
                     from app.core.skeleton_detection import detect_dart_skeleton
                     result = detect_dart_skeleton(img, baseline, center=center)
@@ -4064,6 +4099,11 @@ AVAILABLE_MODELS = {
         "name": "11M Dartboard Model",
         "description": "Larger 11M parameter model for better accuracy",
         "path": "11m_dartboard_openvino_model"
+    },
+    "y26-736-pt": {
+        "name": "YOLO26 736x1280 PyTorch (Feb 2026)",
+        "description": "Latest PyTorch model, 736x1280 resolution",
+        "path": "y26-p-n-736-1280-07022026.pt"
     }
 }
 
