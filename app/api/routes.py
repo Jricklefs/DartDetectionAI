@@ -3188,13 +3188,36 @@ async def replay_single_dart(request: ReplayRequest):
             "corrected": correction.get("corrected") if correction else None
         }
     
-    # Vote for final result (simple majority or highest confidence)
+    # Vote for final result using weighted voting (same as main detection)
     from collections import Counter
-    vote_keys = [(v["segment"], v["multiplier"]) for v in camera_votes]
-    vote_counts = Counter(vote_keys)
-    winning_vote = vote_counts.most_common(1)[0][0]
+    
+    # Weight votes by confidence
+    weighted_votes = {}
+    for v in camera_votes:
+        key = (v["segment"], v["multiplier"])
+        weight = v.get("confidence", 1.0)
+        weighted_votes[key] = weighted_votes.get(key, 0) + weight
+    
+    winning_vote = max(weighted_votes.keys(), key=lambda k: weighted_votes[k])
     new_segment, new_multiplier = winning_vote
-    new_score = new_segment * new_multiplier
+    
+    # Calculate score (handle bulls specially)
+    if new_segment == 0:
+        # Bull - determine inner vs outer from zones
+        inner_conf = sum(v["confidence"] for v in camera_votes if v.get("zone") == "inner_bull")
+        outer_conf = sum(v["confidence"] for v in camera_votes if v.get("zone") == "outer_bull")
+        if inner_conf >= outer_conf:
+            new_score = 50
+            new_zone = "inner_bull"
+        else:
+            new_score = 25
+            new_zone = "outer_bull"
+    elif new_multiplier == 0:
+        new_score = 0
+        new_zone = "miss"
+    else:
+        new_score = new_segment * new_multiplier
+        new_zone = "single" if new_multiplier == 1 else ("double" if new_multiplier == 2 else "triple")
     
     # Compare results
     original = metadata.get("final_result", {})
