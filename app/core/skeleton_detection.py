@@ -513,12 +513,22 @@ def detect_dart_hough(
             # Line points away from center, flip it
             vx, vy = -vx, -vy
     
-    # Find contour point furthest in tip direction (toward center)
+    # Find the extreme point in tip direction from ORIGINAL mask (not processed)
+    # This captures the full dart including tip that may be cut off from dart_contour
     best_tip = None
     best_score = -float('inf')
     
-    for point in dart_contour.reshape(-1, 2):
-        px, py = point
+    # Get all white pixels from original mask
+    white_pixels = np.argwhere(original_mask > 0)  # Returns (y, x) pairs
+    
+    # Filter to only consider pixels roughly along the dart line
+    # Use a corridor around the fitted line
+    for (py, px) in white_pixels:
+        # Check if pixel is near the line (within ~30 pixels)
+        dist_to_line = abs((px - x0) * (-vy) + (py - y0) * vx)
+        if dist_to_line > 30:
+            continue
+        
         # Score by how far along the line direction (toward center)
         score = (px - x0) * vx + (py - y0) * vy
         if score > best_score:
