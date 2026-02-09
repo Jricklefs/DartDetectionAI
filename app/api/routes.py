@@ -3148,10 +3148,12 @@ async def replay_single_dart(request: ReplayRequest):
             tip_x, tip_y = selected.get("x_px"), selected.get("y_px")
             tip_confidence = selected.get("confidence", 0)
             line_result = None  # No line info for rescore_only
+            view_quality = 0.5  # Default for rescore_only
         else:
             # Re-run tip detection using requested method
             tip_x, tip_y, tip_confidence = None, None, 0
             line_result = None
+            view_quality = 0.5  # Will be updated if skeleton/hough
             
             if request.method in ("skeleton", "hough") and cam_id in baselines:
                 # Use classical CV detection
@@ -3205,6 +3207,7 @@ async def replay_single_dart(request: ReplayRequest):
                     tip_x, tip_y = result["tip"]
                     tip_confidence = result.get("confidence", 0.5)
                     line_result = result.get("line")  # (vx, vy, x0, y0) if available
+                    view_quality = result.get("view_quality", 0.5)
             
             # Fall back to YOLO if no tip found or YOLO method requested
             if tip_x is None:
@@ -3250,7 +3253,8 @@ async def replay_single_dart(request: ReplayRequest):
                 "confidence": tip_confidence,
                 "tip_x": tip_x,
                 "tip_y": tip_y,
-                "line": line_result  # (vx, vy, x0, y0) or None
+                "line": line_result,  # (vx, vy, x0, y0) or None
+                "view_quality": view_quality
             })
     
     if not camera_votes:
