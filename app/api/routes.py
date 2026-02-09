@@ -3194,31 +3194,6 @@ async def replay_single_dart(request: ReplayRequest):
                 if result.get("tip"):
                     tip_x, tip_y = result["tip"]
                     tip_confidence = result.get("confidence", 0.5)
-                    
-                    # HYBRID CHECK: If skeleton detected a tip far from center,
-                    # also run YOLO to see if there's a bull dart we missed
-                    center = cal.get("center", [img.shape[1]//2, img.shape[0]//2])
-                    cx, cy = center[0], center[1]
-                    skel_dist = math.sqrt((tip_x - cx)**2 + (tip_y - cy)**2)
-                    
-                    # Get outer bull radius for comparison
-                    bull_ellipse = cal.get("bull_ellipse")
-                    if bull_ellipse:
-                        bull_radius = max(bull_ellipse[1][0], bull_ellipse[1][1]) / 2
-                    else:
-                        bull_radius = 30
-                    
-                    # If skeleton tip is far from center (> 3x bull radius), check YOLO for bulls
-                    if skel_dist > bull_radius * 3:
-                        yolo_tips = calibrator.tip_detector.detect_tips(img, confidence_threshold=CONFIDENCE_THRESHOLD)
-                        for yt in yolo_tips:
-                            yolo_dist = math.sqrt((yt.x - cx)**2 + (yt.y - cy)**2)
-                            # If YOLO found a high-confidence tip near center, prefer it
-                            if yolo_dist < bull_radius * 1.5 and yt.confidence > 0.7:
-                                logger.info(f"[HYBRID] Skeleton tip far ({skel_dist:.0f}px), YOLO found bull ({yolo_dist:.0f}px, conf={yt.confidence:.2f})")
-                                tip_x, tip_y = yt.x, yt.y
-                                tip_confidence = yt.confidence
-                                break
             
             # Fall back to YOLO if no tip found or YOLO method requested
             if tip_x is None:
@@ -3255,30 +3230,13 @@ async def replay_single_dart(request: ReplayRequest):
         result = score_from_ellipse_calibration((tip_x, tip_y), cal)
         
         if result:
-            # Calculate pixel distance from center for bull determination
-            center = cal.get("center", [img.shape[1]//2, img.shape[0]//2])
-            cx, cy = center[0], center[1]
-            center_dist_px = math.sqrt((tip_x - cx)**2 + (tip_y - cy)**2)
-            
-            # Get bull_ellipse semi-axes for normalization
-            bull_ellipse = cal.get("bull_ellipse")
-            if bull_ellipse:
-                # bull_ellipse format: [[cx, cy], [width, height], angle]
-                bull_semi_major = max(bull_ellipse[1][0], bull_ellipse[1][1]) / 2
-            else:
-                bull_semi_major = 30  # fallback ~30px
-            
             camera_votes.append({
                 "camera_id": cam_id,
                 "segment": result["segment"],
                 "multiplier": result["multiplier"],
                 "score": result["score"],
                 "zone": result.get("zone"),
-                "confidence": tip_confidence,
-                "tip_x": tip_x,
-                "tip_y": tip_y,
-                "center_dist_px": center_dist_px,
-                "bull_radius_px": bull_semi_major
+                "confidence": tip_confidence
             })
     
     if not camera_votes:
@@ -3320,46 +3278,13 @@ async def replay_single_dart(request: ReplayRequest):
     
     # Calculate score (handle bulls specially)
     if new_segment == 0:
-        # Bull - determine inner vs outer using AVERAGE PIXEL DISTANCE
-        # This is more reliable than zone confidence when cameras disagree
-        bull_votes = [v for v in camera_votes if v.get("zone") in ("inner_bull", "outer_bull")]
-        
-        if bull_votes:
-            # Calculate average normalized distance (dist / bull_radius)
-            # < 0.4 = inner bull, >= 0.4 = outer bull
-            total_norm_dist = 0.0
-            count = 0
-            for v in bull_votes:
-                dist_px = v.get("center_dist_px", 0)
-                bull_r = v.get("bull_radius_px", 30)
-                if bull_r > 0:
-                    norm_dist = dist_px / bull_r
-                    total_norm_dist += norm_dist
-                    count += 1
-            
-            if count > 0:
-                avg_norm_dist = total_norm_dist / count
-                # Threshold: normalized dist < 0.4 = inner bull
-                # (inner bull is ~40% of outer bull radius)
-                if avg_norm_dist < 0.4:
-                    new_score = 50
-                    new_zone = "inner_bull"
-                else:
-                    new_score = 25
-                    new_zone = "outer_bull"
-                logger.info(f"[BULL] avg_norm_dist={avg_norm_dist:.3f} -> {new_zone}")
-            else:
-                # Fallback to zone confidence
-                inner_conf = sum(v["confidence"] for v in camera_votes if v.get("zone") == "inner_bull")
-                outer_conf = sum(v["confidence"] for v in camera_votes if v.get("zone") == "outer_bull")
-                if inner_conf >= outer_conf:
-                    new_score = 50
-                    new_zone = "inner_bull"
-                else:
-                    new_score = 25
-                    new_zone = "outer_bull"
+        # Bull - determine inner vs outer from zones
+        inner_conf = sum(v["confidence"] for v in camera_votes if v.get("zone") == "inner_bull")
+        outer_conf = sum(v["confidence"] for v in camera_votes if v.get("zone") == "outer_bull")
+        if inner_conf >= outer_conf:
+            new_score = 50
+            new_zone = "inner_bull"
         else:
-            # No explicit bull votes, but segment 0 won - treat as outer bull
             new_score = 25
             new_zone = "outer_bull"
     elif new_multiplier == 0:
