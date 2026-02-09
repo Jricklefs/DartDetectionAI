@@ -527,15 +527,12 @@ def detect_dart_hough(
     # Now extend from that contour tip along the line direction through original_mask
     if contour_tip:
         # Walk along the line from contour_tip until we exit original_mask
-        tip = project_to_tip(contour_tip, (vx, vy, x0, y0), original_mask, max_extend=150)
-        best_tip = tip
+        best_tip = project_to_tip(contour_tip, (vx, vy, x0, y0), original_mask, max_extend=150)
     else:
         best_tip = None
     
     if best_tip:
-        # Project from contour extreme to find true tip
-        tip = project_to_tip(best_tip, (vx, vy, x0, y0), original_mask, max_extend=100)
-        result["tip"] = tip
+        result["tip"] = best_tip
         result["confidence"] = min(1.0, alignment * (length / 80.0))
     else:
         d1 = np.sqrt((x1 - cx)**2 + (y1 - cy)**2)
