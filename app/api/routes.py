@@ -3254,118 +3254,33 @@ async def replay_single_dart(request: ReplayRequest):
             "corrected": correction.get("corrected") if correction else None
         }
     
-    # NEW: Use angle-averaging for skeleton/hough methods (Autodarts approach)
-    # Instead of voting on per-camera segments, average the tip-to-center angles
+    # Use standard voting for now - angle averaging needs better tip detection first
     import math
+    from collections import Counter
     
-    use_angle_averaging = request.method in ("skeleton", "hough") and not request.rescore_only
+    # Step 1: Vote on segment (combine all multipliers for same segment)
+    segment_votes = {}
+    for v in camera_votes:
+        seg = v["segment"]
+        weight = v.get("confidence", 1.0)
+        segment_votes[seg] = segment_votes.get(seg, 0) + weight
     
-    if use_angle_averaging:
-        # Collect angles from tip to center for each camera
-        angles = []
-        weights = []
-        norm_distances = []
-        
-        for v in camera_votes:
-            cam_id = v["camera_id"]
-            tip_x, tip_y = v.get("tip_x"), v.get("tip_y")
-            
-            if tip_x is None or tip_y is None:
-                continue
-            
-            cal = saved_calibrations.get(cam_id, {})
-            center = cal.get("center", [320, 240])
-            cx, cy = center[0], center[1]
-            
-            # Calculate angle from tip to center
-            dx = cx - tip_x
-            dy = cy - tip_y
-            angle_rad = math.atan2(dy, dx)
-            angle_deg = (math.degrees(angle_rad) + 360) % 360
-            
-            angles.append(angle_deg)
-            weights.append(v.get("confidence", 1.0))
-            
-            # Calculate normalized distance for multiplier zone
-            outer_double = cal.get("outer_double_ellipse")
-            if outer_double:
-                board_radius = max(outer_double[1][0], outer_double[1][1]) / 2
-            else:
-                board_radius = 200
-            dist_px = math.sqrt((tip_x - cx)**2 + (tip_y - cy)**2)
-            norm_distances.append(dist_px / board_radius)
-        
-        if angles:
-            # Circular mean of angles
-            sin_sum = sum(w * math.sin(math.radians(a)) for a, w in zip(angles, weights))
-            cos_sum = sum(w * math.cos(math.radians(a)) for a, w in zip(angles, weights))
-            avg_angle_rad = math.atan2(sin_sum, cos_sum)
-            avg_angle = (math.degrees(avg_angle_rad) + 360) % 360
-            
-            # Convert angle to segment
-            # Dartboard: segment 20 at top, clockwise order
-            SEGMENT_ORDER = [20, 1, 18, 4, 13, 6, 10, 15, 2, 17, 3, 19, 7, 16, 8, 11, 14, 9, 12, 5]
-            # Convert from math convention (0=right, CCW) to dartboard (top=20, CW)
-            dart_angle = (90 - avg_angle) % 360
-            segment_idx = int((dart_angle + 9) / 18) % 20
-            new_segment = SEGMENT_ORDER[segment_idx]
-            
-            # Use average normalized distance to determine multiplier zone
-            avg_norm_dist = sum(norm_distances) / len(norm_distances) if norm_distances else 0.5
-            
-            # Zone thresholds (normalized: 0 = center, 1 = edge)
-            # Bull: < 0.07 (inner), < 0.17 (outer)
-            # Triple: ~0.55-0.62
-            # Double: ~0.95-1.0
-            if avg_norm_dist < 0.07:
-                new_segment = 0
-                new_multiplier = 2  # inner bull = 50
-            elif avg_norm_dist < 0.17:
-                new_segment = 0
-                new_multiplier = 1  # outer bull = 25
-            elif avg_norm_dist < 0.50:
-                new_multiplier = 1  # single (inner)
-            elif avg_norm_dist < 0.62:
-                new_multiplier = 3  # triple
-            elif avg_norm_dist < 0.93:
-                new_multiplier = 1  # single (outer)
-            elif avg_norm_dist < 1.05:
-                new_multiplier = 2  # double
-            else:
-                new_multiplier = 0  # miss
-            
-            logger.info(f"[ANGLE_AVG] angles={[f'{a:.1f}' for a in angles]} avg={avg_angle:.1f} -> seg={new_segment}, dist={avg_norm_dist:.3f} -> mult={new_multiplier}")
-        else:
-            # Fallback to original voting
-            use_angle_averaging = False
+    winning_segment = max(segment_votes.keys(), key=lambda k: segment_votes[k])
     
-    if not use_angle_averaging:
-        # Original voting logic for YOLO or rescore_only
-        from collections import Counter
-        
-        # Step 1: Vote on segment (combine all multipliers for same segment)
-        segment_votes = {}
-        for v in camera_votes:
-            seg = v["segment"]
+    # Step 2: Among cameras that voted for winning segment, vote on multiplier
+    multiplier_votes = {}
+    for v in camera_votes:
+        if v["segment"] == winning_segment:
+            mult = v["multiplier"]
             weight = v.get("confidence", 1.0)
-            segment_votes[seg] = segment_votes.get(seg, 0) + weight
-        
-        winning_segment = max(segment_votes.keys(), key=lambda k: segment_votes[k])
-        
-        # Step 2: Among cameras that voted for winning segment, vote on multiplier
-        multiplier_votes = {}
-        for v in camera_votes:
-            if v["segment"] == winning_segment:
-                mult = v["multiplier"]
-                weight = v.get("confidence", 1.0)
-                multiplier_votes[mult] = multiplier_votes.get(mult, 0) + weight
-        
-        if multiplier_votes:
-            winning_multiplier = max(multiplier_votes.keys(), key=lambda k: multiplier_votes[k])
-        else:
-            winning_multiplier = 1  # Default to single
-        
-        new_segment, new_multiplier = winning_segment, winning_multiplier
+            multiplier_votes[mult] = multiplier_votes.get(mult, 0) + weight
+    
+    if multiplier_votes:
+        winning_multiplier = max(multiplier_votes.keys(), key=lambda k: multiplier_votes[k])
+    else:
+        winning_multiplier = 1  # Default to single
+    
+    new_segment, new_multiplier = winning_segment, winning_multiplier
     
     # Calculate score (handle bulls specially)
     if new_segment == 0:
