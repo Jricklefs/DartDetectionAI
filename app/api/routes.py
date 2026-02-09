@@ -3226,7 +3226,25 @@ async def replay_single_dart(request: ReplayRequest):
     expected_segment = expected.get("segment")
     expected_multiplier = expected.get("multiplier")
     
-    matches_expected = (new_segment == expected_segment and new_multiplier == expected_multiplier)
+    # Handle bull format mismatch: 
+    # Corrections use segment=25 (25*2=50 inner, 25*1=25 outer)
+    # Detection uses segment=0 with zone to distinguish
+    # Normalize for comparison
+    def normalize_bull(seg, mult, score=None):
+        """Convert bull to consistent format for comparison."""
+        if seg == 0:  # Detection format
+            if score == 50:  # inner bull
+                return (25, 2)
+            elif score == 25:  # outer bull
+                return (25, 1)
+        elif seg == 25:  # Correction format
+            return (25, mult)
+        return (seg, mult)
+    
+    new_normalized = normalize_bull(new_segment, new_multiplier, new_score)
+    expected_normalized = normalize_bull(expected_segment, expected_multiplier)
+    
+    matches_expected = (new_normalized == expected_normalized)
     matches_original = (new_segment == original.get("segment") and new_multiplier == original.get("multiplier"))
     
     return {
