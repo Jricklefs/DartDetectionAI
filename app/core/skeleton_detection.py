@@ -36,7 +36,7 @@ def find_skeleton_endpoints(skeleton):
 def _find_tip_by_contour(mask: np.ndarray, center: tuple, gray_diff: np.ndarray = None) -> tuple:
     """
     Contour-based fallback for tip detection.
-    Finds the point on the largest contour closest to board center.
+    Uses MAX Y point (Autodarts lowestPoint approach).
     """
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
@@ -49,17 +49,14 @@ def _find_tip_by_contour(mask: np.ndarray, center: tuple, gray_diff: np.ndarray 
     if cv2.contourArea(largest) < 100:  # Too small to be a dart
         return None
     
-    cx, cy = center
-    
-    # Find point closest to center
-    min_dist = float('inf')
+    # AUTODARTS APPROACH: Find the LOWEST point (max Y value)
+    max_y = -1
     best_point = None
     
     for pt in largest:
         px, py = pt[0]
-        dist = np.sqrt((px - cx)**2 + (py - cy)**2)
-        if dist < min_dist:
-            min_dist = dist
+        if py > max_y:
+            max_y = py
             best_point = (float(px), float(py))
     
     return best_point
@@ -94,17 +91,13 @@ def _find_tip_by_skeleton(mask: np.ndarray, center: tuple) -> tuple:
     if len(skel_points) == 0:
         return None
     
-    # Find the point closest to board center (the tip)
-    min_dist = float('inf')
-    best_point = None
+    # AUTODARTS APPROACH: Find the LOWEST point (max Y value)
+    # This is the "lowestPoint" from their detection.thinning pipeline
+    # Works because cameras are mounted above/around the board
+    max_y_idx = np.argmax(skel_points[:, 0])  # Column 0 is Y
+    best_y, best_x = skel_points[max_y_idx]
     
-    for y, x in skel_points:
-        dist = np.sqrt((x - cx)**2 + (y - cy)**2)
-        if dist < min_dist:
-            min_dist = dist
-            best_point = (float(x), float(y))
-    
-    return best_point
+    return (float(best_x), float(best_y))
 
 
 def detect_dart_hough(
