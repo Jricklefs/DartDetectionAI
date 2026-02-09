@@ -121,7 +121,7 @@ def project_to_tip(skeleton_endpoint, line_params, original_mask, max_extend=50)
     # Start from endpoint and walk in tip direction
     best_x, best_y = ex, ey
     gap_count = 0
-    max_gap = 10  # Allow up to 10 pixel gaps in the mask
+    max_gap = 50  # Allow up to 10 pixel gaps in the mask
     
     for step in range(1, max_extend + 1):
         nx = int(ex + vx * step)
