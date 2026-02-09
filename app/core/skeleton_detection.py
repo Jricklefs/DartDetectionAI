@@ -255,12 +255,12 @@ def detect_dart_skeleton(
         skeleton_tip = find_tip_endpoint(endpoints, line_params)
         
         # Project along line to find true tip in original mask
-        tip = project_to_tip(skeleton_tip, line_params, original_mask, max_extend=40)
+        tip = project_to_tip(skeleton_tip, line_params, original_mask, max_extend=100)
         result["tip"] = tip
         result["confidence"] = 0.8
         
     elif len(endpoints) == 1:
-        tip = project_to_tip(endpoints[0], line_params, original_mask, max_extend=40)
+        tip = project_to_tip(endpoints[0], line_params, original_mask, max_extend=100)
         result["tip"] = tip
         result["confidence"] = 0.6
     else:
@@ -419,7 +419,7 @@ def detect_dart_hough(
     skeleton_tip = find_tip_endpoint(endpoints, (vx, vy, x0, y0))
     
     if skeleton_tip:
-        tip = project_to_tip(skeleton_tip, (vx, vy, x0, y0), original_mask, max_extend=40)
+        tip = project_to_tip(skeleton_tip, (vx, vy, x0, y0), original_mask, max_extend=100)
         result["tip"] = tip
         result["confidence"] = min(1.0, alignment * (length / 80.0))
     else:
