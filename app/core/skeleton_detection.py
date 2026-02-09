@@ -341,7 +341,11 @@ def detect_dart_hough(
     
     # Fixed low threshold for original mask (used for tip projection)
     _, motion_mask_raw = cv2.threshold(gray_diff, 20, 255, cv2.THRESH_BINARY)
-    original_mask = motion_mask_raw.copy()
+    
+    # Apply morphological closing to original mask to bridge small gaps
+    # This helps connect dart body to tip when there's a small separation
+    close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+    original_mask = cv2.morphologyEx(motion_mask_raw, cv2.MORPH_CLOSE, close_kernel)
     
     # CLAHE enhancement for better edge detection
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
