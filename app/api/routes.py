@@ -2466,7 +2466,7 @@ def line_intersection_2d(line1, line2):
     return (ix, iy)
 
 
-def vote_with_line_intersection(tips_with_lines: List[dict], calibration_data: dict) -> dict:
+def vote_with_line_intersection(tips_with_lines: List[dict], calibration_data: dict, save_debug: bool = True) -> dict:
     """
     Autodarts-style voting using line intersections.
     
@@ -2477,10 +2477,13 @@ def vote_with_line_intersection(tips_with_lines: List[dict], calibration_data: d
     Args:
         tips_with_lines: List of tip dicts with 'line' key (vx, vy, x0, y0)
         calibration_data: Calibration for scoring the intersection point
+        save_debug: Save visualization image
     
     Returns:
         Best tip dict with scored intersection position
     """
+    import cv2
+    import numpy as np
     # Filter to tips that have line data
     tips_with_lines = [t for t in tips_with_lines if t.get('line')]
     
@@ -2538,6 +2541,53 @@ def vote_with_line_intersection(tips_with_lines: List[dict], calibration_data: d
             return None  # Fall back to weighted voting
         
         logger.info(f"[LINE-VOTE] Intersection consensus: ({avg_x:.1f}, {avg_y:.1f}), spread={spread:.1f}px")
+        
+        # Save debug visualization
+        if save_debug:
+            try:
+                # Create blank canvas (assume 640x480)
+                debug_img = np.zeros((480, 640, 3), dtype=np.uint8)
+                debug_img[:] = (40, 40, 40)  # Dark gray background
+                
+                # Draw each camera's line
+                colors = [(0, 255, 0), (255, 0, 0), (0, 0, 255)]  # Green, Blue, Red for cam0,1,2
+                for i, tip in enumerate(tips_with_lines):
+                    line = tip.get('line')
+                    if line:
+                        vx, vy, x0, y0 = line
+                        pt1 = (int(x0 - vx * 300), int(y0 - vy * 300))
+                        pt2 = (int(x0 + vx * 300), int(y0 + vy * 300))
+                        color = colors[i % len(colors)]
+                        cv2.line(debug_img, pt1, pt2, color, 2)
+                        
+                        # Label
+                        cam_id = tip.get('camera_id', f'cam{i}')
+                        cv2.putText(debug_img, cam_id, (pt1[0]+5, pt1[1]-5), 
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+                        
+                        # Draw original tip detection
+                        tip_x, tip_y = int(tip.get('x_px', 0)), int(tip.get('y_px', 0))
+                        cv2.circle(debug_img, (tip_x, tip_y), 5, color, -1)
+                
+                # Draw intersection points
+                for ix_data in intersections:
+                    ix, iy = int(ix_data['x_px']), int(ix_data['y_px'])
+                    cv2.circle(debug_img, (ix, iy), 8, (0, 255, 255), 2)  # Yellow circles
+                
+                # Draw averaged intersection (final result)
+                cv2.circle(debug_img, (int(avg_x), int(avg_y)), 12, (255, 255, 255), 3)  # White circle
+                cv2.circle(debug_img, (int(avg_x), int(avg_y)), 10, (0, 255, 0), -1)  # Green fill
+                
+                # Add legend
+                cv2.putText(debug_img, f"Intersection: ({avg_x:.0f}, {avg_y:.0f})", (10, 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                cv2.putText(debug_img, f"Spread: {spread:.1f}px", (10, 60),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                
+                cv2.imwrite(r"C:\Users\clawd\line_intersection_debug.jpg", debug_img)
+                logger.info(f"[LINE-VOTE] Debug image saved to line_intersection_debug.jpg")
+            except Exception as e:
+                logger.error(f"[LINE-VOTE] Failed to save debug image: {e}")
         
         return {
             'x_px': avg_x,
