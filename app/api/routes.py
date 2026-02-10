@@ -1628,14 +1628,14 @@ async def detect_tips(
                     existing_locs = get_existing_dart_locations(board_id, cam.camera_id)
                     
                     # Get board radius from outer double ellipse for tip selection
-                    outer_ellipse = calibration_data.get('outer_double_ellipse', {})
-                    # Ellipse is (cx, cy, a, b, angle) - take average of a and b as radius
+                    outer_ellipse = calibration_data.get('outer_double_ellipse', [])
+                    # Ellipse is [cx, cy, a, b, angle] - take average of a and b as radius
                     board_radius = None
-                    if outer_ellipse:
-                        a = outer_ellipse.get('a', outer_ellipse.get(2, 200))
-                        b = outer_ellipse.get('b', outer_ellipse.get(3, 200))
-                        if isinstance(a, (int, float)) and isinstance(b, (int, float)):
-                            board_radius = (a + b) / 2
+                    if outer_ellipse and len(outer_ellipse) >= 4:
+                        # List format: [cx, cy, a, b, angle]
+                        a = outer_ellipse[2] if len(outer_ellipse) > 2 else 200
+                        b = outer_ellipse[3] if len(outer_ellipse) > 3 else 200
+                        board_radius = (a + b) / 2
                     
                     skel_result = detect_dart_skeleton(
                         current_img, 
