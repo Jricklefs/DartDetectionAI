@@ -15,7 +15,7 @@ except ImportError:
 import numpy as np
 import os
 
-_detection_method = "hough"
+_detection_method = "skeleton"
 
 def set_detection_method(method: str) -> bool:
     global _detection_method
