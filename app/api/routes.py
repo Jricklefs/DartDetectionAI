@@ -1953,6 +1953,9 @@ async def detect_tips(
     line_intersection_result = None
     detected_tips = []
     
+    # Initialize homographies on first detection
+    init_homographies()
+    
     logger.info(f"[LINE-VOTE] detection_method={detection_method}, all_tips={len(all_tips)}")
     
     if detection_method in ("skeleton", "hough") and len(all_tips) >= 2:
