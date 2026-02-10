@@ -1251,6 +1251,36 @@ def score_with_calibration(tip_data: Dict[str, Any], calibration_data: Dict[str,
     
     score = segment * multiplier
     return {"score": score, "multiplier": multiplier, "segment": segment, "zone": zone, "boundary_distance_deg": boundary_distance_deg}
+def score_with_calibration_hybrid(tip_data: Dict[str, Any], calibration_data: Dict[str, Any], camera_id: str = None) -> Dict[str, Any]:
+    """
+    Score using polygon calibration if available, otherwise fall back to ellipse.
+    
+    Polygon calibration (Autodarts-style) is more accurate for segment boundaries.
+    """
+    x_px = tip_data.get('x_px', 0)
+    y_px = tip_data.get('y_px', 0)
+    
+    # Try polygon scoring first
+    if HAS_POLYGON and camera_id:
+        poly_cal = get_polygon_calibration(camera_id)
+        if poly_cal:
+            try:
+                result = score_from_polygon_calibration((x_px, y_px), poly_cal)
+                if result and result.get('segment') is not None:
+                    # Add boundary distance estimate (polygon doesn't provide this directly)
+                    result['boundary_distance_deg'] = 5.0  # Default - polygon is more accurate at boundaries
+                    result['scoring_method'] = 'polygon'
+                    print(f"[SCORE] Polygon: {camera_id} -> {result.get('segment')}x{result.get('multiplier')}")
+                    return result
+            except Exception as e:
+                print(f"[SCORE] Polygon scoring failed for {camera_id}: {e}")
+    
+    # Fall back to ellipse scoring
+    result = score_with_calibration(tip_data, calibration_data)
+    result['scoring_method'] = 'ellipse'
+    return result
+
+
 
 
 # Configuration
@@ -1800,7 +1830,7 @@ async def detect_tips(
             # Calculate score for each tip
             for tip in tips:
                 t_score = time.time()
-                score_info = score_with_calibration(tip, calibration_data)
+                score_info = score_with_calibration_hybrid(tip, calibration_data, cam.camera_id)
                 scoring_total_ms += int((time.time() - t_score) * 1000)
                 
                 tip['camera_id'] = cam.camera_id
