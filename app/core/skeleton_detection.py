@@ -206,6 +206,17 @@ def project_to_tip(skeleton_endpoint, line_params, original_mask, max_extend=50,
     vx, vy, x0, y0 = line_params
     ex, ey = skeleton_endpoint
     
+    # First: project skeleton_endpoint onto the fitted line
+    # This ensures we start ON the line, not off to the side
+    # Vector from line point to endpoint
+    dx = ex - x0
+    dy = ey - y0
+    # Project onto line direction
+    t = dx * vx + dy * vy
+    # Closest point on line
+    ex = x0 + t * vx
+    ey = y0 + t * vy
+    
     # Normalize direction to point TOWARD board center (not just +Y)
     if board_center is not None:
         bcx, bcy = board_center
@@ -222,7 +233,7 @@ def project_to_tip(skeleton_endpoint, line_params, original_mask, max_extend=50,
         if vy < 0:
             vx, vy = -vx, -vy
     
-    # Normalize to unit vector
+    # Normalize to unit vector (should already be, but just in case)
     length = np.sqrt(vx*vx + vy*vy)
     if length < 0.001:
         return skeleton_endpoint
