@@ -65,6 +65,25 @@ def log_to_api(level: str, category: str, message: str, data: dict = None, game_
 
 router = APIRouter()
 
+# Polygon calibration for Autodarts-style scoring
+try:
+    from app.core.polygon_calibration import (
+        get_polygon_calibration,
+        score_from_polygon_calibration,
+        load_polygon_calibrations,
+    )
+    # Load polygon calibrations on startup
+    load_polygon_calibrations()
+    HAS_POLYGON = True
+    print("[STARTUP] Polygon calibrations loaded successfully")
+except ImportError as e:
+    print(f"[STARTUP] Polygon calibration not available: {e}")
+    HAS_POLYGON = False
+    get_polygon_calibration = None
+    score_from_polygon_calibration = None
+
+
+
 # === Debug Image Saving ===
 DEBUG_IMAGES_ENABLED = os.environ.get("DARTDETECT_DEBUG_IMAGES", "true").lower() == "true"
 DEBUG_IMAGES_DIR = Path(os.environ.get("DARTDETECT_DEBUG_DIR", "C:/Users/clawd/DartImages"))
