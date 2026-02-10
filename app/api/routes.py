@@ -887,6 +887,21 @@ def is_near_existing_dart(board_id: str, cam_id: str, x: float, y: float, thresh
         return False
 
 
+def get_existing_dart_locations(board_id: str, cam_id: str) -> list:
+    """
+    Get list of existing dart tip locations for a camera.
+    Returns list of (x, y) tuples.
+    """
+    with _cache_lock:
+        cache = _mask_cache.get(board_id)
+        if not cache:
+            return []
+        
+        dart_locations = cache.get("dart_locations", {}).get(cam_id, [])
+        # Return just (x, y) tuples, not the confidence
+        return [(x, y) for (x, y, _) in dart_locations]
+
+
 def add_dart_location(board_id: str, cam_id: str, x: float, y: float, confidence: float):
     """
     Record a detected dart's location for future comparison.
@@ -1530,11 +1545,15 @@ async def detect_tips(
                 prev_img = prev_images.get(cam.camera_id) if prev_images else None
                 
                 if prev_img is not None:
+                    # Get existing dart locations for this camera to exclude
+                    existing_locs = get_existing_dart_locations(board_id, cam.camera_id)
+                    
                     skel_result = detect_dart_skeleton(
                         current_img, 
                         prev_img, 
                         center=tuple(center),
-                        mask=mask
+                        mask=mask,
+                        existing_dart_locations=existing_locs
                     )
                     
                     # DEBUG: Log skeleton result
@@ -3217,6 +3236,7 @@ async def replay_single_dart(request: ReplayRequest):
                     from app.core.skeleton_detection import detect_dart_skeleton
                     debug_name = f"{cam_id}_{dart_path.parent.name}_{dart_path.name}"
                     result = detect_dart_skeleton(img, baseline, center=center,
+                        existing_dart_locations=existing_locations,
                         debug=request.debug, debug_name=debug_name)
                 
                 if result.get("tip"):

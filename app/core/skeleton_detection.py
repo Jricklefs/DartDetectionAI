@@ -104,15 +104,22 @@ def fit_line_to_skeleton(skeleton):
     return float(vx[0]), float(vy[0]), float(x0[0]), float(y0[0])
 
 
-def find_dart_contour(motion_mask, min_area=500, min_aspect_ratio=2.0):
+def find_dart_contour(motion_mask, min_area=500, min_aspect_ratio=2.0, existing_locations=None, exclude_radius=80):
     """
     Find the dart contour from motion mask.
     Darts are elongated - filter by aspect ratio to avoid noise blobs.
+    
+    Args:
+        existing_locations: List of (x, y) tuples of previous dart tips to exclude
+        exclude_radius: Pixels - contours with centroid within this radius of existing darts are excluded
     """
     contours, _ = cv2.findContours(motion_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
     if not contours:
         return None
+    
+    if existing_locations is None:
+        existing_locations = []
     
     best_contour = None
     best_score = 0
@@ -128,6 +135,17 @@ def find_dart_contour(motion_mask, min_area=500, min_aspect_ratio=2.0):
         if w == 0 or h == 0:
             continue
         
+        # Check if this contour is near an existing dart - if so, skip it
+        is_existing = False
+        for (ex, ey) in existing_locations:
+            dist = np.sqrt((cx - ex)**2 + (cy - ey)**2)
+            if dist < exclude_radius:
+                is_existing = True
+                break
+        
+        if is_existing:
+            continue
+        
         aspect = max(w, h) / min(w, h)
         score = area * aspect
         
@@ -135,8 +153,32 @@ def find_dart_contour(motion_mask, min_area=500, min_aspect_ratio=2.0):
             best_score = score
             best_contour = cnt
     
-    if best_contour is None and contours:
-        best_contour = max(contours, key=cv2.contourArea)
+    # Fallback: if no good contour found (all were excluded or too small), 
+    # try largest non-excluded contour
+    if best_contour is None:
+        valid_contours = []
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if area < min_area / 2:  # Lower threshold for fallback
+                continue
+            M = cv2.moments(cnt)
+            if M["m00"] == 0:
+                continue
+            cx = M["m10"] / M["m00"]
+            cy = M["m01"] / M["m00"]
+            
+            is_existing = False
+            for (ex, ey) in existing_locations:
+                dist = np.sqrt((cx - ex)**2 + (cy - ey)**2)
+                if dist < exclude_radius:
+                    is_existing = True
+                    break
+            
+            if not is_existing:
+                valid_contours.append(cnt)
+        
+        if valid_contours:
+            best_contour = max(valid_contours, key=cv2.contourArea)
     
     return best_contour
 
@@ -234,11 +276,15 @@ def detect_dart_skeleton(
     previous_frame: np.ndarray,
     center: tuple = None,
     mask: np.ndarray = None,
+    existing_dart_locations: list = None,
     debug: bool = False,
     debug_name: str = "skeleton_debug"
 ) -> dict:
     """
     Detect dart using skeleton-based approach with line projection.
+    
+    Args:
+        existing_dart_locations: List of (x, y) tuples of previous dart tips to exclude
     """
     result = {
         "tip": None, 
@@ -278,8 +324,11 @@ def detect_dart_skeleton(
     close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
     motion_mask = cv2.morphologyEx(motion_mask, cv2.MORPH_CLOSE, close_kernel)
     
-    # 4. Find dart contour
-    dart_contour = find_dart_contour(motion_mask, min_area=300, min_aspect_ratio=1.5)
+    # 4. Find dart contour (excluding existing dart locations)
+    if existing_dart_locations is None:
+        existing_dart_locations = []
+    dart_contour = find_dart_contour(motion_mask, min_area=300, min_aspect_ratio=1.5, 
+                                     existing_locations=existing_dart_locations)
     
     if dart_contour is None:
         return result
