@@ -1251,17 +1251,23 @@ def score_with_calibration(tip_data: Dict[str, Any], calibration_data: Dict[str,
     
     score = segment * multiplier
     return {"score": score, "multiplier": multiplier, "segment": segment, "zone": zone, "boundary_distance_deg": boundary_distance_deg}
-def score_with_calibration_hybrid(tip_data: Dict[str, Any], calibration_data: Dict[str, Any], camera_id: str = None) -> Dict[str, Any]:
+def score_with_calibration_hybrid(tip_data: Dict[str, Any], calibration_data: Dict[str, Any], 
+                                   camera_id: str = None, detection_method: str = "yolo") -> Dict[str, Any]:
     """
-    Score using polygon calibration if available, otherwise fall back to ellipse.
+    Score using polygon or ellipse based on detection method.
     
-    Polygon calibration (Autodarts-style) is more accurate for segment boundaries.
+    - Skeleton detection -> Polygon calibration (Autodarts-style, more accurate boundaries)
+    - YOLO detection -> Ellipse calibration (original approach)
+    
+    Falls back to ellipse if polygon not available.
     """
     x_px = tip_data.get('x_px', 0)
     y_px = tip_data.get('y_px', 0)
     
-    # Try polygon scoring first
-    if HAS_POLYGON and camera_id:
+    # Use polygon for skeleton/hough detection methods
+    use_polygon = detection_method in ("skeleton", "hough") and HAS_POLYGON
+    
+    if use_polygon and camera_id:
         poly_cal = get_polygon_calibration(camera_id)
         if poly_cal:
             try:
@@ -1270,12 +1276,12 @@ def score_with_calibration_hybrid(tip_data: Dict[str, Any], calibration_data: Di
                     # Add boundary distance estimate (polygon doesn't provide this directly)
                     result['boundary_distance_deg'] = 5.0  # Default - polygon is more accurate at boundaries
                     result['scoring_method'] = 'polygon'
-                    print(f"[SCORE] Polygon: {camera_id} -> {result.get('segment')}x{result.get('multiplier')}")
+                    print(f"[SCORE] Polygon ({detection_method}): {camera_id} -> {result.get('segment')}x{result.get('multiplier')}")
                     return result
             except Exception as e:
                 print(f"[SCORE] Polygon scoring failed for {camera_id}: {e}")
     
-    # Fall back to ellipse scoring
+    # Use ellipse scoring (YOLO default, or fallback)
     result = score_with_calibration(tip_data, calibration_data)
     result['scoring_method'] = 'ellipse'
     return result
@@ -1830,7 +1836,7 @@ async def detect_tips(
             # Calculate score for each tip
             for tip in tips:
                 t_score = time.time()
-                score_info = score_with_calibration_hybrid(tip, calibration_data, cam.camera_id)
+                score_info = score_with_calibration_hybrid(tip, calibration_data, cam.camera_id, detection_method)
                 scoring_total_ms += int((time.time() - t_score) * 1000)
                 
                 tip['camera_id'] = cam.camera_id
