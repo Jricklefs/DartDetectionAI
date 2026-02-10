@@ -76,13 +76,6 @@ try:
     load_polygon_calibrations(r"C:/Users/clawd/DartDetectionAI/polygon_calibrations.json")
     HAS_POLYGON = True
     print("[STARTUP] Polygon calibrations loaded successfully")
-    
-    # Compute homography matrices for each camera
-    for cam_id in ["cam0", "cam1", "cam2"]:
-        poly_cal = get_polygon_calibration(cam_id)
-        if poly_cal:
-            if compute_homography_for_camera(cam_id, poly_cal):
-                print(f"[STARTUP] Computed homography for {cam_id}")
 except ImportError as e:
     print(f"[STARTUP] Polygon calibration not available: {e}")
     HAS_POLYGON = False
@@ -2679,6 +2672,24 @@ def get_standard_board_points():
 
 # Cache for homography matrices
 _homography_cache = {}  # {camera_id: (H_matrix, inverse_H)}
+_homography_initialized = False
+
+def init_homographies():
+    """Initialize homography matrices for all cameras. Called on first detection."""
+    global _homography_initialized
+    if _homography_initialized:
+        return
+    
+    _homography_initialized = True
+    
+    if not HAS_POLYGON:
+        return
+        
+    for cam_id in ["cam0", "cam1", "cam2"]:
+        poly_cal = get_polygon_calibration(cam_id)
+        if poly_cal:
+            if compute_homography_for_camera(cam_id, poly_cal):
+                print(f"[STARTUP] Computed homography for {cam_id}")
 
 
 def compute_homography_for_camera(camera_id: str, polygon_calibration) -> bool:
