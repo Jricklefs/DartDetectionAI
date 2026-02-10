@@ -3350,8 +3350,12 @@ async def replay_single_dart(request: ReplayRequest):
     
     new_segment, new_multiplier = winning_segment, winning_multiplier
     
-    # Calculate score (handle bulls specially)
-    if new_segment == 0:
+    # Calculate score (handle bulls and miss specially)
+    # IMPORTANT: Check multiplier=0 (miss) BEFORE segment=0 (bull)
+    if new_multiplier == 0:
+        new_score = 0
+        new_zone = "miss"
+    elif new_segment == 0:
         # Bull - determine inner vs outer from zones
         inner_conf = sum(v["confidence"] for v in camera_votes if v.get("zone") == "inner_bull")
         outer_conf = sum(v["confidence"] for v in camera_votes if v.get("zone") == "outer_bull")
@@ -3361,9 +3365,6 @@ async def replay_single_dart(request: ReplayRequest):
         else:
             new_score = 25
             new_zone = "outer_bull"
-    elif new_multiplier == 0:
-        new_score = 0
-        new_zone = "miss"
     else:
         new_score = new_segment * new_multiplier
         new_zone = "single" if new_multiplier == 1 else ("double" if new_multiplier == 2 else "triple")
