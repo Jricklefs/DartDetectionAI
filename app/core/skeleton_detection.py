@@ -357,7 +357,7 @@ def find_tip_endpoint(endpoints, line_params, board_center=None):
 
 
 def get_adaptive_motion_mask(current_frame, previous_frame, camera_id=None, 
-                             fixed_threshold=25, use_background_model=True):
+                             fixed_threshold=25, use_background_model=False):
     """
     Get motion mask using either fixed threshold or adaptive background model.
     
