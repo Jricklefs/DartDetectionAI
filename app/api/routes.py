@@ -1645,7 +1645,9 @@ async def detect_tips(
                         existing_dart_locations=existing_locs,
                         camera_id=cam.camera_id,
                         use_adaptive_threshold=True,
-                        board_radius=board_radius
+                        board_radius=board_radius,
+                        debug=True,
+                        debug_name=f"dart{dart_number}_{cam.camera_id}"
                     )
                     
                     # DEBUG: Log skeleton result
