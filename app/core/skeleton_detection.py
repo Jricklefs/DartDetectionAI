@@ -183,18 +183,19 @@ def find_dart_contour(motion_mask, min_area=500, min_aspect_ratio=2.0, existing_
     return best_contour
 
 
-def project_to_tip(skeleton_endpoint, line_params, original_mask, max_extend=50):
+def project_to_tip(skeleton_endpoint, line_params, original_mask, max_extend=50, board_center=None):
     """
     Project from skeleton endpoint along line direction to find true tip.
     
     The skeleton may be shortened due to erosion. Project along the
-    fitted line in the +Y direction until we exit the original mask.
+    fitted line toward the board center until we exit the original mask.
     
     Args:
         skeleton_endpoint: (x, y) endpoint from skeleton
         line_params: (vx, vy, x0, y0) from cv2.fitLine
         original_mask: Pre-erosion motion mask
         max_extend: Maximum pixels to extend beyond skeleton
+        board_center: (cx, cy) center of dartboard - projection goes toward this
     
     Returns:
         (tip_x, tip_y) - projected tip position
@@ -205,9 +206,21 @@ def project_to_tip(skeleton_endpoint, line_params, original_mask, max_extend=50)
     vx, vy, x0, y0 = line_params
     ex, ey = skeleton_endpoint
     
-    # Normalize direction to point +Y (downward in image)
-    if vy < 0:
-        vx, vy = -vx, -vy
+    # Normalize direction to point TOWARD board center (not just +Y)
+    if board_center is not None:
+        bcx, bcy = board_center
+        # Vector from endpoint toward center
+        to_center_x = bcx - ex
+        to_center_y = bcy - ey
+        # Check if line direction aligns with toward-center direction
+        dot = vx * to_center_x + vy * to_center_y
+        if dot < 0:
+            # Line points away from center, flip it
+            vx, vy = -vx, -vy
+    else:
+        # Fallback: assume +Y (downward) is toward tip
+        if vy < 0:
+            vx, vy = -vx, -vy
     
     # Normalize to unit vector
     length = np.sqrt(vx*vx + vy*vy)
@@ -243,12 +256,33 @@ def project_to_tip(skeleton_endpoint, line_params, original_mask, max_extend=50)
     return (float(best_x), float(best_y))
 
 
-def find_tip_endpoint(endpoints, line_params):
+def find_tip_endpoint(endpoints, line_params, board_center=None):
     """
-    Find which skeleton endpoint is the tip end (in +Y direction).
+    Find which skeleton endpoint is the tip end.
+    
+    The tip is the endpoint closest to the board center (darts point at the bullseye).
+    Falls back to +Y direction if no center provided.
     """
-    if len(endpoints) < 2 or line_params is None:
+    if len(endpoints) < 2:
         return endpoints[0] if endpoints else None
+    
+    # Prefer: endpoint closest to board center
+    if board_center is not None:
+        cx, cy = board_center
+        best_endpoint = None
+        best_dist = float('inf')
+        
+        for (ex, ey) in endpoints:
+            dist = np.sqrt((ex - cx)**2 + (ey - cy)**2)
+            if dist < best_dist:
+                best_dist = dist
+                best_endpoint = (ex, ey)
+        
+        return best_endpoint
+    
+    # Fallback: use +Y direction from line params
+    if line_params is None:
+        return endpoints[0]
     
     vx, vy, x0, y0 = line_params
     
@@ -375,16 +409,16 @@ def detect_dart_skeleton(
     endpoints = find_skeleton_endpoints(skeleton)
     
     if len(endpoints) >= 2 and line_params:
-        # Find which endpoint is the tip end
-        skeleton_tip = find_tip_endpoint(endpoints, line_params)
+        # Find which endpoint is the tip end (closest to board center)
+        skeleton_tip = find_tip_endpoint(endpoints, line_params, board_center=center)
         
-        # Project along line to find true tip in original mask
-        tip = project_to_tip(skeleton_tip, line_params, original_mask, max_extend=100)
+        # Project along line toward center to find true tip in original mask
+        tip = project_to_tip(skeleton_tip, line_params, original_mask, max_extend=100, board_center=center)
         result["tip"] = tip
         result["confidence"] = 0.8
         
     elif len(endpoints) == 1:
-        tip = project_to_tip(endpoints[0], line_params, original_mask, max_extend=100)
+        tip = project_to_tip(endpoints[0], line_params, original_mask, max_extend=100, board_center=center)
         result["tip"] = tip
         result["confidence"] = 0.6
     else:
@@ -535,10 +569,10 @@ def detect_dart_hough(
     
     # Find tip endpoint and project
     endpoints = [(x1, y1), (x2, y2)]
-    skeleton_tip = find_tip_endpoint(endpoints, (vx, vy, x0, y0))
+    skeleton_tip = find_tip_endpoint(endpoints, (vx, vy, x0, y0), board_center=center)
     
     if skeleton_tip:
-        tip = project_to_tip(skeleton_tip, (vx, vy, x0, y0), original_mask, max_extend=100)
+        tip = project_to_tip(skeleton_tip, (vx, vy, x0, y0), original_mask, max_extend=100, board_center=center)
         result["tip"] = tip
         result["confidence"] = min(1.0, alignment * (length / 80.0))
     else:
