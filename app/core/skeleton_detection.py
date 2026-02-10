@@ -744,32 +744,37 @@ def detect_dart_skeleton(
         # Find which endpoint is the tip (inside board boundary)
         skeleton_tip = find_tip_endpoint(endpoints, line_params, board_center=center, board_radius=board_radius, dart_mask=dart_mask)
         
-        # Project centerline to board surface (even if tip not visible)
-        # Try polygon first (most accurate), then circle, then mask
-        tip = None
-        if hasattr(detect_dart_skeleton, '_polygon_cache') and camera_id in detect_dart_skeleton._polygon_cache:
-            polygon = detect_dart_skeleton._polygon_cache[camera_id]
-            tip = project_line_to_polygon(line_params, polygon, center, start_point=skeleton_tip)
+        # Project along dart centerline to find tip
+        # 1. First, walk along the mask to find where dart ends
+        tip = project_to_tip(skeleton_tip, line_params, original_mask, max_extend=100, board_center=center)
         
-        if tip is None and board_radius is not None:
-            tip = project_line_to_board(line_params, center, board_radius, start_point=skeleton_tip)
-        
-        if tip is None:
-            tip = project_to_tip(skeleton_tip, line_params, original_mask, max_extend=100, board_center=center)
+        # 2. If tip is OUTSIDE board (beyond polygon), use polygon intersection instead
+        #    This handles cases where tip is hidden behind wire or occluded
+        if tip is not None and board_radius is not None:
+            tip_dist = np.sqrt((tip[0] - center[0])**2 + (tip[1] - center[1])**2)
+            if tip_dist > board_radius * 0.95:  # Tip seems to be at/beyond board edge
+                # Try polygon intersection for more accuracy
+                if hasattr(detect_dart_skeleton, '_polygon_cache') and camera_id in detect_dart_skeleton._polygon_cache:
+                    polygon = detect_dart_skeleton._polygon_cache[camera_id]
+                    poly_tip = project_line_to_polygon(line_params, polygon, center, start_point=skeleton_tip)
+                    if poly_tip is not None:
+                        tip = poly_tip
         result["tip"] = tip
         result["confidence"] = 0.8
         
     elif len(endpoints) == 1:
-        tip = None
-        if hasattr(detect_dart_skeleton, '_polygon_cache') and camera_id in detect_dart_skeleton._polygon_cache:
-            polygon = detect_dart_skeleton._polygon_cache[camera_id]
-            tip = project_line_to_polygon(line_params, polygon, center, start_point=endpoints[0])
+        # Walk along mask to find tip
+        tip = project_to_tip(endpoints[0], line_params, original_mask, max_extend=100, board_center=center)
         
-        if tip is None and board_radius is not None and line_params is not None:
-            tip = project_line_to_board(line_params, center, board_radius, start_point=endpoints[0])
-        
-        if tip is None:
-            tip = project_to_tip(endpoints[0], line_params, original_mask, max_extend=100, board_center=center)
+        # Use polygon only if tip seems to be at board edge
+        if tip is not None and board_radius is not None:
+            tip_dist = np.sqrt((tip[0] - center[0])**2 + (tip[1] - center[1])**2)
+            if tip_dist > board_radius * 0.95:
+                if hasattr(detect_dart_skeleton, '_polygon_cache') and camera_id in detect_dart_skeleton._polygon_cache:
+                    polygon = detect_dart_skeleton._polygon_cache[camera_id]
+                    poly_tip = project_line_to_polygon(line_params, polygon, center, start_point=endpoints[0])
+                    if poly_tip is not None:
+                        tip = poly_tip
         result["tip"] = tip
         result["confidence"] = 0.6
     else:
