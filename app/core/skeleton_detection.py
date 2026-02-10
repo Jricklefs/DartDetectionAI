@@ -320,7 +320,7 @@ def find_tip_endpoint(endpoints, line_params, board_center=None):
 
 
 def get_adaptive_motion_mask(current_frame, previous_frame, camera_id=None, 
-                             fixed_threshold=20, use_background_model=True):
+                             fixed_threshold=35, use_background_model=True):
     """
     Get motion mask using either fixed threshold or adaptive background model.
     
@@ -353,6 +353,11 @@ def get_adaptive_motion_mask(current_frame, previous_frame, camera_id=None,
     
     # Fallback: fixed threshold
     _, motion_mask = cv2.threshold(gray_diff, fixed_threshold, 255, cv2.THRESH_BINARY)
+    
+    # Remove small noise blobs
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    motion_mask = cv2.morphologyEx(motion_mask, cv2.MORPH_OPEN, kernel)
+    
     return gray_diff, motion_mask
 
 
@@ -394,7 +399,7 @@ def detect_dart_skeleton(
     gray_diff, motion_mask_raw = get_adaptive_motion_mask(
         current_frame, previous_frame, 
         camera_id=camera_id,
-        fixed_threshold=20,
+        fixed_threshold=35,
         use_background_model=use_adaptive_threshold
     )
     
@@ -522,7 +527,7 @@ def detect_dart_hough(
     gray_diff, motion_mask_raw = get_adaptive_motion_mask(
         current_frame, previous_frame,
         camera_id=camera_id,
-        fixed_threshold=20,
+        fixed_threshold=35,
         use_background_model=use_adaptive_threshold
     )
     original_mask = motion_mask_raw.copy()
