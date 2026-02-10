@@ -15,6 +15,13 @@ except ImportError:
 import numpy as np
 import os
 
+# Optional background model for adaptive thresholding
+try:
+    from app.core.background_model import get_background_manager
+    HAS_BG_MODEL = True
+except ImportError:
+    HAS_BG_MODEL = False
+
 _detection_method = "skeleton"
 
 def set_detection_method(method: str) -> bool:
@@ -192,18 +199,19 @@ def find_dart_contour(motion_mask, min_area=500, min_aspect_ratio=2.0, existing_
     return best_contour
 
 
-def project_to_tip(skeleton_endpoint, line_params, original_mask, max_extend=50):
+def project_to_tip(skeleton_endpoint, line_params, original_mask, max_extend=50, board_center=None):
     """
     Project from skeleton endpoint along line direction to find true tip.
     
     First projects the endpoint onto the centerline, then walks along
-    the line in the +Y direction until we exit the original mask.
+    the line TOWARD THE BOARD CENTER until we exit the original mask.
     
     Args:
         skeleton_endpoint: (x, y) endpoint from skeleton
         line_params: (vx, vy, x0, y0) from cv2.fitLine
         original_mask: Pre-erosion motion mask
         max_extend: Maximum pixels to extend beyond skeleton
+        board_center: (cx, cy) - if provided, walk toward center instead of +Y
     
     Returns:
         (tip_x, tip_y) - projected tip position ON the centerline
@@ -231,9 +239,18 @@ def project_to_tip(skeleton_endpoint, line_params, original_mask, max_extend=50)
     # Start from projected point (on centerline)
     ex, ey = proj_x, proj_y
     
-    # Normalize direction to point +Y (downward in image)
-    if vy < 0:
-        vx, vy = -vx, -vy
+    # Determine which direction to walk
+    if board_center is not None:
+        cx, cy = board_center
+        # Walk toward board center
+        to_center = np.array([cx - ex, cy - ey])
+        dot = to_center[0] * vx + to_center[1] * vy
+        if dot < 0:
+            vx, vy = -vx, -vy
+    else:
+        # Default: walk +Y (downward in image)
+        if vy < 0:
+            vx, vy = -vx, -vy
     
     h, w = original_mask.shape[:2]
     
@@ -263,32 +280,80 @@ def project_to_tip(skeleton_endpoint, line_params, original_mask, max_extend=50)
     return (float(best_x), float(best_y))
 
 
-def find_tip_endpoint(endpoints, line_params):
+def find_tip_endpoint(endpoints, line_params, board_center=None):
     """
-    Find which skeleton endpoint is the tip end (in +Y direction).
+    Find which skeleton endpoint is the tip end (closest to board center).
     """
     if len(endpoints) < 2 or line_params is None:
         return endpoints[0] if endpoints else None
     
     vx, vy, x0, y0 = line_params
     
-    # Normalize to point +Y
-    if vy < 0:
-        vx, vy = -vx, -vy
-    
-    # Pick endpoint in +Y direction from line midpoint
-    best_endpoint = None
-    best_score = -float('inf')
-    
-    for (ex, ey) in endpoints:
-        to_endpoint = np.array([ex - x0, ey - y0])
-        score = to_endpoint[0] * vx + to_endpoint[1] * vy
+    if board_center is not None:
+        # Pick endpoint closest to board center
+        cx, cy = board_center
+        best_endpoint = None
+        best_dist = float('inf')
+        for (ex, ey) in endpoints:
+            dist = np.sqrt((ex - cx)**2 + (ey - cy)**2)
+            if dist < best_dist:
+                best_dist = dist
+                best_endpoint = (ex, ey)
+        return best_endpoint
+    else:
+        # Default: pick endpoint in +Y direction from line midpoint
+        if vy < 0:
+            vx, vy = -vx, -vy
         
-        if score > best_score:
-            best_score = score
-            best_endpoint = (ex, ey)
+        best_endpoint = None
+        best_score = -float('inf')
+        
+        for (ex, ey) in endpoints:
+            to_endpoint = np.array([ex - x0, ey - y0])
+            score = to_endpoint[0] * vx + to_endpoint[1] * vy
+            
+            if score > best_score:
+                best_score = score
+                best_endpoint = (ex, ey)
+        
+        return best_endpoint
+
+
+def get_adaptive_motion_mask(current_frame, previous_frame, camera_id=None, 
+                             fixed_threshold=20, use_background_model=True):
+    """
+    Get motion mask using either fixed threshold or adaptive background model.
     
-    return best_endpoint
+    Args:
+        current_frame: Current BGR frame
+        previous_frame: Previous BGR frame (before dart)
+        camera_id: Camera ID for background model lookup
+        fixed_threshold: Fixed threshold to use if no background model
+        use_background_model: Whether to use adaptive thresholding
+    
+    Returns:
+        (gray_diff, motion_mask) tuple
+    """
+    # Compute diff
+    diff = cv2.absdiff(current_frame, previous_frame)
+    gray_diff = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
+    
+    # Try adaptive thresholding via background model
+    if use_background_model and HAS_BG_MODEL and camera_id:
+        try:
+            bg_manager = get_background_manager()
+            diff_uint8, motion_mask = bg_manager.get_adaptive_diff(
+                camera_id, current_frame, previous_frame
+            )
+            # Use the adaptive mask if we got one
+            if motion_mask is not None and np.sum(motion_mask) > 0:
+                return gray_diff, motion_mask
+        except Exception as e:
+            pass  # Fall through to fixed threshold
+    
+    # Fallback: fixed threshold
+    _, motion_mask = cv2.threshold(gray_diff, fixed_threshold, 255, cv2.THRESH_BINARY)
+    return gray_diff, motion_mask
 
 
 def detect_dart_skeleton(
@@ -298,13 +363,17 @@ def detect_dart_skeleton(
     mask: np.ndarray = None,
     existing_dart_locations: list = None,
     debug: bool = False,
-    debug_name: str = "skeleton_debug"
+    debug_name: str = "skeleton_debug",
+    camera_id: str = None,
+    use_adaptive_threshold: bool = True
 ) -> dict:
     """
     Detect dart using skeleton-based approach with line projection.
     
     Args:
         existing_dart_locations: List of (x, y) tuples of previous dart tips to exclude
+        camera_id: Camera ID for adaptive background thresholding
+        use_adaptive_threshold: Use background model for adaptive thresholding
     """
     result = {
         "tip": None, 
@@ -321,12 +390,13 @@ def detect_dart_skeleton(
     
     cx, cy = center
     
-    # 1. Frame differencing
-    diff = cv2.absdiff(current_frame, previous_frame)
-    gray_diff = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
-    
-    # 2. Lower threshold to capture dart tip (tip is thin, low contrast)
-    _, motion_mask_raw = cv2.threshold(gray_diff, 20, 255, cv2.THRESH_BINARY)
+    # 1. Get motion mask (adaptive or fixed threshold)
+    gray_diff, motion_mask_raw = get_adaptive_motion_mask(
+        current_frame, previous_frame, 
+        camera_id=camera_id,
+        fixed_threshold=20,
+        use_background_model=use_adaptive_threshold
+    )
     
     # Keep original for tip projection (before erosion)
     original_mask = motion_mask_raw.copy()
@@ -395,16 +465,16 @@ def detect_dart_skeleton(
     endpoints = find_skeleton_endpoints(skeleton)
     
     if len(endpoints) >= 2 and line_params:
-        # Find which endpoint is the tip end
-        skeleton_tip = find_tip_endpoint(endpoints, line_params)
+        # Find which endpoint is the tip end (closest to board center)
+        skeleton_tip = find_tip_endpoint(endpoints, line_params, board_center=center)
         
         # Project along line to find true tip in original mask
-        tip = project_to_tip(skeleton_tip, line_params, original_mask, max_extend=100)
+        tip = project_to_tip(skeleton_tip, line_params, original_mask, max_extend=100, board_center=center)
         result["tip"] = tip
         result["confidence"] = 0.8
         
     elif len(endpoints) == 1:
-        tip = project_to_tip(endpoints[0], line_params, original_mask, max_extend=100)
+        tip = project_to_tip(endpoints[0], line_params, original_mask, max_extend=100, board_center=center)
         result["tip"] = tip
         result["confidence"] = 0.6
     else:
@@ -430,7 +500,9 @@ def detect_dart_hough(
     mask: np.ndarray = None,
     existing_dart_locations: list = None,
     debug: bool = False,
-    debug_name: str = "hough_debug"
+    debug_name: str = "hough_debug",
+    camera_id: str = None,
+    use_adaptive_threshold: bool = True
 ) -> dict:
     """Detect dart using Hough line detection."""
     result = {"tip": None, "line": None, "confidence": 0.0, "method": "hough"}
@@ -446,12 +518,13 @@ def detect_dart_hough(
     
     cx, cy = center
     
-    # Frame difference
-    diff = cv2.absdiff(current_frame, previous_frame)
-    gray_diff = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
-    
-    # Fixed low threshold for original mask (used for tip projection)
-    _, motion_mask_raw = cv2.threshold(gray_diff, 20, 255, cv2.THRESH_BINARY)
+    # Get motion mask (adaptive or fixed)
+    gray_diff, motion_mask_raw = get_adaptive_motion_mask(
+        current_frame, previous_frame,
+        camera_id=camera_id,
+        fixed_threshold=20,
+        use_background_model=use_adaptive_threshold
+    )
     original_mask = motion_mask_raw.copy()
     
     # CLAHE enhancement for better edge detection
@@ -507,7 +580,9 @@ def detect_dart_hough(
                              maxLineGap=int(10 * scale))
     
     if lines is None or len(lines) == 0:
-        return detect_dart_skeleton(current_frame, previous_frame, center, mask, debug)
+        return detect_dart_skeleton(current_frame, previous_frame, center, mask, 
+                                   existing_dart_locations, debug, debug_name,
+                                   camera_id, use_adaptive_threshold)
     
     # Filter for dart-like lines
     dart_lines = []
@@ -541,7 +616,9 @@ def detect_dart_hough(
         dart_lines.append((x1, y1, x2, y2, length, alignment))
     
     if not dart_lines:
-        return detect_dart_skeleton(current_frame, previous_frame, center, mask, debug)
+        return detect_dart_skeleton(current_frame, previous_frame, center, mask,
+                                   existing_dart_locations, debug, debug_name,
+                                   camera_id, use_adaptive_threshold)
     
     # Select best line
     best = max(dart_lines, key=lambda l: l[4] * l[5])
@@ -555,10 +632,10 @@ def detect_dart_hough(
     
     # Find tip endpoint and project
     endpoints = [(x1, y1), (x2, y2)]
-    skeleton_tip = find_tip_endpoint(endpoints, (vx, vy, x0, y0))
+    skeleton_tip = find_tip_endpoint(endpoints, (vx, vy, x0, y0), board_center=center)
     
     if skeleton_tip:
-        tip = project_to_tip(skeleton_tip, (vx, vy, x0, y0), original_mask, max_extend=100)
+        tip = project_to_tip(skeleton_tip, (vx, vy, x0, y0), original_mask, max_extend=100, board_center=center)
         result["tip"] = tip
         result["confidence"] = min(1.0, alignment * (length / 80.0))
     else:

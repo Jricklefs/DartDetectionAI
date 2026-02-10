@@ -29,6 +29,7 @@ from app.core.calibration import (
 )
 from app.core.stereo_calibration import StereoCalibrator, StereoCalibration, generate_checkerboard_pdf
 from app.core.scoring import scoring_system
+from app.core.background_model import get_background_manager, reset_background_models
 from app.core.geometry import (
     DARTBOARD_SEGMENTS,
     BULL_RADIUS_MM,
@@ -853,6 +854,12 @@ def clear_cache(board_id: str):
         if board_id in _last_raw_images:
             del _last_raw_images[board_id]
             logger.debug(f"Cleared last raw images for board {board_id}")
+    # Reset background models for fresh baseline
+    try:
+        reset_background_models()
+        logger.debug(f"Reset background models for board {board_id}")
+    except Exception as e:
+        logger.warning(f"Could not reset background models: {e}")
 
 def get_cached_dart_count(board_id: str) -> int:
     """Get the dart count for cached board."""
