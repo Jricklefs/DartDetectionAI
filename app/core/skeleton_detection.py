@@ -317,6 +317,90 @@ def project_to_tip(skeleton_endpoint, line_params, original_mask, max_extend=50,
     return (float(best_x), float(best_y))
 
 
+
+def project_line_to_board(line_params, board_center, board_radius, start_point=None):
+    """
+    Project the dart centerline until it intersects the board boundary.
+    
+    The dart tip is where the centerline meets the board surface.
+    This works even when the actual tip is occluded or behind a wire.
+    
+    Args:
+        line_params: (vx, vy, x0, y0) from cv2.fitLine
+        board_center: (cx, cy) center of dartboard in pixels
+        board_radius: radius of board (outer double) in pixels
+        start_point: optional starting point to determine direction
+    
+    Returns:
+        (tip_x, tip_y) where line intersects board, or None if no intersection
+    """
+    if line_params is None or board_center is None:
+        return None
+    
+    vx, vy, x0, y0 = line_params
+    cx, cy = board_center
+    
+    # Normalize direction
+    length = np.sqrt(vx*vx + vy*vy)
+    if length < 0.001:
+        return None
+    vx, vy = vx/length, vy/length
+    
+    # Determine direction: walk TOWARD board center
+    if start_point is not None:
+        sx, sy = start_point
+    else:
+        sx, sy = x0, y0
+    
+    to_center = np.array([cx - sx, cy - sy])
+    dot = to_center[0] * vx + to_center[1] * vy
+    if dot < 0:
+        vx, vy = -vx, -vy  # Flip to point toward center
+    
+    # Line equation: P(t) = (x0, y0) + t * (vx, vy)
+    # Circle equation: (x - cx)^2 + (y - cy)^2 = r^2
+    # Substitute and solve quadratic for t
+    
+    # (x0 + t*vx - cx)^2 + (y0 + t*vy - cy)^2 = r^2
+    # Let dx = x0 - cx, dy = y0 - cy
+    dx = x0 - cx
+    dy = y0 - cy
+    
+    # a*t^2 + b*t + c = 0
+    a = vx*vx + vy*vy  # = 1 since normalized
+    b = 2 * (dx*vx + dy*vy)
+    c = dx*dx + dy*dy - board_radius*board_radius
+    
+    discriminant = b*b - 4*a*c
+    
+    if discriminant < 0:
+        # Line doesn't intersect circle - shouldn't happen for valid darts
+        return None
+    
+    sqrt_disc = np.sqrt(discriminant)
+    t1 = (-b - sqrt_disc) / (2*a)
+    t2 = (-b + sqrt_disc) / (2*a)
+    
+    # We want the intersection in the direction we're walking (positive t if pointing right way)
+    # Pick the one that's in front of us (positive t and closest)
+    candidates = []
+    for t in [t1, t2]:
+        if t > -50:  # Allow slight negative for points just outside
+            px = x0 + t * vx
+            py = y0 + t * vy
+            candidates.append((t, px, py))
+    
+    if not candidates:
+        return None
+    
+    # Pick smallest positive t (closest intersection in walking direction)
+    candidates.sort(key=lambda x: abs(x[0]))
+    _, tip_x, tip_y = candidates[0]
+    
+    return (float(tip_x), float(tip_y))
+
+
+
 def find_tip_endpoint(endpoints, line_params, board_center=None, board_radius=None, dart_mask=None):
     """
     Find which skeleton endpoint is the tip end.
@@ -544,13 +628,24 @@ def detect_dart_skeleton(
         # Find which endpoint is the tip (inside board boundary)
         skeleton_tip = find_tip_endpoint(endpoints, line_params, board_center=center, board_radius=board_radius, dart_mask=dart_mask)
         
-        # Project along line to find true tip in original mask
-        tip = project_to_tip(skeleton_tip, line_params, original_mask, max_extend=100, board_center=center)
+        # Project centerline to board surface (even if tip not visible)
+        if board_radius is not None:
+            tip = project_line_to_board(line_params, center, board_radius, start_point=skeleton_tip)
+            if tip is None:
+                # Fallback to mask-based projection
+                tip = project_to_tip(skeleton_tip, line_params, original_mask, max_extend=100, board_center=center)
+        else:
+            tip = project_to_tip(skeleton_tip, line_params, original_mask, max_extend=100, board_center=center)
         result["tip"] = tip
         result["confidence"] = 0.8
         
     elif len(endpoints) == 1:
-        tip = project_to_tip(endpoints[0], line_params, original_mask, max_extend=100, board_center=center)
+        if board_radius is not None and line_params is not None:
+            tip = project_line_to_board(line_params, center, board_radius, start_point=endpoints[0])
+            if tip is None:
+                tip = project_to_tip(endpoints[0], line_params, original_mask, max_extend=100, board_center=center)
+        else:
+            tip = project_to_tip(endpoints[0], line_params, original_mask, max_extend=100, board_center=center)
         result["tip"] = tip
         result["confidence"] = 0.6
     else:
