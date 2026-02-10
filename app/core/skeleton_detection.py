@@ -317,9 +317,15 @@ def project_to_tip(skeleton_endpoint, line_params, original_mask, max_extend=50,
     return (float(best_x), float(best_y))
 
 
-def find_tip_endpoint(endpoints, line_params, board_center=None):
+def find_tip_endpoint(endpoints, line_params, board_center=None, board_radius=None):
     """
-    Find which skeleton endpoint is the tip end (closest to board center).
+    Find which skeleton endpoint is the tip end.
+    
+    The tip is the point ON THE BOARD SURFACE (inside the board boundary).
+    The flight sticks OUT from the board (further from the board plane).
+    
+    Strategy: Pick the endpoint that is INSIDE the board boundary (within radius).
+    The tip is where dart meets board. Flight is beyond the board edge.
     """
     if len(endpoints) < 2 or line_params is None:
         return endpoints[0] if endpoints else None
@@ -327,18 +333,38 @@ def find_tip_endpoint(endpoints, line_params, board_center=None):
     vx, vy, x0, y0 = line_params
     
     if board_center is not None:
-        # Pick endpoint closest to board center
         cx, cy = board_center
+        
+        # Use calibration radius if provided, otherwise estimate
+        # Double ring outer edge is ~170mm from center, maps to ~180-220px typically
+        if board_radius is None:
+            board_radius = 200  # Default estimate
+        
         best_endpoint = None
-        best_dist = float('inf')
+        best_score = float('inf')  # Lower = better (more inside board)
+        
+        endpoint_info = []
         for (ex, ey) in endpoints:
-            dist = np.sqrt((ex - cx)**2 + (ey - cy)**2)
-            if dist < best_dist:
-                best_dist = dist
+            dist_from_center = np.sqrt((ex - cx)**2 + (ey - cy)**2)
+            
+            # Score = how far BEYOND the board boundary
+            # Negative = inside board (this is the TIP!)
+            # Positive = outside board (this is the FLIGHT!)
+            beyond_board = dist_from_center - board_radius
+            
+            endpoint_info.append(f"({ex:.0f},{ey:.0f}) d={dist_from_center:.0f} beyond={beyond_board:.0f}")
+            
+            if beyond_board < best_score:
+                best_score = beyond_board
                 best_endpoint = (ex, ey)
+        
+        # Debug log
+        with open(r"C:\Users\clawd\skeleton_endpoints.txt", "a") as f:
+            f.write(f"center=({cx:.0f},{cy:.0f}) radius={board_radius:.0f} [{'; '.join(endpoint_info)}] -> tip=({best_endpoint[0]:.0f},{best_endpoint[1]:.0f})\n")
+        
         return best_endpoint
     else:
-        # Default: pick endpoint in +Y direction from line midpoint
+        # Fallback: use line direction
         if vy < 0:
             vx, vy = -vx, -vy
         
@@ -427,7 +453,8 @@ def detect_dart_skeleton(
     debug: bool = False,
     debug_name: str = "skeleton_debug",
     camera_id: str = None,
-    use_adaptive_threshold: bool = True
+    use_adaptive_threshold: bool = True,
+    board_radius: float = None
 ) -> dict:
     """
     Detect dart using skeleton-based approach with line projection.
@@ -436,6 +463,7 @@ def detect_dart_skeleton(
         existing_dart_locations: List of (x, y) tuples of previous dart tips to exclude
         camera_id: Camera ID for adaptive background thresholding
         use_adaptive_threshold: Use background model for adaptive thresholding
+        board_radius: Outer radius of board in pixels (from calibration) for tip selection
     """
     result = {
         "tip": None, 
@@ -527,8 +555,8 @@ def detect_dart_skeleton(
     endpoints = find_skeleton_endpoints(skeleton)
     
     if len(endpoints) >= 2 and line_params:
-        # Find which endpoint is the tip end (closest to board center)
-        skeleton_tip = find_tip_endpoint(endpoints, line_params, board_center=center)
+        # Find which endpoint is the tip (inside board boundary)
+        skeleton_tip = find_tip_endpoint(endpoints, line_params, board_center=center, board_radius=board_radius)
         
         # Project along line to find true tip in original mask
         tip = project_to_tip(skeleton_tip, line_params, original_mask, max_extend=100, board_center=center)
@@ -564,7 +592,8 @@ def detect_dart_hough(
     debug: bool = False,
     debug_name: str = "hough_debug",
     camera_id: str = None,
-    use_adaptive_threshold: bool = True
+    use_adaptive_threshold: bool = True,
+    board_radius: float = None
 ) -> dict:
     """Detect dart using Hough line detection."""
     result = {"tip": None, "line": None, "confidence": 0.0, "method": "hough"}
@@ -694,7 +723,7 @@ def detect_dart_hough(
     
     # Find tip endpoint and project
     endpoints = [(x1, y1), (x2, y2)]
-    skeleton_tip = find_tip_endpoint(endpoints, (vx, vy, x0, y0), board_center=center)
+    skeleton_tip = find_tip_endpoint(endpoints, (vx, vy, x0, y0), board_center=center, board_radius=board_radius)
     
     if skeleton_tip:
         tip = project_to_tip(skeleton_tip, (vx, vy, x0, y0), original_mask, max_extend=100, board_center=center)

@@ -1627,6 +1627,16 @@ async def detect_tips(
                     # Get existing dart locations for this camera to exclude
                     existing_locs = get_existing_dart_locations(board_id, cam.camera_id)
                     
+                    # Get board radius from outer double ellipse for tip selection
+                    outer_ellipse = calibration_data.get('outer_double_ellipse', {})
+                    # Ellipse is (cx, cy, a, b, angle) - take average of a and b as radius
+                    board_radius = None
+                    if outer_ellipse:
+                        a = outer_ellipse.get('a', outer_ellipse.get(2, 200))
+                        b = outer_ellipse.get('b', outer_ellipse.get(3, 200))
+                        if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+                            board_radius = (a + b) / 2
+                    
                     skel_result = detect_dart_skeleton(
                         current_img, 
                         prev_img, 
@@ -1634,7 +1644,8 @@ async def detect_tips(
                         mask=mask,
                         existing_dart_locations=existing_locs,
                         camera_id=cam.camera_id,
-                        use_adaptive_threshold=True
+                        use_adaptive_threshold=True,
+                        board_radius=board_radius
                     )
                     
                     # DEBUG: Log skeleton result
