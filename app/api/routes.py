@@ -1670,7 +1670,8 @@ async def detect_tips(
                             "confidence": skel_result.get("confidence", 0.5),
                             "method": "skeleton",
                             "view_quality": skel_result.get("view_quality", 0.5),
-                            "line": line_info  # (vx, vy, x0, y0) for line intersection voting
+                            "line": line_info,  # (vx, vy, x0, y0) for line intersection voting
+                            "camera_id": cam.camera_id  # Required for homography transform
                         }]
                         logger.info(f"[DETECT] Skeleton found tip at ({tip_x:.1f}, {tip_y:.1f}) view_quality={skel_result.get('view_quality', 0.5):.2f} line={line_info}")
                     else:
