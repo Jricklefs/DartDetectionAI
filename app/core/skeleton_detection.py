@@ -317,69 +317,86 @@ def project_to_tip(skeleton_endpoint, line_params, original_mask, max_extend=50,
     return (float(best_x), float(best_y))
 
 
-def find_tip_endpoint(endpoints, line_params, board_center=None, board_radius=None):
+def find_tip_endpoint(endpoints, line_params, board_center=None, board_radius=None, dart_mask=None):
     """
     Find which skeleton endpoint is the tip end.
     
-    The tip is the point ON THE BOARD SURFACE (inside the board boundary).
-    The flight sticks OUT from the board (further from the board plane).
+    Strategy (in order of preference):
+    1. If dart_mask provided: tip is the NARROWER end (less local white pixels)
+    2. If board_center provided: tip is CLOSER to board center
+    3. Fallback: use line direction
     
-    Strategy: Pick the endpoint that is INSIDE the board boundary (within radius).
-    The tip is where dart meets board. Flight is beyond the board edge.
+    The tip is thin and points toward the board. The flight is wide.
     """
     if len(endpoints) < 2 or line_params is None:
         return endpoints[0] if endpoints else None
     
     vx, vy, x0, y0 = line_params
     
+    # Method 1: Width-based (most reliable)
+    # Count white pixels near each endpoint - tip end is narrower
+    if dart_mask is not None:
+        endpoint_widths = []
+        h, w = dart_mask.shape[:2]
+        
+        for (ex, ey) in endpoints:
+            ex_int, ey_int = int(ex), int(ey)
+            # Sample in 15x15 neighborhood
+            y_min, y_max = max(0, ey_int-7), min(h, ey_int+8)
+            x_min, x_max = max(0, ex_int-7), min(w, ex_int+8)
+            local_region = dart_mask[y_min:y_max, x_min:x_max]
+            width = np.sum(local_region > 0)
+            endpoint_widths.append(((ex, ey), width))
+        
+        # Sort by width - tip is narrowest
+        endpoint_widths.sort(key=lambda x: x[1])
+        tip = endpoint_widths[0][0]
+        
+        # Debug log
+        with open(r"C:\Users\clawd\skeleton_endpoints.txt", "a") as f:
+            info = [f"({e[0]:.0f},{e[1]:.0f}) w={w}" for e, w in endpoint_widths]
+            f.write(f"WIDTH-BASED: [{'; '.join(info)}] -> tip=({tip[0]:.0f},{tip[1]:.0f})\n")
+        
+        return tip
+    
+    # Method 2: Distance to board center (tip is closer to center)
     if board_center is not None:
         cx, cy = board_center
         
-        # Use calibration radius if provided, otherwise estimate
-        # Double ring outer edge is ~170mm from center, maps to ~180-220px typically
-        if board_radius is None:
-            board_radius = 200  # Default estimate
-        
         best_endpoint = None
-        best_score = float('inf')  # Lower = better (more inside board)
+        best_dist = float('inf')
         
         endpoint_info = []
         for (ex, ey) in endpoints:
             dist_from_center = np.sqrt((ex - cx)**2 + (ey - cy)**2)
+            endpoint_info.append(f"({ex:.0f},{ey:.0f}) d={dist_from_center:.0f}")
             
-            # Score = how far BEYOND the board boundary
-            # Negative = inside board (this is the TIP!)
-            # Positive = outside board (this is the FLIGHT!)
-            beyond_board = dist_from_center - board_radius
-            
-            endpoint_info.append(f"({ex:.0f},{ey:.0f}) d={dist_from_center:.0f} beyond={beyond_board:.0f}")
-            
-            if beyond_board < best_score:
-                best_score = beyond_board
+            if dist_from_center < best_dist:
+                best_dist = dist_from_center
                 best_endpoint = (ex, ey)
         
         # Debug log
         with open(r"C:\Users\clawd\skeleton_endpoints.txt", "a") as f:
-            f.write(f"center=({cx:.0f},{cy:.0f}) radius={board_radius:.0f} [{'; '.join(endpoint_info)}] -> tip=({best_endpoint[0]:.0f},{best_endpoint[1]:.0f})\n")
+            f.write(f"CENTER-BASED: center=({cx:.0f},{cy:.0f}) [{'; '.join(endpoint_info)}] -> tip=({best_endpoint[0]:.0f},{best_endpoint[1]:.0f})\n")
         
         return best_endpoint
-    else:
-        # Fallback: use line direction
-        if vy < 0:
-            vx, vy = -vx, -vy
+    
+    # Method 3: Fallback - use line direction
+    if vy < 0:
+        vx, vy = -vx, -vy
+    
+    best_endpoint = None
+    best_score = -float('inf')
+    
+    for (ex, ey) in endpoints:
+        to_endpoint = np.array([ex - x0, ey - y0])
+        score = to_endpoint[0] * vx + to_endpoint[1] * vy
         
-        best_endpoint = None
-        best_score = -float('inf')
-        
-        for (ex, ey) in endpoints:
-            to_endpoint = np.array([ex - x0, ey - y0])
-            score = to_endpoint[0] * vx + to_endpoint[1] * vy
-            
-            if score > best_score:
-                best_score = score
-                best_endpoint = (ex, ey)
-        
-        return best_endpoint
+        if score > best_score:
+            best_score = score
+            best_endpoint = (ex, ey)
+    
+    return best_endpoint
 
 
 def get_adaptive_motion_mask(current_frame, previous_frame, camera_id=None, 
@@ -525,7 +542,7 @@ def detect_dart_skeleton(
     
     if len(endpoints) >= 2 and line_params:
         # Find which endpoint is the tip (inside board boundary)
-        skeleton_tip = find_tip_endpoint(endpoints, line_params, board_center=center, board_radius=board_radius)
+        skeleton_tip = find_tip_endpoint(endpoints, line_params, board_center=center, board_radius=board_radius, dart_mask=dart_mask)
         
         # Project along line to find true tip in original mask
         tip = project_to_tip(skeleton_tip, line_params, original_mask, max_extend=100, board_center=center)
@@ -692,7 +709,7 @@ def detect_dart_hough(
     
     # Find tip endpoint and project
     endpoints = [(x1, y1), (x2, y2)]
-    skeleton_tip = find_tip_endpoint(endpoints, (vx, vy, x0, y0), board_center=center, board_radius=board_radius)
+    skeleton_tip = find_tip_endpoint(endpoints, (vx, vy, x0, y0), board_center=center, board_radius=board_radius, dart_mask=original_mask)
     
     if skeleton_tip:
         tip = project_to_tip(skeleton_tip, (vx, vy, x0, y0), original_mask, max_extend=100, board_center=center)
