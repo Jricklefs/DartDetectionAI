@@ -1636,16 +1636,16 @@ async def detect_tips(
                     
                     if skel_result.get("tip"):
                         tip_x, tip_y = skel_result["tip"]
+                        line_info = skel_result.get("line")
                         tips = [{
                             "x_px": tip_x,
                             "y_px": tip_y,
                             "confidence": skel_result.get("confidence", 0.5),
                             "method": "skeleton",
                             "view_quality": skel_result.get("view_quality", 0.5),
-                            "line": skel_result.get("line")  # (vx, vy, x0, y0) for line intersection voting
+                            "line": line_info  # (vx, vy, x0, y0) for line intersection voting
                         }]
-                        line_info = skel_result.get("line")
-                        logger.info(f"[DETECT] Skeleton found tip at ({tip_x:.1f}, {tip_y:.1f}) view_quality={skel_result.get('view_quality', 0.5):.2f} line={line_info is not None}")
+                        logger.info(f"[DETECT] Skeleton found tip at ({tip_x:.1f}, {tip_y:.1f}) view_quality={skel_result.get('view_quality', 0.5):.2f} line={line_info}")
                     else:
                         tips = []
                         logger.info(f"[DETECT] Skeleton found no tip")
@@ -1944,9 +1944,14 @@ async def detect_tips(
     
     # Try line intersection voting for skeleton/hough detection
     line_intersection_result = None
+    logger.info(f"[LINE-VOTE] detection_method={detection_method}, all_tips={len(all_tips)}")
+    for t in all_tips:
+        logger.info(f"[LINE-VOTE]   tip cam={t.get('camera_id')} line={t.get('line')}")
+    
     if detection_method in ("skeleton", "hough") and len(all_tips) >= 2:
         # Check if tips have line data
         tips_with_lines = [t for t in all_tips if t.get('line')]
+        logger.info(f"[LINE-VOTE] tips_with_lines={len(tips_with_lines)}")
         if len(tips_with_lines) >= 2:
             logger.info(f"[LINE-VOTE] Attempting line intersection with {len(tips_with_lines)} lines")
             line_intersection_result = vote_with_line_intersection(tips_with_lines, {})
