@@ -28,6 +28,63 @@ def get_detection_method() -> str:
     return _detection_method
 
 
+def save_debug_image(debug_name, current_frame, diff, motion_mask, original_mask, 
+                     dart_contour, tip, center, line_params=None):
+    """Save debug visualization showing detection stages."""
+    debug_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "debug_images")
+    os.makedirs(debug_dir, exist_ok=True)
+    
+    h, w = current_frame.shape[:2]
+    
+    # Create 2x2 grid
+    grid = np.zeros((h, w * 2, 3), dtype=np.uint8)
+    
+    # Top-left: current frame with overlays
+    frame_vis = current_frame.copy()
+    if dart_contour is not None:
+        cv2.drawContours(frame_vis, [dart_contour], -1, (0, 255, 0), 2)
+    if tip:
+        cv2.circle(frame_vis, (int(tip[0]), int(tip[1])), 8, (0, 0, 255), -1)
+    if center:
+        cv2.circle(frame_vis, (int(center[0]), int(center[1])), 5, (255, 0, 0), -1)
+    if line_params:
+        vx, vy, x0, y0 = line_params
+        pt1 = (int(x0 - vx * 200), int(y0 - vy * 200))
+        pt2 = (int(x0 + vx * 200), int(y0 + vy * 200))
+        cv2.line(frame_vis, pt1, pt2, (255, 255, 0), 2)
+    cv2.putText(frame_vis, "Current + Contour + Tip", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,255), 2)
+    
+    # Top-right: diff
+    diff_vis = cv2.cvtColor(diff, cv2.COLOR_GRAY2BGR) if len(diff.shape) == 2 else diff
+    cv2.putText(diff_vis, "Frame Diff", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,255), 2)
+    
+    # Stack top row
+    top_row = np.hstack([frame_vis, diff_vis])
+    
+    # Bottom-left: motion mask
+    mask_vis = cv2.cvtColor(motion_mask, cv2.COLOR_GRAY2BGR)
+    if dart_contour is not None:
+        cv2.drawContours(mask_vis, [dart_contour], -1, (0, 255, 0), 2)
+    cv2.putText(mask_vis, "Motion Mask", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,255), 2)
+    
+    # Bottom-right: original mask with tip
+    orig_vis = cv2.cvtColor(original_mask, cv2.COLOR_GRAY2BGR)
+    if tip:
+        cv2.circle(orig_vis, (int(tip[0]), int(tip[1])), 8, (0, 0, 255), -1)
+    cv2.putText(orig_vis, "Original Mask", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,255), 2)
+    
+    # Stack bottom row
+    bottom_row = np.hstack([mask_vis, orig_vis])
+    
+    # Full grid
+    full_grid = np.vstack([top_row, bottom_row])
+    
+    # Save
+    out_path = os.path.join(debug_dir, f"{debug_name}.jpg")
+    cv2.imwrite(out_path, full_grid)
+    return out_path
+
+
 def find_skeleton_endpoints(skeleton):
     """Find endpoints of a skeletonized line (pixels with 1 neighbor)."""
     skel = (skeleton > 0).astype(np.uint8)
@@ -177,7 +234,8 @@ def detect_dart_skeleton(
     previous_frame: np.ndarray,
     center: tuple = None,
     mask: np.ndarray = None,
-    debug: bool = False
+    debug: bool = False,
+    debug_name: str = "skeleton_debug"
 ) -> dict:
     """
     Detect dart using skeleton-based approach with line projection.
@@ -290,24 +348,8 @@ def detect_dart_skeleton(
             result["confidence"] = 0.4
     
     if debug and result["tip"]:
-        debug_dir = r"C:\Users\clawd\DartDetectionAI\skeleton_debug"
-        os.makedirs(debug_dir, exist_ok=True)
-        from datetime import datetime
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        
-        cv2.imwrite(os.path.join(debug_dir, f"{timestamp}_1_raw.jpg"), motion_mask_raw)
-        cv2.imwrite(os.path.join(debug_dir, f"{timestamp}_2_clean.jpg"), motion_mask)
-        cv2.imwrite(os.path.join(debug_dir, f"{timestamp}_3_skel.jpg"), skeleton)
-        
-        debug_img = current_frame.copy()
-        cv2.drawContours(debug_img, [dart_contour], -1, (0, 255, 0), 2)
-        debug_img[skeleton > 0] = [255, 255, 0]
-        cv2.circle(debug_img, (int(cx), int(cy)), 10, (255, 0, 0), 2)
-        for (ex, ey) in endpoints:
-            cv2.circle(debug_img, (int(ex), int(ey)), 6, (255, 255, 0), -1)
-        tip_x, tip_y = int(result["tip"][0]), int(result["tip"][1])
-        cv2.circle(debug_img, (tip_x, tip_y), 10, (0, 0, 255), 3)
-        cv2.imwrite(os.path.join(debug_dir, f"{timestamp}_4_result.jpg"), debug_img)
+        save_debug_image(debug_name, current_frame, gray_diff, motion_mask, original_mask,
+                        dart_contour, result["tip"], center, result.get("line"))
     
     return result
 
@@ -456,5 +498,10 @@ def detect_dart_hough(
         tip = (x1, y1) if d1 < d2 else (x2, y2)
         result["tip"] = (float(tip[0]), float(tip[1]))
         result["confidence"] = min(1.0, alignment * (length / 80.0))
+    
+    # Save debug image if requested
+    if debug and result["tip"]:
+        save_debug_image(debug_name, current_frame, gray_diff, motion_mask, original_mask,
+                        dart_contour, result["tip"], center, result.get("line"))
     
     return result
