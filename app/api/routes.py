@@ -3326,11 +3326,14 @@ async def replay_single_dart(request: ReplayRequest):
     from collections import Counter
     
     # Step 1: Vote on segment (combine all multipliers for same segment)
+    # Weight = confidence * view_quality (better camera angle = more weight)
     segment_votes = {}
     for v in camera_votes:
         seg = v["segment"]
-        # Use confidence only - view_quality was hurting accuracy
-        weight = v.get("confidence", 1.0)
+        conf = v.get("confidence", 1.0)
+        view_q = v.get("view_quality", 0.5)
+        # Combined weight: confidence * (0.5 + 0.5*view_quality) to give view_quality some influence
+        weight = conf * (0.5 + 0.5 * view_q)
         segment_votes[seg] = segment_votes.get(seg, 0) + weight
     
     winning_segment = max(segment_votes.keys(), key=lambda k: segment_votes[k])
@@ -3340,7 +3343,9 @@ async def replay_single_dart(request: ReplayRequest):
     for v in camera_votes:
         if v["segment"] == winning_segment:
             mult = v["multiplier"]
-            weight = v.get("confidence", 1.0)
+            conf = v.get("confidence", 1.0)
+            view_q = v.get("view_quality", 0.5)
+            weight = conf * (0.5 + 0.5 * view_q)
             multiplier_votes[mult] = multiplier_votes.get(mult, 0) + weight
     
     if multiplier_votes:
