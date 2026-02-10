@@ -561,6 +561,16 @@ def init_board_cache(board_id: str, baseline_images: Dict[str, np.ndarray]):
             # Format: [(cam_id, x, y, dart_number), ...]
             "source_of_truth": []
         }
+    
+    # Initialize background models with baseline images
+    try:
+        bg_manager = get_background_manager()
+        for cam_id, img in baseline_images.items():
+            bg_manager.initialize(cam_id, img)
+        logger.info(f"Initialized background models for {len(baseline_images)} cameras")
+    except Exception as e:
+        logger.warning(f"Could not initialize background models: {e}")
+    
     logger.info(f"Initialized cache for board {board_id} with {len(baseline_images)} cameras")
 
 def update_masks_with_diff(board_id: str, current_images: Dict[str, np.ndarray], threshold: int = 40) -> Dict[str, np.ndarray]:
@@ -1560,7 +1570,9 @@ async def detect_tips(
                         prev_img, 
                         center=tuple(center),
                         mask=mask,
-                        existing_dart_locations=existing_locs
+                        existing_dart_locations=existing_locs,
+                        camera_id=cam.camera_id,
+                        use_adaptive_threshold=True
                     )
                     
                     # DEBUG: Log skeleton result
