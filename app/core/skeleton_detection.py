@@ -385,63 +385,37 @@ def find_tip_endpoint(endpoints, line_params, board_center=None, board_radius=No
 def get_adaptive_motion_mask(current_frame, previous_frame, camera_id=None, 
                              fixed_threshold=20, use_background_model=False):
     """
-    Get motion mask using frame differencing with improved preprocessing.
-    
-    Pipeline:
-    1. Gaussian blur both frames (reduces sensor noise)
-    2. Compute absolute difference
-    3. Apply threshold
-    4. Morphological opening (remove noise)
-    5. Morphological closing (fill gaps in dart)
+    Autodarts-style simple diff: blur -> diff -> threshold.
+    Minimal morphology to preserve dart shape, especially the tip.
     
     Args:
-        current_frame: Current BGR frame
+        current_frame: Current BGR frame (with dart)
         previous_frame: Previous BGR frame (before dart)
-        camera_id: Camera ID for background model lookup
-        fixed_threshold: Fixed threshold (lowered to 20 since blur reduces noise)
-        use_background_model: Whether to use adaptive thresholding (disabled)
+        camera_id: Unused (kept for API compatibility)
+        fixed_threshold: Threshold value (default 20)
+        use_background_model: Unused (kept for API compatibility)
     
     Returns:
         (gray_diff, motion_mask) tuple
     """
-    # STEP 1: Gaussian blur to reduce camera sensor noise
-    # This is key - reduces false positives from sensor noise
+    # STEP 1: Gaussian blur to reduce sensor noise
     blur_current = cv2.GaussianBlur(current_frame, (5, 5), 0)
     blur_previous = cv2.GaussianBlur(previous_frame, (5, 5), 0)
     
-    # STEP 2: Compute diff on blurred frames
+    # STEP 2: Compute diff
     diff = cv2.absdiff(blur_current, blur_previous)
     gray_diff = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
     
-    # Keep original diff for return (useful for debugging)
-    diff_orig = cv2.absdiff(current_frame, previous_frame)
-    gray_diff_orig = cv2.cvtColor(diff_orig, cv2.COLOR_BGR2GRAY)
-    
-    # Try adaptive thresholding via background model (disabled by default)
-    if use_background_model and HAS_BG_MODEL and camera_id:
-        try:
-            bg_manager = get_background_manager()
-            diff_uint8, motion_mask = bg_manager.get_adaptive_diff(
-                camera_id, current_frame, previous_frame
-            )
-            if motion_mask is not None and np.sum(motion_mask) > 0:
-                return gray_diff_orig, motion_mask
-        except Exception:
-            pass  # Fall through to fixed threshold
-    
-    # STEP 3: Apply fixed threshold (lower now since blur reduced noise)
+    # STEP 3: Simple threshold - that's it!
+    # Autodarts uses minimal processing to preserve dart shape
     _, motion_mask = cv2.threshold(gray_diff, fixed_threshold, 255, cv2.THRESH_BINARY)
     
-    # STEP 4: Morphological opening - removes small noise blobs
-    open_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    motion_mask = cv2.morphologyEx(motion_mask, cv2.MORPH_OPEN, open_kernel)
+    # Optional: very light opening to remove isolated noise pixels
+    # Keep kernel tiny (2x2) to avoid eating the tip
+    # open_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
+    # motion_mask = cv2.morphologyEx(motion_mask, cv2.MORPH_OPEN, open_kernel)
     
-    # STEP 5: Morphological closing - fills small holes in dart silhouette
-    # This helps create a more solid dart shape for skeleton extraction
-    close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    motion_mask = cv2.morphologyEx(motion_mask, cv2.MORPH_CLOSE, close_kernel)
-    
-    return gray_diff_orig, motion_mask
+    return gray_diff, motion_mask
 
 
 def detect_dart_skeleton(
@@ -491,18 +465,13 @@ def detect_dart_skeleton(
     # Keep original for tip projection (before erosion)
     original_mask = motion_mask_raw.copy()
     
-    # 3. Morphological cleanup for skeleton
-    # Erode to remove noise (but this may shrink tip)
-    erode_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    motion_mask = cv2.erode(motion_mask_raw, erode_kernel, iterations=1)  # Less erosion
+    # 3. Autodarts-style: minimal morphology to preserve dart shape
+    # Just use the raw threshold mask - the tip is preserved!
+    motion_mask = motion_mask_raw
     
-    # Dilate to restore
-    dilate_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    motion_mask = cv2.dilate(motion_mask, dilate_kernel, iterations=2)
-    
-    # Close to fill holes
-    close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-    motion_mask = cv2.morphologyEx(motion_mask, cv2.MORPH_CLOSE, close_kernel)
+    # Optional: very light closing to connect broken segments (small kernel only)
+    # close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    # motion_mask = cv2.morphologyEx(motion_mask, cv2.MORPH_CLOSE, close_kernel)
     
     # 4. Find dart contour (excluding existing dart locations)
     if existing_dart_locations is None:
