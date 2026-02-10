@@ -1278,7 +1278,8 @@ def score_with_calibration_hybrid(tip_data: Dict[str, Any], calibration_data: Di
     - Skeleton detection -> Polygon calibration (Autodarts-style, more accurate boundaries)
     - YOLO detection -> Ellipse calibration (original approach)
     
-    Falls back to ellipse if polygon not available.
+    Falls back to ellipse if polygon not available OR if polygon returns miss
+    (tip outside polygon bounds - can happen if skeleton finds wrong point)
     """
     x_px = tip_data.get('x_px', 0)
     y_px = tip_data.get('y_px', 0)
@@ -1292,17 +1293,23 @@ def score_with_calibration_hybrid(tip_data: Dict[str, Any], calibration_data: Di
             try:
                 result = score_from_polygon_calibration((x_px, y_px), poly_cal)
                 if result and result.get('segment') is not None:
-                    # Add boundary distance estimate (polygon doesn't provide this directly)
-                    result['boundary_distance_deg'] = 5.0  # Default - polygon is more accurate at boundaries
-                    result['scoring_method'] = 'polygon'
-                    print(f"[SCORE] Polygon ({detection_method}): {camera_id} -> {result.get('segment')}x{result.get('multiplier')}")
-                    return result
+                    # Check if polygon returned miss (tip outside bounds)
+                    # Fall back to ellipse which has larger coverage
+                    if result.get('zone') == 'miss' and result.get('score', 0) == 0:
+                        print(f"[SCORE] Polygon ({detection_method}): {camera_id} -> miss (outside bounds), trying ellipse")
+                    else:
+                        # Valid polygon result
+                        result['boundary_distance_deg'] = 5.0
+                        result['scoring_method'] = 'polygon'
+                        print(f"[SCORE] Polygon ({detection_method}): {camera_id} -> {result.get('segment')}x{result.get('multiplier')}")
+                        return result
             except Exception as e:
                 print(f"[SCORE] Polygon scoring failed for {camera_id}: {e}")
     
-    # Use ellipse scoring (YOLO default, or fallback)
+    # Use ellipse scoring (YOLO default, or fallback from polygon miss)
     result = score_with_calibration(tip_data, calibration_data)
     result['scoring_method'] = 'ellipse'
+    print(f"[SCORE] Ellipse ({detection_method}): {camera_id} -> {result.get('segment')}x{result.get('multiplier')}")
     return result
 
 
@@ -1942,51 +1949,22 @@ async def detect_tips(
         clustered_tips = [all_tips_merged]
         logger.info(f"[DETECT] Merged into 1 cluster with {len(all_tips_merged)} tips")
     
-    # Try line intersection voting for skeleton/hough detection
+    # Line intersection voting - DISABLED for now
+    # Requires coordinate transformation to common space (not yet implemented)
+    # Each camera's line is in its own pixel space, can't intersect directly
     line_intersection_result = None
+    
+    # Debug logging (keeping for diagnostics)
     logger.info(f"[LINE-VOTE] detection_method={detection_method}, all_tips={len(all_tips)}")
     for t in all_tips:
         logger.info(f"[LINE-VOTE]   tip cam={t.get('camera_id')} line={t.get('line')}")
     
-    if detection_method in ("skeleton", "hough") and len(all_tips) >= 2:
-        # Check if tips have line data
-        tips_with_lines = [t for t in all_tips if t.get('line')]
-        logger.info(f"[LINE-VOTE] tips_with_lines={len(tips_with_lines)}")
-        if len(tips_with_lines) >= 2:
-            logger.info(f"[LINE-VOTE] Attempting line intersection with {len(tips_with_lines)} lines")
-            line_intersection_result = vote_with_line_intersection(tips_with_lines, {})
-            
-            if line_intersection_result:
-                # Score the intersection point using polygon calibration
-                ix, iy = line_intersection_result['x_px'], line_intersection_result['y_px']
-                
-                # Use first camera's calibration for scoring (they should be similar)
-                first_cam = tips_with_lines[0].get('camera_id', 'cam0')
-                
-                # Score with polygon if available
-                if HAS_POLYGON:
-                    poly_cal = get_polygon_calibration(first_cam)
-                    if poly_cal:
-                        try:
-                            score_result = score_from_polygon_calibration((ix, iy), poly_cal)
-                            if score_result and score_result.get('segment') is not None:
-                                logger.info(f"[LINE-VOTE] Intersection scored: {score_result.get('segment')}x{score_result.get('multiplier')}")
-                                
-                                # Create detected tip from intersection
-                                detected_tips = [DetectedTip(
-                                    x_mm=0,  # Would need calibration to convert
-                                    y_mm=0,
-                                    segment=score_result['segment'],
-                                    multiplier=score_result['multiplier'],
-                                    zone=score_result.get('zone', 'unknown'),
-                                    score=score_result['score'],
-                                    confidence=0.9,  # High confidence for line intersection
-                                    cameras_seen=[t.get('camera_id') for t in tips_with_lines]
-                                )]
-                                logger.info(f"[LINE-VOTE] Using line intersection result: {detected_tips[0].segment}x{detected_tips[0].multiplier}")
-                        except Exception as e:
-                            logger.error(f"[LINE-VOTE] Polygon scoring failed: {e}")
-                            line_intersection_result = None
+    # Line intersection DISABLED - needs coordinate transform to board space
+    # if detection_method in ("skeleton", "hough") and len(all_tips) >= 2:
+    #     tips_with_lines = [t for t in all_tips if t.get('line')]
+    #     if len(tips_with_lines) >= 2:
+    #         line_intersection_result = vote_with_line_intersection(tips_with_lines, {})
+    pass  # Skip line intersection for now
     
     # Fall back to weighted voting if line intersection didn't work
     if not line_intersection_result or not detected_tips:
