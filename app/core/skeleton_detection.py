@@ -120,14 +120,16 @@ def fit_line_to_skeleton(skeleton):
     return float(vx[0]), float(vy[0]), float(x0[0]), float(y0[0])
 
 
-def find_dart_contour(motion_mask, min_area=500, min_aspect_ratio=2.0, existing_locations=None, exclude_radius=80):
+def find_dart_contour(motion_mask, min_area=500, min_aspect_ratio=2.0, existing_locations=None, exclude_radius=80, board_center=None):
     """
     Find the dart contour from motion mask.
     Darts are elongated - filter by aspect ratio to avoid noise blobs.
+    BUT: Bullseye darts look circular from camera angle - give bonus to center proximity.
     
     Args:
         existing_locations: List of (x, y) tuples of previous dart tips to exclude
         exclude_radius: Pixels - contours with centroid within this radius of existing darts are excluded
+        board_center: (x, y) center of the dartboard for bullseye detection
     """
     contours, _ = cv2.findContours(motion_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
@@ -137,8 +139,15 @@ def find_dart_contour(motion_mask, min_area=500, min_aspect_ratio=2.0, existing_
     if existing_locations is None:
         existing_locations = []
     
+    # Get image center as fallback for board_center
+    if board_center is None:
+        h, w = motion_mask.shape[:2]
+        board_center = (w // 2, h // 2)
+    
     best_contour = None
     best_score = 0
+    
+    candidates = []  # Track all valid candidates with scores
     
     for cnt in contours:
         area = cv2.contourArea(cnt)
@@ -163,38 +172,66 @@ def find_dart_contour(motion_mask, min_area=500, min_aspect_ratio=2.0, existing_
             continue
         
         aspect = max(w, h) / min(w, h)
-        score = area * aspect
         
-        if score > best_score and aspect >= min_aspect_ratio:
-            best_score = score
-            best_contour = cnt
+        # Distance from board center
+        dist_to_center = np.sqrt((cx - board_center[0])**2 + (cy - board_center[1])**2)
+        
+        # Base score
+        base_score = area * aspect
+        
+        # CENTER PROXIMITY BONUS for bullseye detection:
+        # If contour is near center AND somewhat circular (aspect < 2.5), boost score significantly
+        # Bull/bullseye area is ~50mm radius, at typical resolution ~30-60px
+        BULLSEYE_RADIUS_PX = 60
+        
+        if dist_to_center < BULLSEYE_RADIUS_PX:
+            # Contour is in bullseye region - massive bonus
+            # This overrides aspect ratio preference for circular bullseye blobs
+            center_bonus = 5.0  # 5x multiplier for bullseye proximity
+            score = base_score * center_bonus
+            candidates.append((cnt, score, "bullseye_region", dist_to_center, aspect))
+        elif dist_to_center < BULLSEYE_RADIUS_PX * 2:
+            # Near-center bonus (outer bull area)
+            center_bonus = 2.0
+            score = base_score * center_bonus
+            candidates.append((cnt, score, "near_center", dist_to_center, aspect))
+        elif aspect >= min_aspect_ratio:
+            # Regular dart-shaped contour
+            score = base_score
+            candidates.append((cnt, score, "dart_shape", dist_to_center, aspect))
     
-    # Fallback: if no good contour found (all were excluded or too small), 
-    # try largest non-excluded contour
-    if best_contour is None:
-        valid_contours = []
-        for cnt in contours:
-            area = cv2.contourArea(cnt)
-            if area < min_area / 2:  # Lower threshold for fallback
-                continue
-            M = cv2.moments(cnt)
-            if M["m00"] == 0:
-                continue
-            cx = M["m10"] / M["m00"]
-            cy = M["m01"] / M["m00"]
-            
-            is_existing = False
-            for (ex, ey) in existing_locations:
-                dist = np.sqrt((cx - ex)**2 + (cy - ey)**2)
-                if dist < exclude_radius:
-                    is_existing = True
-                    break
-            
-            if not is_existing:
-                valid_contours.append(cnt)
+    # Pick best candidate
+    if candidates:
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        best_contour = candidates[0][0]
+        # Debug: uncomment to see selection
+        # print(f"[CONTOUR] Selected: {candidates[0][2]}, dist={candidates[0][3]:.0f}, aspect={candidates[0][4]:.1f}, score={candidates[0][1]:.0f}")
+        return best_contour
+    
+    # Fallback: if no good contour found, try largest non-excluded contour
+    valid_contours = []
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area < min_area / 2:  # Lower threshold for fallback
+            continue
+        M = cv2.moments(cnt)
+        if M["m00"] == 0:
+            continue
+        cx = M["m10"] / M["m00"]
+        cy = M["m01"] / M["m00"]
         
-        if valid_contours:
-            best_contour = max(valid_contours, key=cv2.contourArea)
+        is_existing = False
+        for (ex, ey) in existing_locations:
+            dist = np.sqrt((cx - ex)**2 + (cy - ey)**2)
+            if dist < exclude_radius:
+                is_existing = True
+                break
+        
+        if not is_existing:
+            valid_contours.append(cnt)
+    
+    if valid_contours:
+        best_contour = max(valid_contours, key=cv2.contourArea)
     
     return best_contour
 
@@ -320,7 +357,7 @@ def find_tip_endpoint(endpoints, line_params, board_center=None):
 
 
 def get_adaptive_motion_mask(current_frame, previous_frame, camera_id=None, 
-                             fixed_threshold=35, use_background_model=True):
+                             fixed_threshold=25, use_background_model=True):
     """
     Get motion mask using either fixed threshold or adaptive background model.
     
@@ -399,7 +436,7 @@ def detect_dart_skeleton(
     gray_diff, motion_mask_raw = get_adaptive_motion_mask(
         current_frame, previous_frame, 
         camera_id=camera_id,
-        fixed_threshold=35,
+        fixed_threshold=25,
         use_background_model=use_adaptive_threshold
     )
     
@@ -423,7 +460,7 @@ def detect_dart_skeleton(
     if existing_dart_locations is None:
         existing_dart_locations = []
     dart_contour = find_dart_contour(motion_mask, min_area=300, min_aspect_ratio=1.5, 
-                                     existing_locations=existing_dart_locations)
+                                     existing_locations=existing_dart_locations, board_center=center)
     
     if dart_contour is None:
         return result
@@ -527,7 +564,7 @@ def detect_dart_hough(
     gray_diff, motion_mask_raw = get_adaptive_motion_mask(
         current_frame, previous_frame,
         camera_id=camera_id,
-        fixed_threshold=35,
+        fixed_threshold=25,
         use_background_model=use_adaptive_threshold
     )
     original_mask = motion_mask_raw.copy()
