@@ -1979,9 +1979,20 @@ async def detect_tips(
     
     logger.info(f"[LINE-VOTE] detection_method={detection_method}, all_tips={len(all_tips)}")
     
+    # Debug: log line data to file
+    with open(r"C:\Users\clawd\skel_debug.txt", "a") as dbg:
+        dbg.write(f"[LINE-VOTE] method={detection_method}, tips={len(all_tips)}\n")
+        for t in all_tips:
+            has_line = 'line' in t and t['line'] is not None
+            has_camid = 'camera_id' in t
+            dbg.write(f"  tip: cam={t.get('camera_id')}, has_line={has_line}, has_camid={has_camid}\n")
+    
     if detection_method in ("skeleton", "hough") and len(all_tips) >= 2:
         tips_with_lines = [t for t in all_tips if t.get('line')]
         logger.info(f"[LINE-VOTE] {len(tips_with_lines)} tips have line data")
+        
+        with open(r"C:\Users\clawd\skel_debug.txt", "a") as dbg:
+            dbg.write(f"[LINE-VOTE] {len(tips_with_lines)} tips have line data\n")
         
         if len(tips_with_lines) >= 2:
             # Try line intersection in mm space using homography
