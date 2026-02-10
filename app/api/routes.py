@@ -3192,38 +3192,38 @@ async def replay_single_dart(request: ReplayRequest):
                 center = (cal.get("center", [img.shape[1]//2, img.shape[0]//2]))
                 center = (int(center[0]), int(center[1]))
                 
+                # Get existing dart locations from previous darts in this round
+                existing_locations = []
+                dart_folder = dart_path.name  # e.g., "dart_3"
+                round_folder = dart_path.parent  # e.g., "round_13_Player_1"
+                
+                # Parse dart number
+                try:
+                    current_dart_num = int(dart_folder.replace("dart_", ""))
+                    
+                    # Load tip locations from previous darts
+                    for prev_num in range(1, current_dart_num):
+                        prev_dart_path = round_folder / f"dart_{prev_num}"
+                        prev_meta_path = prev_dart_path / "metadata.json"
+                        
+                        if prev_meta_path.exists():
+                            with open(prev_meta_path) as pf:
+                                prev_meta = json.load(pf)
+                            
+                            # Get this camera's tip from previous dart
+                            prev_pipeline = prev_meta.get("pipeline", {}).get(cam_id, {})
+                            prev_tip = prev_pipeline.get("selected_tip")
+                            
+                            if prev_tip and prev_tip.get("x_px") is not None:
+                                existing_locations.append((
+                                    prev_tip["x_px"],
+                                    prev_tip["y_px"]
+                                ))
+                except (ValueError, AttributeError):
+                    pass  # If dart number can't be parsed, skip
+                
                 if request.method == "hough":
                     from app.core.skeleton_detection import detect_dart_hough
-                    
-                    # Get existing dart locations from previous darts in this round
-                    existing_locations = []
-                    dart_folder = dart_path.name  # e.g., "dart_3"
-                    round_folder = dart_path.parent  # e.g., "round_13_Player_1"
-                    
-                    # Parse dart number
-                    try:
-                        current_dart_num = int(dart_folder.replace("dart_", ""))
-                        
-                        # Load tip locations from previous darts
-                        for prev_num in range(1, current_dart_num):
-                            prev_dart_path = round_folder / f"dart_{prev_num}"
-                            prev_meta_path = prev_dart_path / "metadata.json"
-                            
-                            if prev_meta_path.exists():
-                                with open(prev_meta_path) as pf:
-                                    prev_meta = json.load(pf)
-                                
-                                # Get this camera's tip from previous dart
-                                prev_pipeline = prev_meta.get("pipeline", {}).get(cam_id, {})
-                                prev_tip = prev_pipeline.get("selected_tip")
-                                
-                                if prev_tip and prev_tip.get("x_px") is not None:
-                                    existing_locations.append((
-                                        prev_tip["x_px"],
-                                        prev_tip["y_px"]
-                                    ))
-                    except (ValueError, AttributeError):
-                        pass  # If dart number can't be parsed, skip
                     
                     debug_name = f"{cam_id}_{dart_path.parent.name}_{dart_path.name}"
                     result = detect_dart_hough(
