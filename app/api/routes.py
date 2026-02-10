@@ -73,7 +73,7 @@ try:
         load_polygon_calibrations,
     )
     # Load polygon calibrations on startup
-    load_polygon_calibrations()
+    load_polygon_calibrations(r"C:/Users/clawd/DartDetectionAI/polygon_calibrations.json")
     HAS_POLYGON = True
     print("[STARTUP] Polygon calibrations loaded successfully")
 except ImportError as e:
