@@ -1637,6 +1637,13 @@ async def detect_tips(
                         b = outer_ellipse[3] if len(outer_ellipse) > 3 else 200
                         board_radius = (a + b) / 2
                     
+                    # Cache polygon calibration for line-polygon intersection
+                    polygon = calibration_data.get('polygon', {}).get('double_outers', [])
+                    if polygon:
+                        if not hasattr(detect_dart_skeleton, '_polygon_cache'):
+                            detect_dart_skeleton._polygon_cache = {}
+                        detect_dart_skeleton._polygon_cache[cam.camera_id] = polygon
+                    
                     skel_result = detect_dart_skeleton(
                         current_img, 
                         prev_img, 

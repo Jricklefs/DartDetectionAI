@@ -401,6 +401,122 @@ def project_line_to_board(line_params, board_center, board_radius, start_point=N
 
 
 
+
+def line_segment_intersection(p1, p2, p3, p4):
+    """
+    Find intersection point of line segment p1-p2 with line segment p3-p4.
+    Returns (x, y, t) where t is parameter along p1-p2, or None if no intersection.
+    """
+    x1, y1 = p1
+    x2, y2 = p2
+    x3, y3 = p3
+    x4, y4 = p4
+    
+    denom = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4)
+    if abs(denom) < 1e-10:
+        return None  # Parallel lines
+    
+    t = ((x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4)) / denom
+    u = -((x1 - x2) * (y1 - y3) - (y1 - y2) * (x1 - x3)) / denom
+    
+    # Check if intersection is within both segments
+    if 0 <= u <= 1:  # Must be on the polygon edge
+        # t can be any value (we extend the dart line infinitely)
+        x = x1 + t * (x2 - x1)
+        y = y1 + t * (y2 - y1)
+        return (x, y, t)
+    
+    return None
+
+
+def project_line_to_polygon(line_params, polygon_points, board_center, start_point=None):
+    """
+    Project the dart centerline until it intersects the polygon boundary.
+    
+    Uses the 20-point calibration polygon (double_outers) for accurate
+    board edge detection that accounts for perspective and lens distortion.
+    
+    Args:
+        line_params: (vx, vy, x0, y0) from cv2.fitLine
+        polygon_points: List of 20 (x, y) points defining board boundary
+        board_center: (cx, cy) center of dartboard
+        start_point: Starting point to determine direction toward board
+    
+    Returns:
+        (tip_x, tip_y) where line intersects polygon, or None if no intersection
+    """
+    if line_params is None or not polygon_points or len(polygon_points) < 3:
+        return None
+    
+    vx, vy, x0, y0 = line_params
+    cx, cy = board_center
+    
+    # Normalize direction
+    length = np.sqrt(vx*vx + vy*vy)
+    if length < 0.001:
+        return None
+    vx, vy = vx/length, vy/length
+    
+    # Determine direction: walk TOWARD board center
+    if start_point is not None:
+        sx, sy = start_point
+    else:
+        sx, sy = x0, y0
+    
+    to_center = np.array([cx - sx, cy - sy])
+    dot = to_center[0] * vx + to_center[1] * vy
+    if dot < 0:
+        vx, vy = -vx, -vy  # Flip to point toward center
+    
+    # Create line segment from current position extending far in both directions
+    # We use a large extension to ensure we hit the polygon
+    extend = 1000
+    line_start = (x0 - extend * vx, y0 - extend * vy)
+    line_end = (x0 + extend * vx, y0 + extend * vy)
+    
+    # Find all intersections with polygon edges
+    intersections = []
+    n = len(polygon_points)
+    
+    for i in range(n):
+        p1 = polygon_points[i]
+        p2 = polygon_points[(i + 1) % n]
+        
+        result = line_segment_intersection(line_start, line_end, p1, p2)
+        if result:
+            ix, iy, t = result
+            # Calculate distance from start_point in the walking direction
+            if start_point:
+                dx = ix - sx
+                dy = iy - sy
+                # Project onto direction vector to get signed distance
+                dist = dx * vx + dy * vy
+            else:
+                dist = t
+            intersections.append((ix, iy, dist, i))
+    
+    if not intersections:
+        return None
+    
+    # We want the intersection that's in FRONT of us (positive distance)
+    # and closest to us (smallest positive distance)
+    forward_intersections = [(x, y, d, i) for x, y, d, i in intersections if d > -50]
+    
+    if not forward_intersections:
+        return None
+    
+    # Sort by distance, take closest
+    forward_intersections.sort(key=lambda x: x[2])
+    tip_x, tip_y, _, segment_idx = forward_intersections[0]
+    
+    # Debug log
+    with open(r"C:\Users\clawd\polygon_intersection.txt", "a") as f:
+        f.write(f"line=({x0:.0f},{y0:.0f})->({vx:.2f},{vy:.2f}) hit polygon at ({tip_x:.0f},{tip_y:.0f}) edge={segment_idx}\n")
+    
+    return (float(tip_x), float(tip_y))
+
+
+
 def find_tip_endpoint(endpoints, line_params, board_center=None, board_radius=None, dart_mask=None):
     """
     Find which skeleton endpoint is the tip end.
@@ -629,22 +745,30 @@ def detect_dart_skeleton(
         skeleton_tip = find_tip_endpoint(endpoints, line_params, board_center=center, board_radius=board_radius, dart_mask=dart_mask)
         
         # Project centerline to board surface (even if tip not visible)
-        if board_radius is not None:
+        # Try polygon first (most accurate), then circle, then mask
+        tip = None
+        if hasattr(detect_dart_skeleton, '_polygon_cache') and camera_id in detect_dart_skeleton._polygon_cache:
+            polygon = detect_dart_skeleton._polygon_cache[camera_id]
+            tip = project_line_to_polygon(line_params, polygon, center, start_point=skeleton_tip)
+        
+        if tip is None and board_radius is not None:
             tip = project_line_to_board(line_params, center, board_radius, start_point=skeleton_tip)
-            if tip is None:
-                # Fallback to mask-based projection
-                tip = project_to_tip(skeleton_tip, line_params, original_mask, max_extend=100, board_center=center)
-        else:
+        
+        if tip is None:
             tip = project_to_tip(skeleton_tip, line_params, original_mask, max_extend=100, board_center=center)
         result["tip"] = tip
         result["confidence"] = 0.8
         
     elif len(endpoints) == 1:
-        if board_radius is not None and line_params is not None:
+        tip = None
+        if hasattr(detect_dart_skeleton, '_polygon_cache') and camera_id in detect_dart_skeleton._polygon_cache:
+            polygon = detect_dart_skeleton._polygon_cache[camera_id]
+            tip = project_line_to_polygon(line_params, polygon, center, start_point=endpoints[0])
+        
+        if tip is None and board_radius is not None and line_params is not None:
             tip = project_line_to_board(line_params, center, board_radius, start_point=endpoints[0])
-            if tip is None:
-                tip = project_to_tip(endpoints[0], line_params, original_mask, max_extend=100, board_center=center)
-        else:
+        
+        if tip is None:
             tip = project_to_tip(endpoints[0], line_params, original_mask, max_extend=100, board_center=center)
         result["tip"] = tip
         result["confidence"] = 0.6
