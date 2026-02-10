@@ -76,6 +76,13 @@ try:
     load_polygon_calibrations(r"C:/Users/clawd/DartDetectionAI/polygon_calibrations.json")
     HAS_POLYGON = True
     print("[STARTUP] Polygon calibrations loaded successfully")
+    
+    # Compute homography matrices for each camera
+    for cam_id in ["cam0", "cam1", "cam2"]:
+        poly_cal = get_polygon_calibration(cam_id)
+        if poly_cal:
+            if compute_homography_for_camera(cam_id, poly_cal):
+                print(f"[STARTUP] Computed homography for {cam_id}")
 except ImportError as e:
     print(f"[STARTUP] Polygon calibration not available: {e}")
     HAS_POLYGON = False
@@ -1949,22 +1956,40 @@ async def detect_tips(
         clustered_tips = [all_tips_merged]
         logger.info(f"[DETECT] Merged into 1 cluster with {len(all_tips_merged)} tips")
     
-    # Line intersection voting - DISABLED for now
-    # Requires coordinate transformation to common space (not yet implemented)
-    # Each camera's line is in its own pixel space, can't intersect directly
+    # Line intersection voting with homography transform (Autodarts-style)
     line_intersection_result = None
+    detected_tips = []
     
-    # Debug logging (keeping for diagnostics)
     logger.info(f"[LINE-VOTE] detection_method={detection_method}, all_tips={len(all_tips)}")
-    for t in all_tips:
-        logger.info(f"[LINE-VOTE]   tip cam={t.get('camera_id')} line={t.get('line')}")
     
-    # Line intersection DISABLED - needs coordinate transform to board space
-    # if detection_method in ("skeleton", "hough") and len(all_tips) >= 2:
-    #     tips_with_lines = [t for t in all_tips if t.get('line')]
-    #     if len(tips_with_lines) >= 2:
-    #         line_intersection_result = vote_with_line_intersection(tips_with_lines, {})
-    pass  # Skip line intersection for now
+    if detection_method in ("skeleton", "hough") and len(all_tips) >= 2:
+        tips_with_lines = [t for t in all_tips if t.get('line')]
+        logger.info(f"[LINE-VOTE] {len(tips_with_lines)} tips have line data")
+        
+        if len(tips_with_lines) >= 2:
+            # Try line intersection in mm space using homography
+            mm_result = vote_with_line_intersection_mm(tips_with_lines)
+            
+            if mm_result and mm_result.get('x_mm') is not None:
+                # Score the intersection point in mm
+                score_result = score_from_mm_position(mm_result['x_mm'], mm_result['y_mm'])
+                
+                if score_result.get('score', 0) > 0 or score_result.get('zone') in ('inner_bull', 'outer_bull'):
+                    logger.info(f"[LINE-VOTE] MM intersection scored: {score_result.get('segment')}x{score_result.get('multiplier')}")
+                    
+                    detected_tips = [DetectedTip(
+                        x_mm=round(mm_result['x_mm'], 2),
+                        y_mm=round(mm_result['y_mm'], 2),
+                        segment=score_result['segment'],
+                        multiplier=score_result['multiplier'],
+                        zone=score_result.get('zone', 'unknown'),
+                        score=score_result['score'],
+                        confidence=0.9,
+                        cameras_seen=[t.get('camera_id') for t in tips_with_lines]
+                    )]
+                    line_intersection_result = mm_result
+                else:
+                    logger.info(f"[LINE-VOTE] MM intersection outside board, falling back to voting")
     
     # Fall back to weighted voting if line intersection didn't work
     if not line_intersection_result or not detected_tips:
@@ -2610,6 +2635,308 @@ def vote_with_line_intersection(tips_with_lines: List[dict], calibration_data: d
             'method': 'line_intersection'
         }
 
+
+
+
+# ============================================================================
+# Homography Transform for Line Intersection (Autodarts-style)
+# ============================================================================
+
+# Standard dartboard measurements (mm from center)
+DARTBOARD_MM = {
+    "double_outer": 170.0,   # Outer edge of double ring
+    "double_inner": 162.0,   # Inner edge of double ring  
+    "triple_outer": 107.0,   # Outer edge of triple ring
+    "triple_inner": 99.0,    # Inner edge of triple ring
+    "bull_outer": 15.9,      # Outer bull radius
+    "bullseye": 6.35,        # Bullseye radius
+}
+
+# Segment angles (center of each segment, clockwise from 20 at top)
+SEGMENT_ORDER = [20, 1, 18, 4, 13, 6, 10, 15, 2, 17, 3, 19, 7, 16, 8, 11, 14, 9, 12, 5]
+SEGMENT_ANGLES = {}
+for i, seg in enumerate(SEGMENT_ORDER):
+    # Each segment is 18 degrees, starting at -9 from top (20 is centered at top)
+    angle = -90 + (i * 18)  # -90 puts 20 at top (12 o'clock)
+    SEGMENT_ANGLES[seg] = math.radians(angle)
+
+def get_standard_board_points():
+    """
+    Get the 20 double-outer ring points in standard mm coordinates.
+    These correspond to the center of each segment on the outer double ring.
+    """
+    points_mm = []
+    radius = DARTBOARD_MM["double_outer"]
+    
+    for i in range(20):
+        angle = math.radians(-90 + (i * 18))  # Start at top (20), go clockwise
+        x = radius * math.cos(angle)
+        y = radius * math.sin(angle)
+        points_mm.append((x, y))
+    
+    return points_mm
+
+
+# Cache for homography matrices
+_homography_cache = {}  # {camera_id: (H_matrix, inverse_H)}
+
+
+def compute_homography_for_camera(camera_id: str, polygon_calibration) -> bool:
+    """
+    Compute homography matrix from polygon calibration points.
+    
+    Uses the 20 double_outers points (pixel positions of segment centers on double ring)
+    mapped to standard dartboard mm coordinates.
+    
+    Returns True if successful, False otherwise.
+    """
+    global _homography_cache
+    
+    if not polygon_calibration or not polygon_calibration.double_outers:
+        logger.warning(f"[HOMOGRAPHY] No double_outers for {camera_id}")
+        return False
+    
+    if len(polygon_calibration.double_outers) != 20:
+        logger.warning(f"[HOMOGRAPHY] Expected 20 points, got {len(polygon_calibration.double_outers)} for {camera_id}")
+        return False
+    
+    try:
+        import cv2
+        import numpy as np
+        
+        # Source points: pixel coordinates from calibration
+        src_points = np.array(polygon_calibration.double_outers, dtype=np.float32)
+        
+        # Destination points: standard board mm coordinates
+        dst_points = np.array(get_standard_board_points(), dtype=np.float32)
+        
+        # Compute homography: maps pixels -> mm
+        H, mask = cv2.findHomography(src_points, dst_points, cv2.RANSAC, 5.0)
+        
+        if H is None:
+            logger.error(f"[HOMOGRAPHY] Failed to compute homography for {camera_id}")
+            return False
+        
+        # Also compute inverse for mm -> pixels if needed
+        H_inv = np.linalg.inv(H)
+        
+        _homography_cache[camera_id] = (H, H_inv)
+        
+        # Test the transform with bull position
+        bull_px = np.array([[polygon_calibration.bull[0], polygon_calibration.bull[1]]], dtype=np.float32)
+        bull_px = bull_px.reshape(-1, 1, 2)
+        bull_mm = cv2.perspectiveTransform(bull_px, H)
+        bull_mm = bull_mm.reshape(-1, 2)[0]
+        
+        logger.info(f"[HOMOGRAPHY] {camera_id}: Computed transform. Bull px{polygon_calibration.bull} -> mm({bull_mm[0]:.1f}, {bull_mm[1]:.1f})")
+        
+        return True
+        
+    except Exception as e:
+        logger.error(f"[HOMOGRAPHY] Error computing for {camera_id}: {e}")
+        return False
+
+
+def transform_point_to_mm(camera_id: str, point_px: tuple) -> tuple:
+    """Transform a pixel point to mm coordinates using cached homography."""
+    global _homography_cache
+    
+    if camera_id not in _homography_cache:
+        return None
+    
+    H, _ = _homography_cache[camera_id]
+    
+    import cv2
+    import numpy as np
+    
+    pt = np.array([[point_px[0], point_px[1]]], dtype=np.float32).reshape(-1, 1, 2)
+    pt_mm = cv2.perspectiveTransform(pt, H)
+    pt_mm = pt_mm.reshape(-1, 2)[0]
+    
+    return (float(pt_mm[0]), float(pt_mm[1]))
+
+
+def transform_line_to_mm(camera_id: str, line_px: tuple) -> tuple:
+    """
+    Transform a line from pixel space to mm space.
+    
+    Line is (vx, vy, x0, y0) - direction vector and point on line.
+    Transform two points on the line and recompute direction.
+    """
+    global _homography_cache
+    
+    if camera_id not in _homography_cache:
+        return None
+    
+    vx, vy, x0, y0 = line_px
+    
+    # Get two points on the line
+    p1_px = (x0, y0)
+    p2_px = (x0 + vx * 100, y0 + vy * 100)
+    
+    # Transform both
+    p1_mm = transform_point_to_mm(camera_id, p1_px)
+    p2_mm = transform_point_to_mm(camera_id, p2_px)
+    
+    if p1_mm is None or p2_mm is None:
+        return None
+    
+    # Recompute direction in mm space
+    dx = p2_mm[0] - p1_mm[0]
+    dy = p2_mm[1] - p1_mm[1]
+    length = math.sqrt(dx*dx + dy*dy)
+    
+    if length < 0.001:
+        return None
+    
+    vx_mm = dx / length
+    vy_mm = dy / length
+    
+    return (vx_mm, vy_mm, p1_mm[0], p1_mm[1])
+
+
+def vote_with_line_intersection_mm(tips_with_lines: List[dict]) -> dict:
+    """
+    Line intersection voting in mm space (Autodarts-style).
+    
+    1. Transform each camera's line from pixels to mm using homography
+    2. Intersect lines in mm space
+    3. Return intersection point in mm
+    """
+    # Transform all lines to mm space
+    lines_mm = []
+    for tip in tips_with_lines:
+        cam_id = tip.get('camera_id')
+        line_px = tip.get('line')
+        
+        if not cam_id or not line_px:
+            continue
+        
+        line_mm = transform_line_to_mm(cam_id, line_px)
+        if line_mm:
+            lines_mm.append({
+                'camera_id': cam_id,
+                'line_mm': line_mm,
+                'confidence': tip.get('confidence', 0.5),
+                'tip_mm': transform_point_to_mm(cam_id, (tip.get('x_px', 0), tip.get('y_px', 0)))
+            })
+    
+    if len(lines_mm) < 2:
+        logger.warning(f"[LINE-MM] Only {len(lines_mm)} lines transformed to mm")
+        return None
+    
+    # Find pairwise intersections in mm space
+    intersections = []
+    
+    for i in range(len(lines_mm)):
+        for j in range(i + 1, len(lines_mm)):
+            line1 = lines_mm[i]['line_mm']
+            line2 = lines_mm[j]['line_mm']
+            
+            intersection = line_intersection_2d(line1, line2)
+            if intersection:
+                ix, iy = intersection
+                
+                # Weight by confidence
+                conf1 = lines_mm[i]['confidence']
+                conf2 = lines_mm[j]['confidence']
+                weight = (conf1 + conf2) / 2
+                
+                intersections.append({
+                    'x_mm': ix,
+                    'y_mm': iy,
+                    'weight': weight,
+                    'cameras': [lines_mm[i]['camera_id'], lines_mm[j]['camera_id']]
+                })
+                
+                logger.info(f"[LINE-MM] {lines_mm[i]['camera_id']} x {lines_mm[j]['camera_id']} -> ({ix:.1f}, {iy:.1f})mm")
+    
+    if not intersections:
+        return None
+    
+    # Average intersections
+    total_weight = sum(i['weight'] for i in intersections)
+    avg_x = sum(i['x_mm'] * i['weight'] for i in intersections) / total_weight
+    avg_y = sum(i['y_mm'] * i['weight'] for i in intersections) / total_weight
+    
+    # Check spread
+    spread = max(
+        math.sqrt((i['x_mm'] - avg_x)**2 + (i['y_mm'] - avg_y)**2)
+        for i in intersections
+    )
+    
+    logger.info(f"[LINE-MM] Intersection: ({avg_x:.1f}, {avg_y:.1f})mm, spread={spread:.1f}mm")
+    
+    # 10mm spread threshold (about 1 segment width at triple ring)
+    if spread > 10:
+        logger.warning(f"[LINE-MM] Spread too large: {spread:.1f}mm")
+        return None
+    
+    return {
+        'x_mm': avg_x,
+        'y_mm': avg_y,
+        'spread_mm': spread,
+        'num_intersections': len(intersections),
+        'method': 'line_intersection_mm'
+    }
+
+
+def score_from_mm_position(x_mm: float, y_mm: float) -> dict:
+    """
+    Score a dart from its mm position on the board.
+    Uses standard dartboard geometry.
+    """
+    import math
+    
+    # Distance from center
+    dist = math.sqrt(x_mm*x_mm + y_mm*y_mm)
+    
+    # Angle (0 = right, counter-clockwise)
+    angle = math.atan2(y_mm, x_mm)
+    angle_deg = math.degrees(angle)
+    
+    # Adjust so 0 degrees = top (20)
+    angle_deg = (90 - angle_deg) % 360
+    
+    # Check bulls
+    if dist <= DARTBOARD_MM["bullseye"]:
+        return {"segment": 25, "multiplier": 2, "zone": "inner_bull", "score": 50}
+    
+    if dist <= DARTBOARD_MM["bull_outer"]:
+        return {"segment": 25, "multiplier": 1, "zone": "outer_bull", "score": 25}
+    
+    # Outside board
+    if dist > DARTBOARD_MM["double_outer"]:
+        return {"segment": 0, "multiplier": 0, "zone": "miss", "score": 0}
+    
+    # Find segment (18 degrees each, 20 is at 0 degrees)
+    segment_idx = int((angle_deg + 9) / 18) % 20  # +9 to center on segment
+    segment = SEGMENT_ORDER[segment_idx]
+    
+    # Find ring
+    if dist > DARTBOARD_MM["double_inner"]:
+        zone = "double"
+        multiplier = 2
+    elif dist > DARTBOARD_MM["triple_outer"]:
+        zone = "single_outer"
+        multiplier = 1
+    elif dist > DARTBOARD_MM["triple_inner"]:
+        zone = "triple"
+        multiplier = 3
+    else:
+        zone = "single_inner"
+        multiplier = 1
+    
+    score = segment * multiplier
+    
+    return {
+        "segment": segment,
+        "multiplier": multiplier,
+        "zone": zone,
+        "score": score,
+        "dist_mm": dist,
+        "angle_deg": angle_deg
+    }
 
 
 def vote_on_scores(clusters: List[List[dict]]) -> List[DetectedTip]:
