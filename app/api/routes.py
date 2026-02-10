@@ -1622,9 +1622,11 @@ async def detect_tips(
                             "y_px": tip_y,
                             "confidence": skel_result.get("confidence", 0.5),
                             "method": "skeleton",
-                            "view_quality": skel_result.get("view_quality", 0.5)
+                            "view_quality": skel_result.get("view_quality", 0.5),
+                            "line": skel_result.get("line")  # (vx, vy, x0, y0) for line intersection voting
                         }]
-                        logger.info(f"[DETECT] Skeleton found tip at ({tip_x:.1f}, {tip_y:.1f}) view_quality={skel_result.get('view_quality', 0.5):.2f}")
+                        line_info = skel_result.get("line")
+                        logger.info(f"[DETECT] Skeleton found tip at ({tip_x:.1f}, {tip_y:.1f}) view_quality={skel_result.get('view_quality', 0.5):.2f} line={line_info is not None}")
                     else:
                         tips = []
                         logger.info(f"[DETECT] Skeleton found no tip")
@@ -1921,7 +1923,50 @@ async def detect_tips(
         clustered_tips = [all_tips_merged]
         logger.info(f"[DETECT] Merged into 1 cluster with {len(all_tips_merged)} tips")
     
-    detected_tips = vote_on_scores(clustered_tips)
+    # Try line intersection voting for skeleton/hough detection
+    line_intersection_result = None
+    if detection_method in ("skeleton", "hough") and len(all_tips) >= 2:
+        # Check if tips have line data
+        tips_with_lines = [t for t in all_tips if t.get('line')]
+        if len(tips_with_lines) >= 2:
+            logger.info(f"[LINE-VOTE] Attempting line intersection with {len(tips_with_lines)} lines")
+            line_intersection_result = vote_with_line_intersection(tips_with_lines, {})
+            
+            if line_intersection_result:
+                # Score the intersection point using polygon calibration
+                ix, iy = line_intersection_result['x_px'], line_intersection_result['y_px']
+                
+                # Use first camera's calibration for scoring (they should be similar)
+                first_cam = tips_with_lines[0].get('camera_id', 'cam0')
+                
+                # Score with polygon if available
+                if HAS_POLYGON:
+                    poly_cal = get_polygon_calibration(first_cam)
+                    if poly_cal:
+                        try:
+                            score_result = score_from_polygon_calibration((ix, iy), poly_cal)
+                            if score_result and score_result.get('segment') is not None:
+                                logger.info(f"[LINE-VOTE] Intersection scored: {score_result.get('segment')}x{score_result.get('multiplier')}")
+                                
+                                # Create detected tip from intersection
+                                detected_tips = [DetectedTip(
+                                    x_mm=0,  # Would need calibration to convert
+                                    y_mm=0,
+                                    segment=score_result['segment'],
+                                    multiplier=score_result['multiplier'],
+                                    zone=score_result.get('zone', 'unknown'),
+                                    score=score_result['score'],
+                                    confidence=0.9,  # High confidence for line intersection
+                                    cameras_seen=[t.get('camera_id') for t in tips_with_lines]
+                                )]
+                                logger.info(f"[LINE-VOTE] Using line intersection result: {detected_tips[0].segment}x{detected_tips[0].multiplier}")
+                        except Exception as e:
+                            logger.error(f"[LINE-VOTE] Polygon scoring failed: {e}")
+                            line_intersection_result = None
+    
+    # Fall back to weighted voting if line intersection didn't work
+    if not line_intersection_result or not detected_tips:
+        detected_tips = vote_on_scores(clustered_tips)
     
     # Log final result vs votes
     if detected_tips and all_tips:
@@ -2387,6 +2432,131 @@ def score_from_position(x_mm: float, y_mm: float, calibration_data: Dict = None)
         "boundary_distance_deg": boundary_distance,
         "distance_mm": distance
     }
+
+
+
+
+
+def line_intersection_2d(line1, line2):
+    """
+    Find intersection point of two 2D lines.
+    Each line is (vx, vy, x0, y0) - direction vector and point on line.
+    Returns (x, y) intersection point or None if parallel.
+    """
+    vx1, vy1, x01, y01 = line1
+    vx2, vy2, x02, y02 = line2
+    
+    # Parametric: P1 = (x01, y01) + t * (vx1, vy1)
+    #             P2 = (x02, y02) + s * (vx2, vy2)
+    # Solve for intersection
+    
+    denom = vx1 * vy2 - vy1 * vx2
+    if abs(denom) < 1e-6:
+        return None  # Lines are parallel
+    
+    dx = x02 - x01
+    dy = y02 - y01
+    
+    t = (dx * vy2 - dy * vx2) / denom
+    
+    # Intersection point
+    ix = x01 + t * vx1
+    iy = y01 + t * vy1
+    
+    return (ix, iy)
+
+
+def vote_with_line_intersection(tips_with_lines: List[dict], calibration_data: dict) -> dict:
+    """
+    Autodarts-style voting using line intersections.
+    
+    Each camera provides a line (direction of dart shaft).
+    Find where lines intersect to get consensus tip position.
+    Score that position using polygon calibration.
+    
+    Args:
+        tips_with_lines: List of tip dicts with 'line' key (vx, vy, x0, y0)
+        calibration_data: Calibration for scoring the intersection point
+    
+    Returns:
+        Best tip dict with scored intersection position
+    """
+    # Filter to tips that have line data
+    tips_with_lines = [t for t in tips_with_lines if t.get('line')]
+    
+    if len(tips_with_lines) < 2:
+        # Not enough lines to intersect - fall back to None (use weighted voting)
+        return None
+    
+    # Find all pairwise intersections
+    intersections = []
+    
+    for i in range(len(tips_with_lines)):
+        for j in range(i + 1, len(tips_with_lines)):
+            line1 = tips_with_lines[i]['line']
+            line2 = tips_with_lines[j]['line']
+            
+            intersection = line_intersection_2d(line1, line2)
+            if intersection:
+                ix, iy = intersection
+                
+                # Weight by combined confidence of the two cameras
+                conf1 = tips_with_lines[i].get('confidence', 0.5)
+                conf2 = tips_with_lines[j].get('confidence', 0.5)
+                weight = (conf1 + conf2) / 2
+                
+                # Also weight by view quality
+                vq1 = tips_with_lines[i].get('view_quality', 0.5)
+                vq2 = tips_with_lines[j].get('view_quality', 0.5)
+                weight *= (vq1 + vq2) / 2 + 0.5
+                
+                intersections.append({
+                    'x_px': ix,
+                    'y_px': iy,
+                    'weight': weight,
+                    'cameras': [tips_with_lines[i].get('camera_id'), tips_with_lines[j].get('camera_id')]
+                })
+    
+    if not intersections:
+        return None
+    
+    # If we have 3+ cameras, we get 3 intersection points
+    # Take weighted average for best consensus position
+    if len(intersections) >= 2:
+        total_weight = sum(i['weight'] for i in intersections)
+        avg_x = sum(i['x_px'] * i['weight'] for i in intersections) / total_weight
+        avg_y = sum(i['y_px'] * i['weight'] for i in intersections) / total_weight
+        
+        # Check spread - if intersections are far apart, lines don't agree well
+        spread = max(
+            ((i['x_px'] - avg_x)**2 + (i['y_px'] - avg_y)**2)**0.5 
+            for i in intersections
+        )
+        
+        if spread > 50:  # pixels - lines disagree significantly
+            logger.warning(f"[LINE-VOTE] Line intersection spread too large: {spread:.1f}px")
+            return None  # Fall back to weighted voting
+        
+        logger.info(f"[LINE-VOTE] Intersection consensus: ({avg_x:.1f}, {avg_y:.1f}), spread={spread:.1f}px")
+        
+        return {
+            'x_px': avg_x,
+            'y_px': avg_y,
+            'intersection_spread': spread,
+            'num_intersections': len(intersections),
+            'method': 'line_intersection'
+        }
+    else:
+        # Only one intersection (2 cameras)
+        best = intersections[0]
+        logger.info(f"[LINE-VOTE] Single intersection: ({best['x_px']:.1f}, {best['y_px']:.1f})")
+        return {
+            'x_px': best['x_px'],
+            'y_px': best['y_px'],
+            'intersection_spread': 0,
+            'num_intersections': 1,
+            'method': 'line_intersection'
+        }
 
 
 
