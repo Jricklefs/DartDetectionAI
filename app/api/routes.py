@@ -5865,7 +5865,7 @@ async def recalibrate_all_cameras():
     import base64
     
     results = []
-    calibrator = get_calibrator()
+    calibrator = DartboardCalibrator()
     
     # Camera URLs (from config or defaults)
     camera_urls = {
