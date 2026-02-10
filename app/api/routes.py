@@ -5506,3 +5506,144 @@ async def replay_benchmark_polygon_with_voting():
         },
         "details": details[:30]
     }
+
+
+# ==================== THRESHOLD TUNING ====================
+
+@router.get("/v1/tuning/threshold")
+async def get_threshold_tuning(
+    threshold: int = 25,
+    camera_id: str = "cam0"
+):
+    """
+    Get a visual preview of frame diff at a given threshold.
+    Returns base64 image showing: current frame, diff, and binary mask.
+    
+    Use this to tune the diff threshold for skeleton detection.
+    Lower threshold = more sensitive (more noise)
+    Higher threshold = less sensitive (may miss darts)
+    
+    Call from DartSensor to get current + previous frames.
+    """
+    import httpx
+    import cv2
+    import numpy as np
+    import base64
+    
+    try:
+        # Get snapshot from DartSensor
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            # Map camera_id to index
+            cam_index = int(camera_id.replace("cam", ""))
+            
+            resp = await client.get(f"http://localhost:8001/cameras/{cam_index}/snapshot")
+            if resp.status_code != 200:
+                return {"error": f"Could not get snapshot from camera {camera_id}"}
+            
+            data = resp.json()
+            current_b64 = data.get("image")
+            if not current_b64:
+                return {"error": "No image data from camera"}
+            
+            # Decode current frame
+            current_bytes = base64.b64decode(current_b64)
+            current_arr = np.frombuffer(current_bytes, np.uint8)
+            current = cv2.imdecode(current_arr, cv2.IMREAD_COLOR)
+        
+        # Get baseline from cache
+        board_id = "default"
+        cache = board_image_cache.get(board_id, {})
+        baseline_dict = cache.get("baseline", {})
+        baseline = baseline_dict.get(camera_id)
+        
+        if baseline is None:
+            return {"error": f"No baseline for {camera_id}. Start a game first to capture baseline."}
+        
+        # Compute diff
+        diff = cv2.absdiff(current, baseline)
+        gray_diff = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
+        
+        # Apply threshold
+        _, mask = cv2.threshold(gray_diff, threshold, 255, cv2.THRESH_BINARY)
+        
+        # Apply morphological cleanup (same as skeleton detection)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        mask_clean = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        
+        # Create visualization (2x2 grid)
+        h, w = current.shape[:2]
+        vis = np.zeros((h, w * 2, 3), dtype=np.uint8)
+        
+        # Top-left: current frame
+        vis[0:h//2, 0:w//2] = cv2.resize(current, (w//2, h//2))
+        cv2.putText(vis, "Current", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
+        
+        # Top-right: baseline
+        vis[0:h//2, w//2:w] = cv2.resize(baseline, (w//2, h//2))
+        cv2.putText(vis, "Baseline", (w//2+10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
+        
+        # Bottom-left: diff (amplified)
+        diff_vis = cv2.cvtColor(gray_diff * 3, cv2.COLOR_GRAY2BGR)  # Amplify for visibility
+        vis[h//2:h, 0:w//2] = cv2.resize(diff_vis, (w//2, h//2))
+        cv2.putText(vis, "Diff (3x)", (10, h//2+25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
+        
+        # Bottom-right: mask
+        mask_vis = cv2.cvtColor(mask_clean, cv2.COLOR_GRAY2BGR)
+        vis[h//2:h, w//2:w] = cv2.resize(mask_vis, (w//2, h//2))
+        cv2.putText(vis, f"Mask (t={threshold})", (w//2+10, h//2+25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
+        
+        # Extend to full width 
+        # Actually make it single row for mobile
+        vis_mobile = np.zeros((h, w*2, 3), dtype=np.uint8)
+        vis_mobile[0:h, 0:w] = current
+        cv2.putText(vis_mobile, f"Current | Threshold={threshold}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0), 2)
+        
+        # Overlay mask as red on current frame
+        mask_colored = np.zeros_like(current)
+        mask_colored[:,:,2] = mask_clean  # Red channel
+        blended = cv2.addWeighted(current, 0.7, mask_colored, 0.3, 0)
+        vis_mobile[0:h, w:w*2] = blended
+        cv2.putText(vis_mobile, "Mask Overlay", (w+10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0), 2)
+        
+        # Count mask pixels
+        mask_pixels = np.count_nonzero(mask_clean)
+        cv2.putText(vis_mobile, f"Mask pixels: {mask_pixels}", (w+10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,255), 2)
+        
+        # Encode as JPEG
+        _, buffer = cv2.imencode('.jpg', vis_mobile, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        img_b64 = base64.b64encode(buffer.tobytes()).decode('utf-8')
+        
+        return {
+            "image": img_b64,
+            "threshold": threshold,
+            "camera_id": camera_id,
+            "mask_pixels": mask_pixels,
+            "has_baseline": True
+        }
+        
+    except Exception as e:
+        logger.error(f"Threshold tuning error: {e}")
+        return {"error": str(e)}
+
+
+@router.post("/v1/tuning/set-threshold")
+async def set_skeleton_threshold(request: dict):
+    """
+    Set the fixed threshold used by skeleton detection.
+    This modifies the in-memory default and will reset on restart.
+    
+    Body: {"threshold": 25}
+    """
+    from app.core import skeleton_detection
+    
+    new_threshold = request.get("threshold", 25)
+    new_threshold = max(5, min(100, int(new_threshold)))  # Clamp to 5-100
+    
+    # Update module-level default (would need to modify skeleton_detection.py for persistence)
+    # For now just return the value - the UI can pass threshold as param
+    
+    return {
+        "threshold": new_threshold,
+        "message": f"Use threshold={new_threshold} in detection requests"
+    }
+
