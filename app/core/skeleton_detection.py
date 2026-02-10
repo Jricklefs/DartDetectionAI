@@ -54,9 +54,18 @@ def save_debug_image(debug_name, current_frame, diff, motion_mask, original_mask
         cv2.line(frame_vis, pt1, pt2, (255, 255, 0), 2)
     cv2.putText(frame_vis, "Current + Contour + Tip", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,255), 2)
     
-    # Top-right: diff
-    diff_vis = cv2.cvtColor(diff, cv2.COLOR_GRAY2BGR) if len(diff.shape) == 2 else diff
-    cv2.putText(diff_vis, "Frame Diff", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,255), 2)
+    # Top-right: diff with contour overlay
+    diff_vis = cv2.cvtColor(diff, cv2.COLOR_GRAY2BGR) if len(diff.shape) == 2 else diff.copy()
+    if dart_contour is not None:
+        cv2.drawContours(diff_vis, [dart_contour], -1, (0, 255, 0), 2)
+    if tip:
+        cv2.circle(diff_vis, (int(tip[0]), int(tip[1])), 8, (0, 0, 255), -1)
+    if line_params:
+        vx, vy, x0, y0 = line_params
+        pt1 = (int(x0 - vx * 200), int(y0 - vy * 200))
+        pt2 = (int(x0 + vx * 200), int(y0 + vy * 200))
+        cv2.line(diff_vis, pt1, pt2, (255, 255, 0), 2)
+    cv2.putText(diff_vis, "Frame Diff + Contour", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,255), 2)
     
     # Stack top row
     top_row = np.hstack([frame_vis, diff_vis])
@@ -104,7 +113,7 @@ def fit_line_to_skeleton(skeleton):
     return float(vx[0]), float(vy[0]), float(x0[0]), float(y0[0])
 
 
-def find_dart_contour(motion_mask, min_area=500, min_aspect_ratio=2.0, existing_locations=None, exclude_radius=120):
+def find_dart_contour(motion_mask, min_area=500, min_aspect_ratio=2.0, existing_locations=None, exclude_radius=80):
     """
     Find the dart contour from motion mask.
     Darts are elongated - filter by aspect ratio to avoid noise blobs.
@@ -121,10 +130,6 @@ def find_dart_contour(motion_mask, min_area=500, min_aspect_ratio=2.0, existing_
     if existing_locations is None:
         existing_locations = []
     
-    # DEBUG: Log existing locations
-    if existing_locations:
-        print(f"[CONTOUR] Excluding {len(existing_locations)} existing dart locations: {existing_locations}")
-    
     best_contour = None
     best_score = 0
     
@@ -140,17 +145,11 @@ def find_dart_contour(motion_mask, min_area=500, min_aspect_ratio=2.0, existing_
             continue
         
         # Check if this contour is near an existing dart - if so, skip it
-        # Use the LOWEST point (max Y) of the contour as the tip estimate
-        # This is more accurate than centroid for dart comparison
-        lowest_point = max(cnt.reshape(-1, 2), key=lambda p: p[1])
-        cnt_tip_x, cnt_tip_y = float(lowest_point[0]), float(lowest_point[1])
-        
         is_existing = False
         for (ex, ey) in existing_locations:
-            dist = np.sqrt((cnt_tip_x - ex)**2 + (cnt_tip_y - ey)**2)
+            dist = np.sqrt((cx - ex)**2 + (cy - ey)**2)
             if dist < exclude_radius:
                 is_existing = True
-                print(f"[CONTOUR] Excluding contour with tip ({cnt_tip_x:.0f}, {cnt_tip_y:.0f}) - {dist:.0f}px from existing ({ex:.0f}, {ey:.0f})")
                 break
         
         if is_existing:
@@ -193,87 +192,103 @@ def find_dart_contour(motion_mask, min_area=500, min_aspect_ratio=2.0, existing_
     return best_contour
 
 
-def project_to_tip(skeleton_endpoint, line_params, original_mask, max_extend=50, board_center=None, dart_contour=None):
+def project_to_tip(skeleton_endpoint, line_params, original_mask, max_extend=50):
     """
-    Find the tip by walking along the fitted line in +Y direction.
+    Project from skeleton endpoint along line direction to find true tip.
     
-    The tip is the lowest point (max Y) of the dart along the line,
-    constrained to be near the dart contour if provided.
+    First projects the endpoint onto the centerline, then walks along
+    the line in the +Y direction until we exit the original mask.
     
     Args:
-        skeleton_endpoint: (x, y) starting point (fallback)
+        skeleton_endpoint: (x, y) endpoint from skeleton
         line_params: (vx, vy, x0, y0) from cv2.fitLine
-        original_mask: Full motion mask (pre-erosion)
-        max_extend: Maximum pixels to search
-        board_center: (unused)
-        dart_contour: If provided, only consider points within this contour's bounding box
+        original_mask: Pre-erosion motion mask
+        max_extend: Maximum pixels to extend beyond skeleton
     
     Returns:
-        (tip_x, tip_y) - the lowest point on line that's in the mask
+        (tip_x, tip_y) - projected tip position ON the centerline
     """
     if line_params is None:
         return skeleton_endpoint
     
     vx, vy, x0, y0 = line_params
-    h, w = original_mask.shape[:2]
+    ex, ey = skeleton_endpoint
     
-    # Get bounding box of dart contour to constrain search
-    min_x, max_x = 0, w
-    min_y, max_y = 0, h
-    if dart_contour is not None:
-        x, y, cw, ch = cv2.boundingRect(dart_contour)
-        # Expand bounding box a bit to catch the tip
-        min_x = max(0, x - 50)
-        max_x = min(w, x + cw + 50)
-        min_y = max(0, y - 20)
-        max_y = min(h, y + ch + 100)  # More room below for tip
-    
-    # Normalize direction to point +Y (downward = toward tip)
-    if vy < 0:
-        vx, vy = -vx, -vy
-    
-    # Normalize to unit vector
+    # Normalize direction to unit vector
     length = np.sqrt(vx*vx + vy*vy)
     if length < 0.001:
         return skeleton_endpoint
     vx, vy = vx/length, vy/length
     
-    # Start from the line origin point and walk in BOTH directions to find full extent
-    best_x, best_y = x0, y0
+    # Project skeleton endpoint onto the centerline
+    # Line: P = (x0, y0) + t * (vx, vy)
+    # Find t such that (endpoint - P) is perpendicular to line direction
+    # t = ((ex - x0) * vx + (ey - y0) * vy)
+    t = (ex - x0) * vx + (ey - y0) * vy
+    proj_x = x0 + t * vx
+    proj_y = y0 + t * vy
     
-    # Walk along line in both directions
-    for step in range(-max_extend, max_extend + 1):
-        nx = int(x0 + vx * step)
-        ny = int(y0 + vy * step)
+    # Start from projected point (on centerline)
+    ex, ey = proj_x, proj_y
+    
+    # Normalize direction to point +Y (downward in image)
+    if vy < 0:
+        vx, vy = -vx, -vy
+    
+    h, w = original_mask.shape[:2]
+    
+    # Start from endpoint and walk in tip direction
+    best_x, best_y = ex, ey
+    gap_count = 0
+    max_gap = 10  # Allow up to 10 pixel gaps in the mask
+    
+    for step in range(1, max_extend + 1):
+        nx = int(ex + vx * step)
+        ny = int(ey + vy * step)
         
         # Check bounds
         if nx < 0 or nx >= w or ny < 0 or ny >= h:
-            continue
+            break
         
-        # Check if within dart contour bounding box
-        if nx < min_x or nx > max_x or ny < min_y or ny > max_y:
-            continue
-        
-        # Check if in mask and has higher Y (lower on screen = closer to tip)
+        # Check if still in mask
         if original_mask[ny, nx] > 0:
-            if ny > best_y:
-                best_x, best_y = nx, ny
+            best_x, best_y = nx, ny
+            gap_count = 0  # Reset gap counter
+        else:
+            gap_count += 1
+            if gap_count > max_gap:
+                # Too big a gap - we've exited the dart
+                break
     
     return (float(best_x), float(best_y))
 
 
-def find_tip_endpoint(endpoints, line_params, board_center=None):
+def find_tip_endpoint(endpoints, line_params):
     """
-    Find which skeleton endpoint is the tip end.
-    
-    The tip is simply the endpoint with the highest Y value (lowest point in image).
-    Darts point downward into the board.
+    Find which skeleton endpoint is the tip end (in +Y direction).
     """
-    if len(endpoints) < 2:
+    if len(endpoints) < 2 or line_params is None:
         return endpoints[0] if endpoints else None
     
-    # Tip = highest Y value (lowest point on screen)
-    return max(endpoints, key=lambda p: p[1])
+    vx, vy, x0, y0 = line_params
+    
+    # Normalize to point +Y
+    if vy < 0:
+        vx, vy = -vx, -vy
+    
+    # Pick endpoint in +Y direction from line midpoint
+    best_endpoint = None
+    best_score = -float('inf')
+    
+    for (ex, ey) in endpoints:
+        to_endpoint = np.array([ex - x0, ey - y0])
+        score = to_endpoint[0] * vx + to_endpoint[1] * vy
+        
+        if score > best_score:
+            best_score = score
+            best_endpoint = (ex, ey)
+    
+    return best_endpoint
 
 
 def detect_dart_skeleton(
@@ -380,16 +395,16 @@ def detect_dart_skeleton(
     endpoints = find_skeleton_endpoints(skeleton)
     
     if len(endpoints) >= 2 and line_params:
-        # Find which endpoint is the tip end (highest Y = lowest on screen)
-        skeleton_tip = find_tip_endpoint(endpoints, line_params, board_center=center)
+        # Find which endpoint is the tip end
+        skeleton_tip = find_tip_endpoint(endpoints, line_params)
         
-        # Project along line to find true tip in original mask (need long range for full dart)
-        tip = project_to_tip(skeleton_tip, line_params, original_mask, max_extend=400, board_center=center, dart_contour=dart_contour)
+        # Project along line to find true tip in original mask
+        tip = project_to_tip(skeleton_tip, line_params, original_mask, max_extend=100)
         result["tip"] = tip
         result["confidence"] = 0.8
         
     elif len(endpoints) == 1:
-        tip = project_to_tip(endpoints[0], line_params, original_mask, max_extend=400, board_center=center, dart_contour=dart_contour)
+        tip = project_to_tip(endpoints[0], line_params, original_mask, max_extend=100)
         result["tip"] = tip
         result["confidence"] = 0.6
     else:
@@ -540,10 +555,10 @@ def detect_dart_hough(
     
     # Find tip endpoint and project
     endpoints = [(x1, y1), (x2, y2)]
-    skeleton_tip = find_tip_endpoint(endpoints, (vx, vy, x0, y0), board_center=center)
+    skeleton_tip = find_tip_endpoint(endpoints, (vx, vy, x0, y0))
     
     if skeleton_tip:
-        tip = project_to_tip(skeleton_tip, (vx, vy, x0, y0), original_mask, max_extend=100, board_center=center)
+        tip = project_to_tip(skeleton_tip, (vx, vy, x0, y0), original_mask, max_extend=100)
         result["tip"] = tip
         result["confidence"] = min(1.0, alignment * (length / 80.0))
     else:
