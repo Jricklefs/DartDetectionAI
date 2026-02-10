@@ -357,45 +357,65 @@ def find_tip_endpoint(endpoints, line_params, board_center=None):
 
 
 def get_adaptive_motion_mask(current_frame, previous_frame, camera_id=None, 
-                             fixed_threshold=25, use_background_model=False):
+                             fixed_threshold=20, use_background_model=False):
     """
-    Get motion mask using either fixed threshold or adaptive background model.
+    Get motion mask using frame differencing with improved preprocessing.
+    
+    Pipeline:
+    1. Gaussian blur both frames (reduces sensor noise)
+    2. Compute absolute difference
+    3. Apply threshold
+    4. Morphological opening (remove noise)
+    5. Morphological closing (fill gaps in dart)
     
     Args:
         current_frame: Current BGR frame
         previous_frame: Previous BGR frame (before dart)
         camera_id: Camera ID for background model lookup
-        fixed_threshold: Fixed threshold to use if no background model
-        use_background_model: Whether to use adaptive thresholding
+        fixed_threshold: Fixed threshold (lowered to 20 since blur reduces noise)
+        use_background_model: Whether to use adaptive thresholding (disabled)
     
     Returns:
         (gray_diff, motion_mask) tuple
     """
-    # Compute diff
-    diff = cv2.absdiff(current_frame, previous_frame)
+    # STEP 1: Gaussian blur to reduce camera sensor noise
+    # This is key - reduces false positives from sensor noise
+    blur_current = cv2.GaussianBlur(current_frame, (5, 5), 0)
+    blur_previous = cv2.GaussianBlur(previous_frame, (5, 5), 0)
+    
+    # STEP 2: Compute diff on blurred frames
+    diff = cv2.absdiff(blur_current, blur_previous)
     gray_diff = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
     
-    # Try adaptive thresholding via background model
+    # Keep original diff for return (useful for debugging)
+    diff_orig = cv2.absdiff(current_frame, previous_frame)
+    gray_diff_orig = cv2.cvtColor(diff_orig, cv2.COLOR_BGR2GRAY)
+    
+    # Try adaptive thresholding via background model (disabled by default)
     if use_background_model and HAS_BG_MODEL and camera_id:
         try:
             bg_manager = get_background_manager()
             diff_uint8, motion_mask = bg_manager.get_adaptive_diff(
                 camera_id, current_frame, previous_frame
             )
-            # Use the adaptive mask if we got one
             if motion_mask is not None and np.sum(motion_mask) > 0:
-                return gray_diff, motion_mask
-        except Exception as e:
+                return gray_diff_orig, motion_mask
+        except Exception:
             pass  # Fall through to fixed threshold
     
-    # Fallback: fixed threshold
+    # STEP 3: Apply fixed threshold (lower now since blur reduced noise)
     _, motion_mask = cv2.threshold(gray_diff, fixed_threshold, 255, cv2.THRESH_BINARY)
     
-    # Remove small noise blobs
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    motion_mask = cv2.morphologyEx(motion_mask, cv2.MORPH_OPEN, kernel)
+    # STEP 4: Morphological opening - removes small noise blobs
+    open_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    motion_mask = cv2.morphologyEx(motion_mask, cv2.MORPH_OPEN, open_kernel)
     
-    return gray_diff, motion_mask
+    # STEP 5: Morphological closing - fills small holes in dart silhouette
+    # This helps create a more solid dart shape for skeleton extraction
+    close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    motion_mask = cv2.morphologyEx(motion_mask, cv2.MORPH_CLOSE, close_kernel)
+    
+    return gray_diff_orig, motion_mask
 
 
 def detect_dart_skeleton(

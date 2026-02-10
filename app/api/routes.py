@@ -5510,6 +5510,7 @@ async def replay_benchmark_polygon_with_voting():
 
 
 
+
 # ==================== THRESHOLD TUNING ====================
 
 # Store tuning baselines separately from game baselines
@@ -5517,20 +5518,22 @@ _tuning_baselines = {}  # {camera_id: np.ndarray}
 
 @router.get("/v1/tuning/threshold")
 async def get_threshold_tuning(
-    threshold: int = 25,
+    threshold: int = 20,
     camera_id: str = "cam0",
-    reset_baseline: bool = False
+    reset_baseline: bool = False,
+    show_raw: bool = False
 ):
     """
     Get a visual preview of frame diff at a given threshold.
-    Returns base64 image showing: current frame with mask overlay.
+    
+    Args:
+        threshold: Diff threshold (default 20)
+        camera_id: Which camera to use
+        reset_baseline: Capture new baseline
+        show_raw: Show full processing pipeline (raw diff, blur, mask stages)
     
     On first call (or reset_baseline=true), captures current frame as baseline.
     Subsequent calls show diff between current and baseline.
-    
-    Use this to tune the diff threshold for skeleton detection.
-    Lower threshold = more sensitive (more noise)
-    Higher threshold = less sensitive (may miss darts)
     """
     import httpx
     import cv2
@@ -5542,7 +5545,6 @@ async def get_threshold_tuning(
     try:
         # Get snapshot from DartSensor
         async with httpx.AsyncClient(timeout=5.0) as client:
-            # Map camera_id to index
             cam_index = int(camera_id.replace("cam", ""))
             
             resp = await client.get(f"http://localhost:8001/cameras/{cam_index}/snapshot")
@@ -5554,7 +5556,6 @@ async def get_threshold_tuning(
             if not current_b64:
                 return {"error": "No image data from camera"}
             
-            # Decode current frame
             current_bytes = base64.b64decode(current_b64)
             current_arr = np.frombuffer(current_bytes, np.uint8)
             current = cv2.imdecode(current_arr, cv2.IMREAD_COLOR)
@@ -5563,7 +5564,6 @@ async def get_threshold_tuning(
         if reset_baseline or camera_id not in _tuning_baselines:
             _tuning_baselines[camera_id] = current.copy()
             
-            # Return just the current frame with "baseline captured" message
             h, w = current.shape[:2]
             cv2.putText(current, "BASELINE CAPTURED", (w//2 - 150, h//2), 
                         cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 3)
@@ -5583,43 +5583,85 @@ async def get_threshold_tuning(
             }
         
         baseline = _tuning_baselines[camera_id]
-        
-        # Compute diff
-        diff = cv2.absdiff(current, baseline)
-        gray_diff = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
-        
-        # Apply threshold
-        _, mask = cv2.threshold(gray_diff, threshold, 255, cv2.THRESH_BINARY)
-        
-        # Apply morphological cleanup (same as skeleton detection)
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        mask_clean = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-        
-        # Count mask pixels
-        mask_pixels = int(np.count_nonzero(mask_clean))
-        
-        # Create visualization - overlay mask as red on current frame
         h, w = current.shape[:2]
         
-        # Side by side: current with mask overlay | baseline
-        vis = np.zeros((h, w * 2, 3), dtype=np.uint8)
+        # === PROCESSING PIPELINE ===
         
-        # Left side: current with mask overlay
-        mask_colored = np.zeros_like(current)
-        mask_colored[:,:,2] = mask_clean  # Red channel
-        blended = cv2.addWeighted(current, 0.7, mask_colored, 0.5, 0)
-        vis[0:h, 0:w] = blended
-        cv2.putText(vis, f"Current + Mask (t={threshold})", (10, 30), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-        cv2.putText(vis, f"Pixels: {mask_pixels:,}", (10, 60), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+        # Step 1: Raw diff (no processing)
+        raw_diff = cv2.absdiff(current, baseline)
+        raw_diff_gray = cv2.cvtColor(raw_diff, cv2.COLOR_BGR2GRAY)
         
-        # Right side: baseline
-        vis[0:h, w:w*2] = baseline
-        cv2.putText(vis, "Baseline (empty board)", (w + 10, 30), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+        # Step 2: Blur both frames
+        blur_current = cv2.GaussianBlur(current, (5, 5), 0)
+        blur_baseline = cv2.GaussianBlur(baseline, (5, 5), 0)
+        blur_diff = cv2.absdiff(blur_current, blur_baseline)
+        blur_diff_gray = cv2.cvtColor(blur_diff, cv2.COLOR_BGR2GRAY)
         
-        # Encode as JPEG
+        # Step 3: Threshold
+        _, raw_mask = cv2.threshold(raw_diff_gray, threshold, 255, cv2.THRESH_BINARY)
+        _, blur_mask = cv2.threshold(blur_diff_gray, threshold, 255, cv2.THRESH_BINARY)
+        
+        # Step 4: Morphological cleanup
+        open_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        
+        final_mask = cv2.morphologyEx(blur_mask, cv2.MORPH_OPEN, open_kernel)
+        final_mask = cv2.morphologyEx(final_mask, cv2.MORPH_CLOSE, close_kernel)
+        
+        mask_pixels = int(np.count_nonzero(final_mask))
+        
+        if show_raw:
+            # Create 2x3 grid showing full pipeline
+            cell_h, cell_w = h // 2, w // 3
+            vis = np.zeros((h, w, 3), dtype=np.uint8)
+            
+            def resize_to_cell(img):
+                if len(img.shape) == 2:
+                    img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+                return cv2.resize(img, (cell_w, cell_h))
+            
+            # Row 1: Current, Baseline, Raw Diff
+            vis[0:cell_h, 0:cell_w] = resize_to_cell(current)
+            vis[0:cell_h, cell_w:cell_w*2] = resize_to_cell(baseline)
+            # Amplify raw diff for visibility
+            raw_diff_amp = cv2.cvtColor(np.clip(raw_diff_gray * 4, 0, 255).astype(np.uint8), cv2.COLOR_GRAY2BGR)
+            vis[0:cell_h, cell_w*2:cell_w*3] = resize_to_cell(raw_diff_amp)
+            
+            # Row 2: Blur Diff, Raw Mask, Final Mask
+            blur_diff_amp = cv2.cvtColor(np.clip(blur_diff_gray * 4, 0, 255).astype(np.uint8), cv2.COLOR_GRAY2BGR)
+            vis[cell_h:cell_h*2, 0:cell_w] = resize_to_cell(blur_diff_amp)
+            vis[cell_h:cell_h*2, cell_w:cell_w*2] = resize_to_cell(raw_mask)
+            vis[cell_h:cell_h*2, cell_w*2:cell_w*3] = resize_to_cell(final_mask)
+            
+            # Labels
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            cv2.putText(vis, "Current", (5, 20), font, 0.5, (0,255,0), 1)
+            cv2.putText(vis, "Baseline", (cell_w+5, 20), font, 0.5, (0,255,0), 1)
+            cv2.putText(vis, f"Raw Diff (4x)", (cell_w*2+5, 20), font, 0.5, (0,255,0), 1)
+            cv2.putText(vis, f"Blur Diff (4x)", (5, cell_h+20), font, 0.5, (0,255,0), 1)
+            cv2.putText(vis, f"Raw Mask (t={threshold})", (cell_w+5, cell_h+20), font, 0.5, (0,255,0), 1)
+            cv2.putText(vis, f"Final Mask ({mask_pixels:,}px)", (cell_w*2+5, cell_h+20), font, 0.5, (0,255,0), 1)
+            
+        else:
+            # Simple side-by-side: current with mask overlay | baseline
+            vis = np.zeros((h, w * 2, 3), dtype=np.uint8)
+            
+            # Left: current with mask overlay
+            mask_colored = np.zeros_like(current)
+            mask_colored[:,:,2] = final_mask  # Red channel
+            blended = cv2.addWeighted(current, 0.7, mask_colored, 0.5, 0)
+            vis[0:h, 0:w] = blended
+            cv2.putText(vis, f"Current + Mask (t={threshold})", (10, 30), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+            cv2.putText(vis, f"Pixels: {mask_pixels:,}", (10, 60), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+            
+            # Right: baseline
+            vis[0:h, w:w*2] = baseline
+            cv2.putText(vis, "Baseline", (w + 10, 30), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+        
+        # Encode
         _, buffer = cv2.imencode('.jpg', vis, [cv2.IMWRITE_JPEG_QUALITY, 85])
         img_b64 = base64.b64encode(buffer.tobytes()).decode('utf-8')
         
@@ -5628,7 +5670,8 @@ async def get_threshold_tuning(
             "threshold": threshold,
             "camera_id": camera_id,
             "mask_pixels": mask_pixels,
-            "baseline_captured": False
+            "baseline_captured": False,
+            "show_raw": show_raw
         }
         
     except Exception as e:
