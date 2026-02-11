@@ -696,9 +696,14 @@ def get_adaptive_motion_mask(current_frame, previous_frame, camera_id=None,
     
     # STEP 4: Bridge gaps between flight and shaft blobs
     # The dart barrel/grip can be similar to background, creating a gap
-    # Use morphological closing with a tall kernel to connect nearby blobs
-    bridge_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 25))
-    motion_mask_bridged = cv2.morphologyEx(motion_mask, cv2.MORPH_CLOSE, bridge_kernel)
+    # Use morphological closing with a large round kernel (angle-independent)
+    # Then dilate slightly to merge close blobs
+    bridge_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+    motion_mask_bridged = cv2.morphologyEx(motion_mask, cv2.MORPH_CLOSE, bridge_kernel, iterations=2)
+    # Also try dilate+erode to merge nearby blobs
+    dilate_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (20, 20))
+    motion_mask_bridged = cv2.dilate(motion_mask_bridged, dilate_kernel, iterations=1)
+    motion_mask_bridged = cv2.erode(motion_mask_bridged, dilate_kernel, iterations=1)
     # Use bridged mask for contour selection, but keep original for detail
     blob_contours, _ = cv2.findContours(motion_mask_bridged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if blob_contours:
