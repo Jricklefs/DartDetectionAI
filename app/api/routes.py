@@ -2803,52 +2803,49 @@ def compute_homography_for_camera(camera_id: str, polygon_calibration) -> bool:
         src_points = np.array(polygon_calibration.double_outers, dtype=np.float32)
         bull = polygon_calibration.bull
         
-        # Compute angle of each polygon point from bull center
-        poly_angles = []
-        for pt in polygon_calibration.double_outers:
-            dx = pt[0] - bull[0]
-            dy = pt[1] - bull[1]
-            angle = math.degrees(math.atan2(dy, dx))  # -180 to 180
-            poly_angles.append(angle)
+        # Find correct alignment by testing all 20 rotations
+        # For each rotation, compute homography and check if bull maps to (0,0)mm
+        # The correct rotation will have bull closest to origin
         
-        # Standard boundary angles: boundary 0 (20/1) is at -81°, each +18° clockwise
-        # In image coords, Y is flipped, so clockwise in image = clockwise on board
-        std_boundary_angles = [(-81 + i * 18 + 180) % 360 - 180 for i in range(20)]
+        # Try both boundary points and center points
+        standard_boundary = get_standard_board_boundary_points()
+        standard_center = get_standard_board_points()
         
-        # Find which polygon point best matches boundary 0 (the 20/1 boundary at -81°)
-        # Normalize polygon angles to same range
-        target_angle = std_boundary_angles[0]  # -81°
-        
-        # Find best match by checking angular distance for each polygon point
         best_offset = 0
-        best_score = float('inf')
+        best_bull_dist = float('inf')
+        best_point_type = "boundary"
         
-        for offset in range(20):
-            # If polygon points start at 'offset' positions from boundary 0
-            total_error = 0
-            for i in range(20):
-                poly_idx = (i + offset) % 20
-                poly_a = poly_angles[poly_idx]
-                std_a = std_boundary_angles[i]
+        bull_px = np.array([[bull[0], bull[1]]], dtype=np.float32).reshape(-1, 1, 2)
+        
+        for point_type, standard_pts in [("boundary", standard_boundary), ("center", standard_center)]:
+            for offset in range(20):
+                rotated = standard_pts[offset:] + standard_pts[:offset]
+                dst_test = np.array(rotated, dtype=np.float32)
                 
-                # Angular difference (handle wrap-around)
-                diff = abs(((poly_a - std_a) + 180) % 360 - 180)
-                total_error += diff
-            
-            if total_error < best_score:
-                best_score = total_error
-                best_offset = offset
+                H_test, _ = cv2.findHomography(src_points, dst_test, cv2.RANSAC, 5.0)
+                if H_test is None:
+                    continue
+                
+                # Transform bull through this homography
+                bull_mm = cv2.perspectiveTransform(bull_px, H_test).reshape(-1, 2)[0]
+                bull_dist = math.sqrt(bull_mm[0]**2 + bull_mm[1]**2)
+                
+                if bull_dist < best_bull_dist:
+                    best_bull_dist = bull_dist
+                    best_offset = offset
+                    best_point_type = point_type
         
-        avg_error = best_score / 20
-        
-        # Generate destination points: rotate standard boundary mm coords to match polygon order
-        standard_pts = get_standard_board_boundary_points()
+        # Use the best rotation
+        if best_point_type == "boundary":
+            standard_pts = standard_boundary
+        else:
+            standard_pts = standard_center
         rotated_dst = standard_pts[best_offset:] + standard_pts[:best_offset]
         dst_points = np.array(rotated_dst, dtype=np.float32)
         
-        logger.info(f"[HOMOGRAPHY] {camera_id}: best_offset={best_offset}, avg_angle_error={avg_error:.1f}°")
+        logger.info(f"[HOMOGRAPHY] {camera_id}: offset={best_offset}, type={best_point_type}, bull_dist={best_bull_dist:.1f}mm")
         with open(r'C:\Users\clawd\skel_debug.txt', 'a') as dbg:
-            dbg.write(f'[HOMOGRAPHY] {camera_id}: offset={best_offset}, avg_err={avg_error:.1f}°, poly_angle[0]={poly_angles[0]:.1f}°\n')
+            dbg.write(f'[HOMOGRAPHY] {camera_id}: offset={best_offset}, type={best_point_type}, bull_err={best_bull_dist:.1f}mm\n')
         
         # Compute homography: maps pixels -> mm
         H, mask = cv2.findHomography(src_points, dst_points, cv2.RANSAC, 5.0)
