@@ -76,6 +76,19 @@ try:
     load_polygon_calibrations(r"C:/Users/clawd/DartDetectionAI/polygon_calibrations.json")
     HAS_POLYGON = True
     print("[STARTUP] Polygon calibrations loaded successfully")
+
+# Scoring mode: 'polygon' (weighted vote) or 'line_intersection' (triangulation)
+_scoring_mode = "polygon"
+
+def get_scoring_mode():
+    return _scoring_mode
+
+def set_scoring_mode(mode: str) -> bool:
+    global _scoring_mode
+    if mode in ("polygon", "line_intersection"):
+        _scoring_mode = mode
+        return True
+    return False
 except ImportError as e:
     print(f"[STARTUP] Polygon calibration not available: {e}")
     HAS_POLYGON = False
@@ -1327,6 +1340,21 @@ API_KEYS = set(os.getenv("API_KEYS", "").split(",")) if os.getenv("API_KEYS") el
 calibrator = DartboardCalibrator()
 
 
+
+
+@app.get("/v1/scoring-mode")
+async def get_scoring_mode_endpoint():
+    """Get current scoring mode."""
+    return {"scoring_mode": get_scoring_mode(), "options": ["polygon", "line_intersection"]}
+
+@app.post("/v1/scoring-mode")
+async def set_scoring_mode_endpoint(request: dict):
+    """Set scoring mode: 'polygon' or 'line_intersection'."""
+    mode = request.get("mode", "")
+    if set_scoring_mode(mode):
+        return {"scoring_mode": mode, "status": "ok"}
+    return {"error": f"Invalid mode: {mode}. Use 'polygon' or 'line_intersection'"}
+
 # === Request/Response Models ===
 
 class CameraInput(BaseModel):
@@ -2061,19 +2089,23 @@ async def detect_tips(
                 else:
                     logger.info(f"[LINE-VOTE] MM intersection outside board, falling back to voting")
     
-    # Always use polygon weighted voting as primary scoring
-    # Line intersection logged for debugging but not used for final score yet
-    # TODO: Enable line intersection when mm->segment mapping is reliable
+    # Score using configured mode
     weighted_tips = vote_on_scores(clustered_tips)
     
-    if line_intersection_result and detected_tips:
-        # Log line intersection result for comparison but use weighted vote
+    if _scoring_mode == "line_intersection" and line_intersection_result and detected_tips:
+        # Use line intersection result
         li_tip = detected_tips[0]
         with open(r"C:\Users\clawd\skel_debug.txt", "a") as dbg:
-            dbg.write(f"[LINE-VOTE] LINE-INTERSECTION would score: S{li_tip.segment}x{li_tip.multiplier}={li_tip.score}\n")
-    
-    detected_tips = weighted_tips
-    line_intersection_result = None  # Force weighted vote method label
+            dbg.write(f"[LINE-VOTE] Using LINE-INTERSECTION: S{li_tip.segment}x{li_tip.multiplier}={li_tip.score}\n")
+        # detected_tips already set from line intersection
+    else:
+        # Use polygon weighted vote (default)
+        if line_intersection_result and detected_tips:
+            li_tip = detected_tips[0]
+            with open(r"C:\Users\clawd\skel_debug.txt", "a") as dbg:
+                dbg.write(f"[LINE-VOTE] LINE-INTERSECTION would score: S{li_tip.segment}x{li_tip.multiplier}={li_tip.score}\n")
+        detected_tips = weighted_tips
+        line_intersection_result = None
     
     # Log final result vs votes
     if detected_tips and all_tips:
