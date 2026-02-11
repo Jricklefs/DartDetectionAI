@@ -6561,3 +6561,13 @@ async def reset_tuning_baseline(camera_id: str = None):
     else:
         _tuning_baselines.clear()
         return {"message": "All baselines reset"}
+
+
+# ============================================================
+# STARTUP: Initialize homography matrices on module load
+# ============================================================
+try:
+    init_homographies()
+    print(f"[STARTUP] Homography initialized: {list(_homography_cache.keys())}")
+except Exception as e:
+    print(f"[STARTUP] Homography init failed (will retry on first detection): {e}")
