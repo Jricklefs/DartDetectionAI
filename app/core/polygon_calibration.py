@@ -283,23 +283,29 @@ def score_from_polygon_calibration(
         bullseye_radius = 15
         bull_radius = 35
     
-    # Check if OUTSIDE the double ring first (miss)
-    # Use point-in-polygon on the full double_outers boundary
-    # Add small inward margin to catch edge cases (darts right on the wire)
+    # Check if OUTSIDE the double ring first
+    # Instead of returning miss, check how far outside and use angle-based scoring
+    # The tip may be slightly outside the polygon due to detection noise
+    is_outside_polygon = False
     if calibration.double_outers and len(calibration.double_outers) >= 3:
-        # Ensure polygon is properly closed by checking if we need to use it as-is
         polygon = list(calibration.double_outers)
-        
-        # Check with a slight inward shrink for robustness
-        # If point is outside the outer boundary, it's a miss
         if not point_in_polygon((x, y), polygon):
-            return {
-                "segment": 0,
-                "zone": "miss",
-                "score": 0,
-                "multiplier": 0,
-                "ring": "miss"
-            }
+            # Check distance from bull vs max polygon radius
+            # If way too far out, it's truly a miss
+            if calibration.double_outers:
+                max_poly_dist = max(
+                    math.sqrt((p[0] - bull[0])**2 + (p[1] - bull[1])**2) 
+                    for p in calibration.double_outers
+                )
+                if dist_from_bull > max_poly_dist * 1.3:  # 30% tolerance
+                    return {
+                        "segment": 0,
+                        "zone": "miss",
+                        "score": 0,
+                        "multiplier": 0,
+                        "ring": "miss"
+                    }
+            is_outside_polygon = True
     
     # Check bullseye first
     if dist_from_bull <= bullseye_radius:
