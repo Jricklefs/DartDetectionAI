@@ -2061,11 +2061,19 @@ async def detect_tips(
                 else:
                     logger.info(f"[LINE-VOTE] MM intersection outside board, falling back to voting")
     
-    # Fall back to weighted voting if line intersection didn't work
-    if not line_intersection_result or not detected_tips:
+    # Always use polygon weighted voting as primary scoring
+    # Line intersection logged for debugging but not used for final score yet
+    # TODO: Enable line intersection when mm->segment mapping is reliable
+    weighted_tips = vote_on_scores(clustered_tips)
+    
+    if line_intersection_result and detected_tips:
+        # Log line intersection result for comparison but use weighted vote
+        li_tip = detected_tips[0]
         with open(r"C:\Users\clawd\skel_debug.txt", "a") as dbg:
-            dbg.write(f"[LINE-VOTE] FALLBACK to weighted voting (line_result={line_intersection_result is not None}, tips={len(detected_tips)})\n")
-        detected_tips = vote_on_scores(clustered_tips)
+            dbg.write(f"[LINE-VOTE] LINE-INTERSECTION would score: S{li_tip.segment}x{li_tip.multiplier}={li_tip.score}\n")
+    
+    detected_tips = weighted_tips
+    line_intersection_result = None  # Force weighted vote method label
     
     # Log final result vs votes
     if detected_tips and all_tips:
