@@ -694,9 +694,13 @@ def get_adaptive_motion_mask(current_frame, previous_frame, camera_id=None,
     # Autodarts uses minimal processing to preserve dart shape
     _, motion_mask = cv2.threshold(gray_diff, fixed_threshold, 255, cv2.THRESH_BINARY)
     
-    # STEP 4: Select biggest elongated blob (dart-shaped)
-    # Filters out motion artifacts, shadows, and noise
-    blob_contours, _ = cv2.findContours(motion_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # STEP 4: Bridge gaps between flight and shaft blobs
+    # The dart barrel/grip can be similar to background, creating a gap
+    # Use morphological closing with a tall kernel to connect nearby blobs
+    bridge_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 25))
+    motion_mask_bridged = cv2.morphologyEx(motion_mask, cv2.MORPH_CLOSE, bridge_kernel)
+    # Use bridged mask for contour selection, but keep original for detail
+    blob_contours, _ = cv2.findContours(motion_mask_bridged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if blob_contours:
         best_blob = None
         best_score = 0
@@ -713,9 +717,12 @@ def get_adaptive_motion_mask(current_frame, previous_frame, camera_id=None,
                 best_blob = c
         
         if best_blob is not None:
-            clean_mask = np.zeros_like(motion_mask)
-            cv2.drawContours(clean_mask, [best_blob], -1, 255, -1)
-            motion_mask = clean_mask
+            # Use the bridged contour as a region of interest
+            # But fill with the ORIGINAL (unbridged) motion pixels for detail
+            roi_mask = np.zeros_like(motion_mask)
+            cv2.drawContours(roi_mask, [best_blob], -1, 255, -1)
+            # Keep original detail within the bridged region
+            motion_mask = cv2.bitwise_and(motion_mask, roi_mask)
     
     return gray_diff, motion_mask
 
