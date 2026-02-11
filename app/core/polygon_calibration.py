@@ -371,18 +371,51 @@ def score_from_polygon_calibration(
         # Need to create a polygon from inner_triple to bull
         # For now, use angle-based detection for inner single
     
-    # Fallback: use angle to determine segment for inner single
+    # Fallback: determine segment by which polygon boundary points the tip falls between
+    # This accounts for camera perspective distortion (unlike standard angle math)
     angle = math.atan2(y - bull[1], x - bull[0])
     angle_deg = math.degrees(angle)
-    if angle_deg < 0:
-        angle_deg += 360
     
-    # Each segment is 18 degrees, starting at 20
-    # 20 is at the top (-90 degrees in image coords, or 270 degrees)
-    # Adjust for segment boundaries
-    adjusted_angle = (angle_deg + 90 + 9) % 360  # +9 to center on segment
-    seg_idx = int(adjusted_angle / 18) % 20
-    segment_value = SEGMENT_ORDER[seg_idx]
+    # Get angles of all double_outer boundary points from bull
+    if calibration.double_outers and len(calibration.double_outers) == 20:
+        boundary_angles = []
+        for p in calibration.double_outers:
+            ba = math.degrees(math.atan2(p[1] - bull[1], p[0] - bull[0]))
+            boundary_angles.append(ba)
+        
+        # Find which two boundary points the tip angle falls between
+        # Boundary i is between SEGMENT_ORDER[i] and SEGMENT_ORDER[(i+1)%20]
+        # So if tip is between boundary[i] and boundary[(i+1)%20], it's in SEGMENT_ORDER[(i+1)%20]
+        best_seg_idx = 0
+        min_angular_dist = 999
+        for i in range(20):
+            ba1 = boundary_angles[i]
+            ba2 = boundary_angles[(i + 1) % 20]
+            
+            # Check if angle_deg is between ba1 and ba2 (handling wraparound)
+            # Normalize angles relative to ba1
+            diff1 = ((angle_deg - ba1 + 180) % 360) - 180  # -180 to 180
+            diff2 = ((ba2 - ba1 + 180) % 360) - 180
+            
+            if diff2 > 0:
+                # Normal case: ba1 < ba2
+                if 0 <= diff1 <= diff2:
+                    best_seg_idx = (i + 1) % 20
+                    break
+            else:
+                # Wraparound case: ba2 < ba1
+                if diff1 >= 0 or diff1 <= diff2:
+                    best_seg_idx = (i + 1) % 20
+                    break
+        
+        segment_value = SEGMENT_ORDER[best_seg_idx]
+    else:
+        # No polygon data, use standard angle math as last resort
+        if angle_deg < 0:
+            angle_deg += 360
+        adjusted_angle = (angle_deg + 90 + 9) % 360
+        seg_idx = int(adjusted_angle / 18) % 20
+        segment_value = SEGMENT_ORDER[seg_idx]
     
     # Check if inside inner triple ring (inner single)
     if calibration.treble_inners:
