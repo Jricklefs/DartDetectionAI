@@ -2775,8 +2775,27 @@ def compute_homography_for_camera(camera_id: str, polygon_calibration) -> bool:
         # Source points: pixel coordinates from calibration
         src_points = np.array(polygon_calibration.double_outers, dtype=np.float32)
         
-        # Destination points: standard board mm coordinates
-        dst_points = np.array(get_standard_board_points(), dtype=np.float32)
+        # Find which polygon point corresponds to segment 20 (top of board)
+        # Segment 20 is at the top (-90 degrees from center)
+        bull = polygon_calibration.bull
+        
+        # Find the point closest to the TOP of the board (minimum y in pixel space = top)
+        min_y_idx = min(range(len(src_points)), key=lambda i: src_points[i][1])
+        
+        # Each point is one segment boundary (18 degrees apart)
+        # The top point should be segment 20 (index 0 in standard order)
+        # Rotate standard points to align with polygon point order
+        rotation_offset = min_y_idx  # How many positions to rotate
+        
+        standard_pts = get_standard_board_points()
+        # Rotate: if polygon point[8] is segment 20, then standard point[0] maps to polygon point[8]
+        # So we rotate standard points by -rotation_offset
+        rotated_dst = standard_pts[rotation_offset:] + standard_pts[:rotation_offset]
+        dst_points = np.array(rotated_dst, dtype=np.float32)
+        
+        logger.info(f"[HOMOGRAPHY] {camera_id}: polygon top point at index {min_y_idx}, rotating standard by {rotation_offset}")
+        with open(r'C:\Users\clawd\skel_debug.txt', 'a') as dbg:
+            dbg.write(f'[HOMOGRAPHY] {camera_id}: top_idx={min_y_idx}, rotation={rotation_offset}\n')
         
         # Compute homography: maps pixels -> mm
         H, mask = cv2.findHomography(src_points, dst_points, cv2.RANSAC, 5.0)
