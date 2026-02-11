@@ -2710,6 +2710,33 @@ for i, seg in enumerate(SEGMENT_ORDER):
     angle = -90 + (i * 18)  # -90 puts 20 at top (12 o'clock)
     SEGMENT_ANGLES[seg] = math.radians(angle)
 
+def get_standard_board_boundary_points():
+    """
+    Get the 20 double-outer ring BOUNDARY points in standard mm coordinates.
+    These are where the wires cross the double ring (segment boundaries).
+    
+    Standard dartboard order (clockwise from top):
+    20, 1, 18, 4, 13, 6, 10, 15, 2, 17, 3, 19, 7, 16, 8, 11, 14, 9, 12, 5
+    
+    Boundary i is between segment[i] and segment[(i+1)%20].
+    Boundary 0 (between 20 and 1) is at -90 + 9 = -81 degrees (9° clockwise from top).
+    """
+    SEGMENTS = [20, 1, 18, 4, 13, 6, 10, 15, 2, 17, 3, 19, 7, 16, 8, 11, 14, 9, 12, 5]
+    
+    points_mm = []
+    radius = DARTBOARD_MM["double_outer"]
+    
+    for i in range(20):
+        # Each boundary is at -90 + 9 + i*18 degrees
+        # -90 = top, +9 = half segment offset to get to boundary, +i*18 = each segment
+        angle = math.radians(-90 + 9 + (i * 18))
+        x = radius * math.cos(angle)
+        y = radius * math.sin(angle)
+        points_mm.append((x, y))
+    
+    return points_mm
+
+
 def get_standard_board_points():
     """
     Get the 20 double-outer ring points in standard mm coordinates.
@@ -2774,28 +2801,54 @@ def compute_homography_for_camera(camera_id: str, polygon_calibration) -> bool:
         
         # Source points: pixel coordinates from calibration
         src_points = np.array(polygon_calibration.double_outers, dtype=np.float32)
-        
-        # Find which polygon point corresponds to segment 20 (top of board)
-        # Segment 20 is at the top (-90 degrees from center)
         bull = polygon_calibration.bull
         
-        # Find the point closest to the TOP of the board (minimum y in pixel space = top)
-        min_y_idx = min(range(len(src_points)), key=lambda i: src_points[i][1])
+        # Compute angle of each polygon point from bull center
+        poly_angles = []
+        for pt in polygon_calibration.double_outers:
+            dx = pt[0] - bull[0]
+            dy = pt[1] - bull[1]
+            angle = math.degrees(math.atan2(dy, dx))  # -180 to 180
+            poly_angles.append(angle)
         
-        # Each point is one segment boundary (18 degrees apart)
-        # The top point should be segment 20 (index 0 in standard order)
-        # Rotate standard points to align with polygon point order
-        rotation_offset = min_y_idx  # How many positions to rotate
+        # Standard boundary angles: boundary 0 (20/1) is at -81°, each +18° clockwise
+        # In image coords, Y is flipped, so clockwise in image = clockwise on board
+        std_boundary_angles = [(-81 + i * 18 + 180) % 360 - 180 for i in range(20)]
         
-        standard_pts = get_standard_board_points()
-        # Rotate: if polygon point[8] is segment 20, then standard point[0] maps to polygon point[8]
-        # So we rotate standard points by -rotation_offset
-        rotated_dst = standard_pts[rotation_offset:] + standard_pts[:rotation_offset]
+        # Find which polygon point best matches boundary 0 (the 20/1 boundary at -81°)
+        # Normalize polygon angles to same range
+        target_angle = std_boundary_angles[0]  # -81°
+        
+        # Find best match by checking angular distance for each polygon point
+        best_offset = 0
+        best_score = float('inf')
+        
+        for offset in range(20):
+            # If polygon points start at 'offset' positions from boundary 0
+            total_error = 0
+            for i in range(20):
+                poly_idx = (i + offset) % 20
+                poly_a = poly_angles[poly_idx]
+                std_a = std_boundary_angles[i]
+                
+                # Angular difference (handle wrap-around)
+                diff = abs(((poly_a - std_a) + 180) % 360 - 180)
+                total_error += diff
+            
+            if total_error < best_score:
+                best_score = total_error
+                best_offset = offset
+        
+        avg_error = best_score / 20
+        
+        # Generate destination points: rotate standard boundary mm coords to match polygon order
+        standard_pts = get_standard_board_boundary_points()
+        rotated_dst = standard_pts[best_offset:] + standard_pts[:best_offset]
         dst_points = np.array(rotated_dst, dtype=np.float32)
         
-        logger.info(f"[HOMOGRAPHY] {camera_id}: polygon top point at index {min_y_idx}, rotating standard by {rotation_offset}")
+        logger.info(f"[HOMOGRAPHY] {camera_id}: best_offset={best_offset}, avg_angle_error={avg_error:.1f}°")
         with open(r'C:\Users\clawd\skel_debug.txt', 'a') as dbg:
-            dbg.write(f'[HOMOGRAPHY] {camera_id}: top_idx={min_y_idx}, rotation={rotation_offset}\n')
+            dbg.write(f'[HOMOGRAPHY] {camera_id}: offset={best_offset}, avg_err={avg_error:.1f}°, poly_angle[0]={poly_angles[0]:.1f}°\n')
         
         # Compute homography: maps pixels -> mm
         H, mask = cv2.findHomography(src_points, dst_points, cv2.RANSAC, 5.0)
