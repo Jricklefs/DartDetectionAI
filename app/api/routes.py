@@ -2891,6 +2891,26 @@ def compute_homography_for_camera(camera_id: str, polygon_calibration, seg20_idx
         return False
 
 
+
+def transform_mm_to_pixel(x_mm: float, y_mm: float, camera_id: str) -> tuple:
+    """Transform mm coordinates back to pixel space using inverse homography."""
+    global _homography_cache
+    
+    if camera_id not in _homography_cache:
+        return None
+    
+    _, H_inv = _homography_cache[camera_id]
+    
+    import cv2
+    import numpy as np
+    
+    pt = np.array([[x_mm, y_mm]], dtype=np.float32).reshape(-1, 1, 2)
+    pt_px = cv2.perspectiveTransform(pt, H_inv)
+    pt_px = pt_px.reshape(-1, 2)[0]
+    
+    return (float(pt_px[0]), float(pt_px[1]))
+
+
 def transform_point_to_mm(camera_id: str, point_px: tuple) -> tuple:
     """Transform a pixel point to mm coordinates using cached homography."""
     global _homography_cache
