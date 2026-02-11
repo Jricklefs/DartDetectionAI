@@ -1284,6 +1284,10 @@ def score_with_calibration_hybrid(tip_data: Dict[str, Any], calibration_data: Di
     x_px = tip_data.get('x_px', 0)
     y_px = tip_data.get('y_px', 0)
     
+    # DEBUG: Log what we're scoring
+    with open(r"C:\Users\clawd\skel_debug.txt", "a") as dbg:
+        dbg.write(f"  [SCORE-INPUT] {camera_id}: x_px={x_px}, y_px={y_px}, method={detection_method}, HAS_POLYGON={HAS_POLYGON}, tip_keys={list(tip_data.keys())[:8]}\n")
+    
     # Use polygon for skeleton/hough detection methods
     use_polygon = detection_method in ("skeleton", "hough") and HAS_POLYGON
     

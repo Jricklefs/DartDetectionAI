@@ -325,28 +325,43 @@ def project_to_tip(skeleton_endpoint, line_params, original_mask, max_extend=50,
     ex, ey = skeleton_endpoint
     t_start = (ex - x0) * vx + (ey - y0) * vy
     
-    # Search forward (toward board center) from way behind the dart
-    # to find the furthest mask pixel along the line
-    search_start = int(t_start - 200)  # Start well behind the flight
-    search_end = int(t_start + max_extend + 200)  # Search well past skeleton endpoint
+    # Search along centerline to find the furthest mask pixel (the tip)
+    # Start from skeleton endpoint and walk toward board center
+    # Constrain: don't search beyond board radius from center
+    search_start = int(t_start - 50)  # Small lookback behind skeleton endpoint
+    search_end = int(t_start + max_extend + 100)  # Reasonable extension past endpoint
     
-    furthest_t = search_start
+    furthest_t = None
     gap_count = 0
-    max_gap = 15  # Allow gaps in the mask (thin shaft might have holes)
+    max_gap = 10  # Allow small gaps in the mask
     in_dart = False
+    
+    # Calculate max allowed distance from board center (if known)
+    max_dist_from_center = float('inf')
+    if board_center is not None:
+        # Don't let tip go beyond ~board radius from center
+        # Estimate board radius from polygon or use generous default
+        max_dist_from_center = 400  # pixels, generous for 1280x720
     
     for t in range(search_start, search_end):
         px = int(x0 + vx * t)
         py = int(y0 + vy * t)
         
         if px < 0 or px >= w or py < 0 or py >= h:
+            if in_dart:
+                break  # Hit image edge while tracking dart
             continue
         
-        # Check a small neighborhood perpendicular to line (not just centerline pixel)
-        # This catches mask pixels slightly off the center
+        # Don't search beyond board boundary
+        if board_center is not None:
+            dist = np.sqrt((px - board_center[0])**2 + (py - board_center[1])**2)
+            if dist > max_dist_from_center:
+                break
+        
+        # Check a small neighborhood perpendicular to line
         nx, ny = -vy, vx  # perpendicular
         hit = False
-        for offset in range(-5, 6):
+        for offset in range(-4, 5):
             sx = int(px + nx * offset)
             sy = int(py + ny * offset)
             if 0 <= sx < w and 0 <= sy < h and original_mask[sy, sx] > 0:
@@ -362,7 +377,7 @@ def project_to_tip(skeleton_endpoint, line_params, original_mask, max_extend=50,
             if gap_count > max_gap:
                 break  # Exited the dart
     
-    if in_dart:
+    if furthest_t is not None:
         best_x = x0 + vx * furthest_t
         best_y = y0 + vy * furthest_t
     
