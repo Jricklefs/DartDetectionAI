@@ -3031,9 +3031,23 @@ def vote_with_line_intersection_mm(tips_with_lines: List[dict]) -> dict:
     
     logger.info(f"[LINE-MM] Intersection: ({avg_x:.1f}, {avg_y:.1f})mm, spread={spread:.1f}mm")
     
-    # 10mm spread threshold (about 1 segment width at triple ring)
-    if spread > 10:
+    # Log all pairwise intersections
+    with open(r'C:\Users\clawd\skel_debug.txt', 'a') as dbg:
+        for ix_data in intersections:
+            dbg.write(f"[LINE-MM] {ix_data['cameras'][0]} x {ix_data['cameras'][1]} -> ({ix_data['x_mm']:.1f}, {ix_data['y_mm']:.1f})mm\n")
+        dbg.write(f"[LINE-MM] avg=({avg_x:.1f}, {avg_y:.1f})mm spread={spread:.1f}mm\n")
+    
+    # Save debug image for ALL cases
+    try:
+        _save_line_debug_image(tips_with_lines, lines_mm, (avg_x, avg_y), f"spread={spread:.0f}mm")
+    except Exception:
+        pass
+    
+    # 50mm spread threshold (relaxed - let scoring determine if valid)
+    if spread > 50:
         logger.warning(f"[LINE-MM] Spread too large: {spread:.1f}mm")
+        with open(r'C:\Users\clawd\skel_debug.txt', 'a') as dbg:
+            dbg.write(f"[LINE-MM] REJECTED: spread {spread:.1f}mm > 50mm\n")
         return None
     
     return {
