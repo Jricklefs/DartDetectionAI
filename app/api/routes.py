@@ -2006,6 +2006,9 @@ async def detect_tips(
                 # Score the intersection point in mm
                 score_result = score_from_mm_position(mm_result['x_mm'], mm_result['y_mm'])
                 
+                with open(r"C:\Users\clawd\skel_debug.txt", "a") as dbg:
+                    dbg.write(f"[LINE-VOTE] intersection=({mm_result['x_mm']:.1f}, {mm_result['y_mm']:.1f})mm -> {score_result.get('segment')}x{score_result.get('multiplier')} zone={score_result.get('zone')}\n")
+                
                 if score_result.get('score', 0) > 0 or score_result.get('zone') in ('inner_bull', 'outer_bull'):
                     logger.info(f"[LINE-VOTE] MM intersection scored: {score_result.get('segment')}x{score_result.get('multiplier')}")
                     
@@ -2020,17 +2023,32 @@ async def detect_tips(
                         cameras_seen=[t.get('camera_id') for t in tips_with_lines]
                     )]
                     line_intersection_result = mm_result
+                    
+                    # Save debug image showing line intersection
+                    try:
+                        _save_line_debug_image(tips_with_lines, 
+                            [l for l in lines_mm if True],  # pass lines_mm from outer scope
+                            (mm_result['x_mm'], mm_result['y_mm']),
+                            f"{score_result.get('segment')}x{score_result.get('multiplier')}")
+                    except Exception:
+                        pass
                 else:
                     logger.info(f"[LINE-VOTE] MM intersection outside board, falling back to voting")
     
     # Fall back to weighted voting if line intersection didn't work
     if not line_intersection_result or not detected_tips:
+        with open(r"C:\Users\clawd\skel_debug.txt", "a") as dbg:
+            dbg.write(f"[LINE-VOTE] FALLBACK to weighted voting (line_result={line_intersection_result is not None}, tips={len(detected_tips)})\n")
         detected_tips = vote_on_scores(clustered_tips)
     
     # Log final result vs votes
     if detected_tips and all_tips:
         winner = detected_tips[0]
-        logger.info(f"[VOTE] WINNER: {winner.segment}x{winner.multiplier}={winner.score} (from {len(all_tips)} cameras)")
+        method = "LINE-INTERSECTION" if line_intersection_result else "WEIGHTED-VOTE"
+        logger.info(f"[VOTE] WINNER: {winner.segment}x{winner.multiplier}={winner.score} via {method} (from {len(all_tips)} cameras)")
+        with open(r"C:\Users\clawd\skel_debug.txt", "a") as dbg:
+            dbg.write(f"[VOTE] WINNER: {winner.segment}x{winner.multiplier}={winner.score} via {method}\n")
+            dbg.write(f"---\n")
     
     # DartSensor triggers once per dart - we should only return 1 tip per request
     # Take the most confident one if multiple were detected
@@ -2845,6 +2863,79 @@ def transform_line_to_mm(camera_id: str, line_px: tuple) -> tuple:
     return (vx_mm, vy_mm, p1_mm[0], p1_mm[1])
 
 
+def _save_line_debug_image(tips_with_lines, lines_mm, intersection_mm, label=""):
+    """Save debug image showing camera lines and intersection point on a dartboard diagram."""
+    try:
+        import cv2
+        import numpy as np
+        
+        # Create 800x800 image centered on dartboard (mm coords, scale 2px/mm)
+        size = 800
+        scale = 2.0  # px per mm
+        offset = size // 2  # Center offset
+        
+        img = np.zeros((size, size, 3), dtype=np.uint8)
+        
+        # Draw board circles
+        for radius_mm in [6.35, 15.9, 99, 107, 162, 170]:  # bull, outer bull, triple, double rings
+            r_px = int(radius_mm * scale)
+            cv2.circle(img, (offset, offset), r_px, (60, 60, 60), 1)
+        
+        # Draw segment lines
+        import math
+        for i in range(20):
+            angle = math.radians(i * 18 - 9)  # 18 degrees per segment
+            x = int(offset + 170 * scale * math.cos(angle))
+            y = int(offset + 170 * scale * math.sin(angle))
+            cv2.line(img, (offset, offset), (x, y), (40, 40, 40), 1)
+        
+        colors = [(0, 0, 255), (0, 255, 0), (255, 0, 0)]  # RGB for cam0, cam1, cam2
+        
+        # Draw lines in mm space
+        for i, line_data in enumerate(lines_mm):
+            line_mm = line_data['line_mm']
+            vx, vy, x0, y0 = line_mm
+            color = colors[i % 3]
+            cam_id = line_data['camera_id']
+            
+            # Draw line extending 200mm in each direction
+            p1 = (int(offset + (x0 - 200*vx) * scale), int(offset + (y0 - 200*vy) * scale))
+            p2 = (int(offset + (x0 + 200*vx) * scale), int(offset + (y0 + 200*vy) * scale))
+            cv2.line(img, p1, p2, color, 2)
+            cv2.putText(img, cam_id, (p2[0]+5, p2[1]), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+        
+        # Draw tip positions from each camera
+        for i, tip in enumerate(tips_with_lines):
+            tip_mm = None
+            for line_data in lines_mm:
+                if line_data['camera_id'] == tip.get('camera_id'):
+                    tip_mm = line_data.get('tip_mm')
+                    break
+            if tip_mm:
+                px = int(offset + tip_mm[0] * scale)
+                py = int(offset + tip_mm[1] * scale)
+                color = colors[i % 3]
+                cv2.circle(img, (px, py), 5, color, -1)
+        
+        # Draw intersection point
+        if intersection_mm:
+            ix = int(offset + intersection_mm[0] * scale)
+            iy = int(offset + intersection_mm[1] * scale)
+            cv2.circle(img, (ix, iy), 8, (0, 255, 255), 2)  # Yellow circle
+            cv2.circle(img, (ix, iy), 3, (0, 255, 255), -1)
+            cv2.putText(img, f"({intersection_mm[0]:.1f}, {intersection_mm[1]:.1f})", 
+                       (ix+10, iy-10), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
+        
+        # Label
+        cv2.putText(img, f"Line Intersection {label}", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        cv2.putText(img, f"Lines: {len(lines_mm)}", (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+        
+        cv2.imwrite(r"C:\Users\clawd\DartDetectionAI\debug_images\line_intersection.jpg", img)
+    except Exception as e:
+        with open(r'C:\Users\clawd\skel_debug.txt', 'a') as dbg:
+            dbg.write(f'[LINE-DBG-IMG] Error: {e}\n')
+
+
 def vote_with_line_intersection_mm(tips_with_lines: List[dict]) -> dict:
     """
     Line intersection voting in mm space (Autodarts-style).
@@ -2864,14 +2955,20 @@ def vote_with_line_intersection_mm(tips_with_lines: List[dict]) -> dict:
             dbg.write(f'[LINE-MM-DBG] AFTER re-init: cache_keys={list(_homography_cache.keys())}\n')
     # Transform all lines to mm space
     lines_mm = []
+    with open(r'C:\Users\clawd\skel_debug.txt', 'a') as dbg:
+        dbg.write(f'[LINE-MM] homography_cache keys: {list(_homography_cache.keys())}\n')
     for tip in tips_with_lines:
         cam_id = tip.get('camera_id')
         line_px = tip.get('line')
         
         if not cam_id or not line_px:
+            with open(r'C:\Users\clawd\skel_debug.txt', 'a') as dbg:
+                dbg.write(f'[LINE-MM] SKIP: cam_id={cam_id}, has_line={line_px is not None}\n')
             continue
         
         line_mm = transform_line_to_mm(cam_id, line_px)
+        with open(r'C:\Users\clawd\skel_debug.txt', 'a') as dbg:
+            dbg.write(f'[LINE-MM] {cam_id}: line_mm={line_mm}, in_cache={cam_id in _homography_cache}\n')
         if line_mm:
             lines_mm.append({
                 'camera_id': cam_id,
@@ -2882,6 +2979,14 @@ def vote_with_line_intersection_mm(tips_with_lines: List[dict]) -> dict:
     
     if len(lines_mm) < 2:
         logger.warning(f"[LINE-MM] Only {len(lines_mm)} lines transformed to mm")
+        with open(r'C:\Users\clawd\skel_debug.txt', 'a') as dbg:
+            dbg.write(f'[LINE-MM] FAIL: only {len(lines_mm)} lines transformed\n')
+        
+        # Save debug image even on failure
+        try:
+            _save_line_debug_image(tips_with_lines, lines_mm, None, "FAIL")
+        except Exception:
+            pass
         return None
     
     # Find pairwise intersections in mm space
