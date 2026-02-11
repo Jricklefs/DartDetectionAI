@@ -2769,19 +2769,40 @@ def init_homographies():
     if not HAS_POLYGON:
         return
         
+    # Load segment_20_index from YOLO calibration data
+    seg20_map = {}
+    try:
+        import glob
+        # Find any metadata.json with calibration data
+        meta_files = sorted(glob.glob(r'C:\Users\clawd\DartBenchmark\default\*\*\*\metadata.json'))
+        if meta_files:
+            import json as json_mod
+            with open(meta_files[-1]) as mf:
+                meta = json_mod.load(mf)
+            for cid in ['cam0', 'cam1', 'cam2']:
+                cal = meta.get('calibrations', {}).get(cid, {})
+                idx = cal.get('segment_20_index')
+                if idx is not None:
+                    seg20_map[cid] = idx
+        print(f"[STARTUP] segment_20_index map: {seg20_map}")
+    except Exception as e:
+        print(f"[STARTUP] Could not load segment_20_index: {e}")
+    
     for cam_id in ["cam0", "cam1", "cam2"]:
         poly_cal = get_polygon_calibration(cam_id)
         if poly_cal:
-            if compute_homography_for_camera(cam_id, poly_cal):
+            if compute_homography_for_camera(cam_id, poly_cal, seg20_idx=seg20_map.get(cam_id)):
                 print(f"[STARTUP] Computed homography for {cam_id}")
 
 
-def compute_homography_for_camera(camera_id: str, polygon_calibration) -> bool:
+def compute_homography_for_camera(camera_id: str, polygon_calibration, seg20_idx=None) -> bool:
     """
     Compute homography matrix from polygon calibration points.
     
-    Uses the 20 double_outers points (pixel positions of segment centers on double ring)
+    Uses the 20 double_outers points (pixel positions on double ring)
     mapped to standard dartboard mm coordinates.
+    
+    seg20_idx: which polygon point index corresponds to segment 20 (from YOLO calibration)
     
     Returns True if successful, False otherwise.
     """
@@ -2807,14 +2828,7 @@ def compute_homography_for_camera(camera_id: str, polygon_calibration) -> bool:
         # For each, compute homography, then verify a KNOWN point maps correctly.
         # We use segment 20 center: should be near (0, -radius)mm (top of board).
         
-        # Get YOLO calibration to find segment_20_index
-        seg20_idx = None
-        try:
-            if camera_id in calibrator.calibrations:
-                yolo_cal = calibrator.calibrations[camera_id]
-                seg20_idx = yolo_cal.get('segment_20_index')
-        except:
-            pass
+        # seg20_idx passed from init_homographies (loaded from benchmark metadata)
         
         # Try both boundary and center point sets
         standard_boundary = get_standard_board_boundary_points()
