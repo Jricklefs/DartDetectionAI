@@ -238,26 +238,32 @@ def find_dart_contour(motion_mask, min_area=500, min_aspect_ratio=2.0, existing_
 
 def project_to_tip(skeleton_endpoint, line_params, original_mask, max_extend=50, board_center=None):
     """
-    Project from skeleton endpoint along line direction to find true tip.
+    Find the dart tip: the furthest point of the detected dart mask
+    toward the board center, projected onto the centerline.
     
-    First projects the endpoint onto the centerline, then walks along
-    the line TOWARD THE BOARD CENTER until we exit the original mask.
+    The tip is where the dart meets the board surface - NOT the board center,
+    but the point on the dart closest to center (i.e. the pointy end).
+    
+    Strategy:
+    1. Find ALL mask pixels
+    2. For each, project onto centerline to get position along dart axis
+    3. The tip is the mask pixel furthest toward board center along the centerline
+    4. Project that point onto the centerline for a clean position
     
     Args:
-        skeleton_endpoint: (x, y) endpoint from skeleton
+        skeleton_endpoint: (x, y) endpoint from skeleton (fallback)
         line_params: (vx, vy, x0, y0) from cv2.fitLine
-        original_mask: Pre-erosion motion mask
-        max_extend: Maximum pixels to extend beyond skeleton
-        board_center: (cx, cy) - if provided, walk toward center instead of +Y
+        original_mask: Motion mask including dart
+        max_extend: Maximum pixels to extend beyond mask (for gap bridging)
+        board_center: (cx, cy) center of dartboard
     
     Returns:
-        (tip_x, tip_y) - projected tip position ON the centerline
+        (tip_x, tip_y) - tip position ON the centerline
     """
     if line_params is None:
         return skeleton_endpoint
     
     vx, vy, x0, y0 = line_params
-    ex, ey = skeleton_endpoint
     
     # Normalize direction to unit vector
     length = np.sqrt(vx*vx + vy*vy)
@@ -265,54 +271,68 @@ def project_to_tip(skeleton_endpoint, line_params, original_mask, max_extend=50,
         return skeleton_endpoint
     vx, vy = vx/length, vy/length
     
-    # Project skeleton endpoint onto the centerline
-    # Line: P = (x0, y0) + t * (vx, vy)
-    # Find t such that (endpoint - P) is perpendicular to line direction
-    # t = ((ex - x0) * vx + (ey - y0) * vy)
-    t = (ex - x0) * vx + (ey - y0) * vy
-    proj_x = x0 + t * vx
-    proj_y = y0 + t * vy
-    
-    # Start from projected point (on centerline)
-    ex, ey = proj_x, proj_y
-    
-    # Determine which direction to walk
+    # Orient direction toward board center
     if board_center is not None:
         cx, cy = board_center
-        # Walk toward board center
-        to_center = np.array([cx - ex, cy - ey])
+        to_center = np.array([cx - x0, cy - y0])
         dot = to_center[0] * vx + to_center[1] * vy
         if dot < 0:
             vx, vy = -vx, -vy
     else:
-        # Default: walk +Y (downward in image)
         if vy < 0:
             vx, vy = -vx, -vy
     
     h, w = original_mask.shape[:2]
     
-    # Start from endpoint and walk in tip direction
-    best_x, best_y = ex, ey
-    gap_count = 0
-    max_gap = 10  # Allow up to 10 pixel gaps in the mask
+    # Find the furthest mask pixel along the centerline toward the board
+    # Sample along the centerline in both directions to find the extent
+    best_t = 0
+    best_x, best_y = float(skeleton_endpoint[0]), float(skeleton_endpoint[1])
     
-    for step in range(1, max_extend + 1):
-        nx = int(ex + vx * step)
-        ny = int(ey + vy * step)
+    # Project skeleton endpoint onto line to get starting t
+    ex, ey = skeleton_endpoint
+    t_start = (ex - x0) * vx + (ey - y0) * vy
+    
+    # Search forward (toward board center) from way behind the dart
+    # to find the furthest mask pixel along the line
+    search_start = int(t_start - 200)  # Start well behind the flight
+    search_end = int(t_start + max_extend + 200)  # Search well past skeleton endpoint
+    
+    furthest_t = search_start
+    gap_count = 0
+    max_gap = 15  # Allow gaps in the mask (thin shaft might have holes)
+    in_dart = False
+    
+    for t in range(search_start, search_end):
+        px = int(x0 + vx * t)
+        py = int(y0 + vy * t)
         
-        # Check bounds
-        if nx < 0 or nx >= w or ny < 0 or ny >= h:
-            break
+        if px < 0 or px >= w or py < 0 or py >= h:
+            continue
         
-        # Check if still in mask
-        if original_mask[ny, nx] > 0:
-            best_x, best_y = nx, ny
-            gap_count = 0  # Reset gap counter
-        else:
+        # Check a small neighborhood perpendicular to line (not just centerline pixel)
+        # This catches mask pixels slightly off the center
+        nx, ny = -vy, vx  # perpendicular
+        hit = False
+        for offset in range(-5, 6):
+            sx = int(px + nx * offset)
+            sy = int(py + ny * offset)
+            if 0 <= sx < w and 0 <= sy < h and original_mask[sy, sx] > 0:
+                hit = True
+                break
+        
+        if hit:
+            in_dart = True
+            furthest_t = t
+            gap_count = 0
+        elif in_dart:
             gap_count += 1
             if gap_count > max_gap:
-                # Too big a gap - we've exited the dart
-                break
+                break  # Exited the dart
+    
+    if in_dart:
+        best_x = x0 + vx * furthest_t
+        best_y = y0 + vy * furthest_t
     
     return (float(best_x), float(best_y))
 
