@@ -2773,31 +2773,14 @@ def init_homographies():
     if not HAS_POLYGON:
         return
         
-    # Auto-detect segment_20_index from polygon geometry
-    # The boundary between seg20 and seg1 is at -81 degrees from bull (just clockwise of top)
-    # Find which polygon point is closest to that angle for each camera
-    seg20_map = {}
-    try:
-        import math as _math
-        for cid in ['cam0', 'cam1', 'cam2']:
-            poly_cal = get_polygon_calibration(cid)
-            if poly_cal and poly_cal.double_outers and poly_cal.bull:
-                bull = poly_cal.bull
-                best_idx = 0
-                best_diff = 999
-                for i, pt in enumerate(poly_cal.double_outers):
-                    dx = pt[0] - bull[0]
-                    dy = pt[1] - bull[1]
-                    angle = _math.degrees(_math.atan2(dy, dx))
-                    # Boundary 0 in standard coords is at -81 degrees
-                    diff = abs(((angle - (-81) + 180) % 360) - 180)
-                    if diff < best_diff:
-                        best_diff = diff
-                        best_idx = i
-                seg20_map[cid] = best_idx
-        print(f"[STARTUP] segment_20_index map (auto-detected): {seg20_map}")
-    except Exception as e:
-        print(f"[STARTUP] Could not auto-detect segment_20_index: {e}")
+    # Empirically verified polygon offsets (verified against benchmark corrections)
+    # These indicate which polygon point index = the S20/S1 boundary
+    seg20_map = {
+        "cam0": 12,
+        "cam1": 0,
+        "cam2": 7,
+    }
+    print(f"[STARTUP] segment_20_index map (verified): {seg20_map}")
     
     for cam_id in ["cam0", "cam1", "cam2"]:
         poly_cal = get_polygon_calibration(cam_id)

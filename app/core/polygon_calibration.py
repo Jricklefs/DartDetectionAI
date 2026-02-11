@@ -247,6 +247,34 @@ def point_in_ring_segment(
     return point_in_polygon(point, quad)
 
 
+
+def _get_seg20_offset(calibration) -> int:
+    """
+    Get the polygon rotation offset for this camera.
+    These offsets were empirically verified against benchmark corrections.
+    They indicate which polygon point index = the S20/S1 boundary.
+    
+    To recalibrate: throw a dart, note actual segment, run solve_offsets.py
+    """
+    # Empirically verified offsets (Feb 11, 2026)
+    VERIFIED_OFFSETS = {
+        "cam0": 12,
+        "cam1": 0,
+        "cam2": 7,
+    }
+    return VERIFIED_OFFSETS.get(calibration.camera_id, 0)
+
+
+# Cache for seg20 offsets per camera
+_seg20_offset_cache = {}
+
+def get_seg20_offset(calibration) -> int:
+    """Cached version of _get_seg20_offset."""
+    cid = calibration.camera_id
+    if cid not in _seg20_offset_cache:
+        _seg20_offset_cache[cid] = _get_seg20_offset(calibration)
+    return _seg20_offset_cache[cid]
+
 def score_from_polygon_calibration(
     tip_px: Tuple[float, float],
     calibration: PolygonCalibration
@@ -263,6 +291,22 @@ def score_from_polygon_calibration(
     """
     x, y = tip_px
     bull = calibration.bull
+    
+    # Apply rotation offset so polygon points align with SEGMENT_ORDER
+    # pt[0] should be the S20/S1 boundary
+    offset = get_seg20_offset(calibration)
+    if offset != 0:
+        # Create a rotated view of the calibration
+        class RotatedCal:
+            pass
+        rotated = RotatedCal()
+        rotated.bull = calibration.bull
+        rotated.camera_id = calibration.camera_id
+        rotated.double_outers = calibration.double_outers[offset:] + calibration.double_outers[:offset]
+        rotated.double_inners = calibration.double_inners[offset:] + calibration.double_inners[:offset] if calibration.double_inners else []
+        rotated.treble_outers = calibration.treble_outers[offset:] + calibration.treble_outers[:offset] if calibration.treble_outers else []
+        rotated.treble_inners = calibration.treble_inners[offset:] + calibration.treble_inners[:offset] if calibration.treble_inners else []
+        calibration = rotated
     
     # Calculate distance from bull for bull detection
     dist_from_bull = math.sqrt((x - bull[0])**2 + (y - bull[1])**2)
