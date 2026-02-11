@@ -2853,17 +2853,9 @@ def vote_with_line_intersection_mm(tips_with_lines: List[dict]) -> dict:
     2. Intersect lines in mm space
     3. Return intersection point in mm
     """
-    # Debug: force re-init homographies if cache empty
-    global _homography_initialized, _homography_cache
-    with open(r'C:\\Users\\clawd\\skel_debug.txt', 'a') as dbg:
-        dbg.write(f'[LINE-MM-DBG] cache_keys={list(_homography_cache.keys())}, init={_homography_initialized}\n')
-    if not _homography_cache:
-        _homography_initialized = False
-        init_homographies()
-        with open(r'C:\\Users\\clawd\\skel_debug.txt', 'a') as dbg:
-            dbg.write(f'[LINE-MM-DBG] AFTER re-init: cache_keys={list(_homography_cache.keys())}\n')
     # Transform all lines to mm space
     lines_mm = []
+    with open(r"C:\Users\clawd\skel_debug.txt", "a") as dbg: dbg.write(f"[LINE-MM-DBG] homography_cache={list(_homography_cache.keys())}, initialized={_homography_initialized}\n")
     for tip in tips_with_lines:
         cam_id = tip.get('camera_id')
         line_px = tip.get('line')
