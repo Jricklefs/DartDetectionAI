@@ -653,6 +653,90 @@ def get_adaptive_motion_mask(current_frame, previous_frame, camera_id=None,
     return gray_diff, motion_mask
 
 
+
+def extend_mask_along_centerline(gray_diff, dart_mask, line_params, board_center, low_threshold=8, corridor_width=15):
+    """
+    Extend the dart mask along the fitted centerline using a lower threshold.
+    
+    The flights/barrel are detected at the normal threshold, but the thin shaft
+    is too faint. This function:
+    1. Creates a narrow corridor along the centerline toward the board center
+    2. Applies a much lower threshold within that corridor
+    3. Merges detected shaft pixels into the dart mask
+    
+    Args:
+        gray_diff: Grayscale absolute difference image
+        dart_mask: Current binary mask (flights + barrel detected)
+        line_params: (vx, vy, x0, y0) from cv2.fitLine
+        board_center: (cx, cy) center of dartboard
+        low_threshold: Lower threshold for shaft detection (default 8)
+        corridor_width: Half-width of search corridor in pixels (default 15)
+    
+    Returns:
+        Extended dart_mask with shaft pixels included
+    """
+    if line_params is None or board_center is None:
+        return dart_mask
+    
+    vx, vy, x0, y0 = line_params
+    cx, cy = board_center
+    h, w = dart_mask.shape[:2]
+    
+    # Normalize direction
+    length = np.sqrt(vx*vx + vy*vy)
+    if length < 0.001:
+        return dart_mask
+    vx, vy = vx/length, vy/length
+    
+    # Direction toward board center from line point
+    to_center = np.array([cx - x0, cy - y0])
+    dot = to_center[0] * vx + to_center[1] * vy
+    if dot < 0:
+        vx, vy = -vx, -vy
+    
+    # Perpendicular direction for corridor width
+    px, py = -vy, vx
+    
+    # Find the extent of current mask along the centerline
+    # Walk from (x0,y0) toward center to find where mask currently ends
+    mask_end_t = 0
+    for t in range(0, 500):
+        nx = int(x0 + vx * t)
+        ny = int(y0 + vy * t)
+        if nx < 0 or nx >= w or ny < 0 or ny >= h:
+            break
+        if dart_mask[ny, nx] > 0:
+            mask_end_t = t
+    
+    # Now create corridor mask from mask_end onwards (where shaft should be)
+    # Also include some overlap with existing mask for continuity
+    corridor_mask = np.zeros_like(dart_mask)
+    start_t = max(0, mask_end_t - 20)  # Start a bit before mask ends
+    
+    for t in range(start_t, start_t + 300):
+        cx_line = x0 + vx * t
+        cy_line = y0 + vy * t
+        
+        # Draw perpendicular line segment at this point
+        for offset in range(-corridor_width, corridor_width + 1):
+            nx = int(cx_line + px * offset)
+            ny = int(cy_line + py * offset)
+            if 0 <= nx < w and 0 <= ny < h:
+                corridor_mask[ny, nx] = 255
+    
+    # Apply low threshold within corridor
+    _, low_thresh_mask = cv2.threshold(gray_diff, low_threshold, 255, cv2.THRESH_BINARY)
+    shaft_pixels = cv2.bitwise_and(low_thresh_mask, corridor_mask)
+    
+    # Light morphology to connect shaft fragments
+    close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 7))
+    shaft_pixels = cv2.morphologyEx(shaft_pixels, cv2.MORPH_CLOSE, close_kernel)
+    
+    # Merge shaft into dart mask
+    extended_mask = cv2.bitwise_or(dart_mask, shaft_pixels)
+    
+    return extended_mask
+
 def detect_dart_skeleton(
     current_frame: np.ndarray,
     previous_frame: np.ndarray,
@@ -732,6 +816,24 @@ def detect_dart_skeleton(
     # Create clean mask from dart contour
     dart_mask = np.zeros_like(motion_mask)
     cv2.drawContours(dart_mask, [dart_contour], -1, 255, -1)
+    
+    # Extend dart mask along centerline to capture thin shaft
+    # Step 1: Quick line fit on the contour to get direction
+    contour_mask_for_line = np.zeros_like(motion_mask)
+    cv2.drawContours(contour_mask_for_line, [dart_contour], -1, 255, -1)
+    quick_skel_pts = np.column_stack(np.where(contour_mask_for_line > 0))
+    if len(quick_skel_pts) > 10:
+        # Fit line to contour points (y,x format from np.where, need x,y)
+        pts_xy = quick_skel_pts[:, ::-1].astype(np.float32)
+        quick_line = cv2.fitLine(pts_xy, cv2.DIST_L2, 0, 0.01, 0.01)
+        quick_line = (float(quick_line[0]), float(quick_line[1]), float(quick_line[2]), float(quick_line[3]))
+        
+        # Step 2: Extend mask along centerline with low threshold
+        dart_mask = extend_mask_along_centerline(gray_diff, dart_mask, quick_line, center, 
+                                                  low_threshold=8, corridor_width=12)
+    
+    # Also update original_mask to include the expanded region for tip projection
+    original_mask = cv2.bitwise_or(original_mask, dart_mask)
     
     # 5. Skeletonize
     if HAS_SKIMAGE:

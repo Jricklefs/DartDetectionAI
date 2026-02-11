@@ -2769,24 +2769,31 @@ def init_homographies():
     if not HAS_POLYGON:
         return
         
-    # Load segment_20_index from YOLO calibration data
+    # Auto-detect segment_20_index from polygon geometry
+    # The boundary between seg20 and seg1 is at -81 degrees from bull (just clockwise of top)
+    # Find which polygon point is closest to that angle for each camera
     seg20_map = {}
     try:
-        import glob
-        # Find any metadata.json with calibration data
-        meta_files = sorted(glob.glob(r'C:\Users\clawd\DartBenchmark\default\*\*\*\metadata.json'))
-        if meta_files:
-            import json as json_mod
-            with open(meta_files[-1]) as mf:
-                meta = json_mod.load(mf)
-            for cid in ['cam0', 'cam1', 'cam2']:
-                cal = meta.get('calibrations', {}).get(cid, {})
-                idx = cal.get('segment_20_index')
-                if idx is not None:
-                    seg20_map[cid] = idx
-        print(f"[STARTUP] segment_20_index map: {seg20_map}")
+        import math as _math
+        for cid in ['cam0', 'cam1', 'cam2']:
+            poly_cal = get_polygon_calibration(cid)
+            if poly_cal and poly_cal.double_outers and poly_cal.bull:
+                bull = poly_cal.bull
+                best_idx = 0
+                best_diff = 999
+                for i, pt in enumerate(poly_cal.double_outers):
+                    dx = pt[0] - bull[0]
+                    dy = pt[1] - bull[1]
+                    angle = _math.degrees(_math.atan2(dy, dx))
+                    # Boundary 0 in standard coords is at -81 degrees
+                    diff = abs(((angle - (-81) + 180) % 360) - 180)
+                    if diff < best_diff:
+                        best_diff = diff
+                        best_idx = i
+                seg20_map[cid] = best_idx
+        print(f"[STARTUP] segment_20_index map (auto-detected): {seg20_map}")
     except Exception as e:
-        print(f"[STARTUP] Could not load segment_20_index: {e}")
+        print(f"[STARTUP] Could not auto-detect segment_20_index: {e}")
     
     for cam_id in ["cam0", "cam1", "cam2"]:
         poly_cal = get_polygon_calibration(cam_id)
@@ -2832,7 +2839,7 @@ def compute_homography_for_camera(camera_id: str, polygon_calibration, seg20_idx
         # standard_pts[0] = segment 20 position in mm
         # Rotate so point[seg20_idx] maps to standard_pts[0]
         
-        standard_pts = get_standard_board_points()
+        standard_pts = get_standard_board_boundary_points()
         
         if seg20_idx is not None:
             rotated_dst = standard_pts[-seg20_idx:] + standard_pts[:-seg20_idx] if seg20_idx > 0 else standard_pts[:]
@@ -2846,7 +2853,7 @@ def compute_homography_for_camera(camera_id: str, polygon_calibration, seg20_idx
             dbg.write(f'[HOMOGRAPHY] {camera_id}: seg20_idx={seg20_idx}\n')
         logger.info(f"[HOMOGRAPHY] {camera_id}: seg20_idx={seg20_idx}")
         with open(r'C:\Users\clawd\skel_debug.txt', 'a') as dbg:
-            dbg.write(f'[HOMOGRAPHY] {camera_id}: offset={best_offset}, type={best_point_type}, seg20_idx={seg20_idx}, err={best_error:.1f}mm\n')
+            dbg.write(f'[HOMOGRAPHY] {camera_id}: seg20_idx={seg20_idx}, src_pts={len(src_points)}, dst_pts={len(dst_points)}\n')
         
         # Compute homography: maps pixels -> mm
         H, mask = cv2.findHomography(src_points, dst_points, cv2.RANSAC, 5.0)
