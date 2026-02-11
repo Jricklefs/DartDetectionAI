@@ -2827,59 +2827,24 @@ def compute_homography_for_camera(camera_id: str, polygon_calibration, seg20_idx
         # Find correct alignment by testing all 20 rotations.
         # For each, compute homography, then verify a KNOWN point maps correctly.
         # We use segment 20 center: should be near (0, -radius)mm (top of board).
+        # DIRECT MAPPING using seg20_idx
+        # polygon point[seg20_idx] = segment 20 on the board
+        # standard_pts[0] = segment 20 position in mm
+        # Rotate so point[seg20_idx] maps to standard_pts[0]
         
-        # seg20_idx passed from init_homographies (loaded from benchmark metadata)
+        standard_pts = get_standard_board_points()
         
-        # Try both boundary and center point sets
-        standard_boundary = get_standard_board_boundary_points()
-        standard_center = get_standard_board_points()
-        
-        best_offset = 0
-        best_error = float('inf')
-        best_point_type = "center"
-        
-        # Segment 20 center is at top: (0, -radius)mm
-        seg20_mm_target = np.array([0, -DARTBOARD_MM["double_outer"]])
-        
-        for point_type, standard_pts in [("boundary", standard_boundary), ("center", standard_center)]:
-            for offset in range(20):
-                rotated = standard_pts[offset:] + standard_pts[:offset]
-                dst_test = np.array(rotated, dtype=np.float32)
-                
-                H_test, _ = cv2.findHomography(src_points, dst_test, cv2.RANSAC, 5.0)
-                if H_test is None:
-                    continue
-                
-                # Strategy 1: If we know segment_20_index, transform that polygon point
-                # and check it maps near the top of the board
-                if seg20_idx is not None:
-                    seg20_px = np.array([[src_points[seg20_idx][0], src_points[seg20_idx][1]]], dtype=np.float32).reshape(-1, 1, 2)
-                    seg20_mm = cv2.perspectiveTransform(seg20_px, H_test).reshape(-1, 2)[0]
-                    error = math.sqrt((seg20_mm[0] - seg20_mm_target[0])**2 + (seg20_mm[1] - seg20_mm_target[1])**2)
-                else:
-                    # Fallback: find which polygon point has minimum Y (top in image)
-                    # and check it maps near top of board
-                    min_y_idx = min(range(len(src_points)), key=lambda i: src_points[i][1])
-                    top_px = np.array([[src_points[min_y_idx][0], src_points[min_y_idx][1]]], dtype=np.float32).reshape(-1, 1, 2)
-                    top_mm = cv2.perspectiveTransform(top_px, H_test).reshape(-1, 2)[0]
-                    # Top point should map near top of board (y very negative)
-                    error = top_mm[1] + DARTBOARD_MM["double_outer"]  # Should be ~0 if correct
-                    error = abs(error) + abs(top_mm[0])  # x should be ~0 too
-                
-                if error < best_error:
-                    best_error = error
-                    best_offset = offset
-                    best_point_type = point_type
-        
-        # Use the best rotation
-        if best_point_type == "boundary":
-            standard_pts = standard_boundary
+        if seg20_idx is not None:
+            rotated_dst = standard_pts[-seg20_idx:] + standard_pts[:-seg20_idx] if seg20_idx > 0 else standard_pts[:]
         else:
-            standard_pts = standard_center
-        rotated_dst = standard_pts[best_offset:] + standard_pts[:best_offset]
+            # Fallback: no seg20 info
+            rotated_dst = standard_pts[:]
+        
         dst_points = np.array(rotated_dst, dtype=np.float32)
         
-        logger.info(f"[HOMOGRAPHY] {camera_id}: offset={best_offset}, type={best_point_type}, seg20_idx={seg20_idx}, error={best_error:.1f}mm")
+        with open(r'C:\Users\clawd\skel_debug.txt', 'a') as dbg:
+            dbg.write(f'[HOMOGRAPHY] {camera_id}: seg20_idx={seg20_idx}\n')
+        logger.info(f"[HOMOGRAPHY] {camera_id}: seg20_idx={seg20_idx}")
         with open(r'C:\Users\clawd\skel_debug.txt', 'a') as dbg:
             dbg.write(f'[HOMOGRAPHY] {camera_id}: offset={best_offset}, type={best_point_type}, seg20_idx={seg20_idx}, err={best_error:.1f}mm\n')
         
