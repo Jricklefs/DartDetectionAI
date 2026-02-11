@@ -111,13 +111,45 @@ def find_skeleton_endpoints(skeleton):
 
 
 def fit_line_to_skeleton(skeleton):
-    """Fit a line to skeleton points using cv2.fitLine."""
+    """
+    Fit a line to skeleton points using iterative outlier rejection.
+    
+    1. Initial fit with DIST_HUBER (robust to outliers)
+    2. Remove points far from the fitted line
+    3. Refit with cleaned points
+    
+    This handles noise blobs and branching artifacts in the skeleton.
+    """
     points = np.column_stack(np.where(skeleton > 0))
     if len(points) < 10:
         return None
     points_xy = points[:, ::-1].reshape(-1, 1, 2).astype(np.float32)
+    
+    # Initial robust fit
     [vx, vy, x0, y0] = cv2.fitLine(points_xy, cv2.DIST_HUBER, 0, 0.01, 0.01)
-    return float(vx[0]), float(vy[0]), float(x0[0]), float(y0[0])
+    vx, vy, x0, y0 = float(vx[0]), float(vy[0]), float(x0[0]), float(y0[0])
+    
+    # Calculate perpendicular distance of each point to the line
+    pts_flat = points_xy.reshape(-1, 2)
+    dx = pts_flat[:, 0] - x0
+    dy = pts_flat[:, 1] - y0
+    # Perpendicular distance = |dx * vy - dy * vx| (since vx,vy is unit-ish)
+    perp_dist = np.abs(dx * vy - dy * vx)
+    
+    # Remove outliers: keep points within 2x median distance
+    median_dist = np.median(perp_dist)
+    threshold = max(median_dist * 3.0, 5.0)  # At least 5px tolerance
+    inlier_mask = perp_dist < threshold
+    
+    inlier_pts = pts_flat[inlier_mask]
+    if len(inlier_pts) < 10:
+        return vx, vy, x0, y0  # Return initial fit if too few inliers
+    
+    # Refit with inliers only
+    inlier_pts_cv = inlier_pts.reshape(-1, 1, 2).astype(np.float32)
+    [vx2, vy2, x02, y02] = cv2.fitLine(inlier_pts_cv, cv2.DIST_L2, 0, 0.01, 0.01)
+    
+    return float(vx2[0]), float(vy2[0]), float(x02[0]), float(y02[0])
 
 
 def find_dart_contour(motion_mask, min_area=500, min_aspect_ratio=2.0, existing_locations=None, exclude_radius=80, board_center=None):
@@ -855,7 +887,17 @@ def detect_dart_skeleton(
     # Also update original_mask to include the expanded region for tip projection
     original_mask = cv2.bitwise_or(original_mask, dart_mask)
     
-    # 5. Skeletonize
+    # 5. Clean up mask before skeletonization
+    # Remove small noise blobs that survived - keep only the largest connected component
+    skel_contours, _ = cv2.findContours(dart_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if len(skel_contours) > 1:
+        # Keep only the largest contour
+        largest = max(skel_contours, key=cv2.contourArea)
+        clean_dart_mask = np.zeros_like(dart_mask)
+        cv2.drawContours(clean_dart_mask, [largest], -1, 255, -1)
+        dart_mask = clean_dart_mask
+    
+    # Skeletonize
     if HAS_SKIMAGE:
         skeleton = skeletonize(dart_mask > 0).astype(np.uint8) * 255
     else:
