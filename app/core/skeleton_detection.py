@@ -600,7 +600,7 @@ def find_tip_endpoint(endpoints, line_params, board_center=None, board_radius=No
 
 
 def get_adaptive_motion_mask(current_frame, previous_frame, camera_id=None, 
-                             fixed_threshold=20, use_background_model=False):
+                             fixed_threshold=8, use_background_model=False):
     """
     Autodarts-style simple diff: blur -> diff -> threshold.
     Minimal morphology to preserve dart shape, especially the tip.
