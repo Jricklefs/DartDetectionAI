@@ -2007,8 +2007,30 @@ async def detect_tips(
                 dbg.write(f"[LINE-VOTE] mm_result={mm_result}\n")
             
             if mm_result and mm_result.get('x_mm') is not None:
-                # Score the intersection point in mm
-                score_result = score_from_mm_position(mm_result['x_mm'], mm_result['y_mm'])
+                # Score by transforming mm back to pixel space and using polygon scorer
+                # The polygon scorer has verified correct segment mapping
+                score_result = None
+                try:
+                    # Try each camera's inverse homography to get pixel coords
+                    for cam_id_try in ['cam0', 'cam1', 'cam2']:
+                        px_point = transform_mm_to_pixel(mm_result['x_mm'], mm_result['y_mm'], cam_id_try)
+                        if px_point is not None:
+                            poly_cal = get_polygon_calibration(cam_id_try)
+                            if poly_cal:
+                                from app.core.polygon_calibration import score_from_polygon_calibration as _score_poly
+                                score_result = _score_poly((px_point[0], px_point[1]), poly_cal)
+                                if score_result and score_result.get('segment', 0) > 0:
+                                    score_result['scoring_method'] = 'line_intersection_polygon'
+                                    with open(r"C:\Users\clawd\skel_debug.txt", "a") as dbg:
+                                        dbg.write(f"[LINE-VOTE] mm->px via {cam_id_try}: ({px_point[0]:.0f},{px_point[1]:.0f}) -> S{score_result['segment']}x{score_result['multiplier']}\n")
+                                    break
+                except Exception as e:
+                    with open(r"C:\Users\clawd\skel_debug.txt", "a") as dbg:
+                        dbg.write(f"[LINE-VOTE] mm->polygon failed: {e}\n")
+                
+                # Fallback to mm scoring if polygon didn't work
+                if not score_result or score_result.get('segment', 0) == 0:
+                    score_result = score_from_mm_position(mm_result['x_mm'], mm_result['y_mm'])
                 
                 with open(r"C:\Users\clawd\skel_debug.txt", "a") as dbg:
                     dbg.write(f"[LINE-VOTE] intersection=({mm_result['x_mm']:.1f}, {mm_result['y_mm']:.1f})mm -> {score_result.get('segment')}x{score_result.get('multiplier')} zone={score_result.get('zone')}\n")
