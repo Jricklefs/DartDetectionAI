@@ -2803,19 +2803,29 @@ def compute_homography_for_camera(camera_id: str, polygon_calibration) -> bool:
         src_points = np.array(polygon_calibration.double_outers, dtype=np.float32)
         bull = polygon_calibration.bull
         
-        # Find correct alignment by testing all 20 rotations
-        # For each rotation, compute homography and check if bull maps to (0,0)mm
-        # The correct rotation will have bull closest to origin
+        # Find correct alignment by testing all 20 rotations.
+        # For each, compute homography, then verify a KNOWN point maps correctly.
+        # We use segment 20 center: should be near (0, -radius)mm (top of board).
         
-        # Try both boundary points and center points
+        # Get YOLO calibration to find segment_20_index
+        seg20_idx = None
+        try:
+            if camera_id in calibrator.calibrations:
+                yolo_cal = calibrator.calibrations[camera_id]
+                seg20_idx = yolo_cal.get('segment_20_index')
+        except:
+            pass
+        
+        # Try both boundary and center point sets
         standard_boundary = get_standard_board_boundary_points()
         standard_center = get_standard_board_points()
         
         best_offset = 0
-        best_bull_dist = float('inf')
-        best_point_type = "boundary"
+        best_error = float('inf')
+        best_point_type = "center"
         
-        bull_px = np.array([[bull[0], bull[1]]], dtype=np.float32).reshape(-1, 1, 2)
+        # Segment 20 center is at top: (0, -radius)mm
+        seg20_mm_target = np.array([0, -DARTBOARD_MM["double_outer"]])
         
         for point_type, standard_pts in [("boundary", standard_boundary), ("center", standard_center)]:
             for offset in range(20):
@@ -2826,12 +2836,24 @@ def compute_homography_for_camera(camera_id: str, polygon_calibration) -> bool:
                 if H_test is None:
                     continue
                 
-                # Transform bull through this homography
-                bull_mm = cv2.perspectiveTransform(bull_px, H_test).reshape(-1, 2)[0]
-                bull_dist = math.sqrt(bull_mm[0]**2 + bull_mm[1]**2)
+                # Strategy 1: If we know segment_20_index, transform that polygon point
+                # and check it maps near the top of the board
+                if seg20_idx is not None:
+                    seg20_px = np.array([[src_points[seg20_idx][0], src_points[seg20_idx][1]]], dtype=np.float32).reshape(-1, 1, 2)
+                    seg20_mm = cv2.perspectiveTransform(seg20_px, H_test).reshape(-1, 2)[0]
+                    error = math.sqrt((seg20_mm[0] - seg20_mm_target[0])**2 + (seg20_mm[1] - seg20_mm_target[1])**2)
+                else:
+                    # Fallback: find which polygon point has minimum Y (top in image)
+                    # and check it maps near top of board
+                    min_y_idx = min(range(len(src_points)), key=lambda i: src_points[i][1])
+                    top_px = np.array([[src_points[min_y_idx][0], src_points[min_y_idx][1]]], dtype=np.float32).reshape(-1, 1, 2)
+                    top_mm = cv2.perspectiveTransform(top_px, H_test).reshape(-1, 2)[0]
+                    # Top point should map near top of board (y very negative)
+                    error = top_mm[1] + DARTBOARD_MM["double_outer"]  # Should be ~0 if correct
+                    error = abs(error) + abs(top_mm[0])  # x should be ~0 too
                 
-                if bull_dist < best_bull_dist:
-                    best_bull_dist = bull_dist
+                if error < best_error:
+                    best_error = error
                     best_offset = offset
                     best_point_type = point_type
         
@@ -2843,9 +2865,9 @@ def compute_homography_for_camera(camera_id: str, polygon_calibration) -> bool:
         rotated_dst = standard_pts[best_offset:] + standard_pts[:best_offset]
         dst_points = np.array(rotated_dst, dtype=np.float32)
         
-        logger.info(f"[HOMOGRAPHY] {camera_id}: offset={best_offset}, type={best_point_type}, bull_dist={best_bull_dist:.1f}mm")
+        logger.info(f"[HOMOGRAPHY] {camera_id}: offset={best_offset}, type={best_point_type}, seg20_idx={seg20_idx}, error={best_error:.1f}mm")
         with open(r'C:\Users\clawd\skel_debug.txt', 'a') as dbg:
-            dbg.write(f'[HOMOGRAPHY] {camera_id}: offset={best_offset}, type={best_point_type}, bull_err={best_bull_dist:.1f}mm\n')
+            dbg.write(f'[HOMOGRAPHY] {camera_id}: offset={best_offset}, type={best_point_type}, seg20_idx={seg20_idx}, err={best_error:.1f}mm\n')
         
         # Compute homography: maps pixels -> mm
         H, mask = cv2.findHomography(src_points, dst_points, cv2.RANSAC, 5.0)
