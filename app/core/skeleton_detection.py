@@ -623,14 +623,32 @@ def get_adaptive_motion_mask(current_frame, previous_frame, camera_id=None,
     diff = cv2.absdiff(blur_current, blur_previous)
     gray_diff = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
     
-    # STEP 3: Simple threshold - that's it!
+    # STEP 3: Simple threshold
     # Autodarts uses minimal processing to preserve dart shape
     _, motion_mask = cv2.threshold(gray_diff, fixed_threshold, 255, cv2.THRESH_BINARY)
     
-    # Optional: very light opening to remove isolated noise pixels
-    # Keep kernel tiny (2x2) to avoid eating the tip
-    # open_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
-    # motion_mask = cv2.morphologyEx(motion_mask, cv2.MORPH_OPEN, open_kernel)
+    # STEP 4: Select biggest elongated blob (dart-shaped)
+    # Filters out motion artifacts, shadows, and noise
+    blob_contours, _ = cv2.findContours(motion_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if blob_contours:
+        best_blob = None
+        best_score = 0
+        for c in blob_contours:
+            area = cv2.contourArea(c)
+            if area < 500:
+                continue
+            x, y, w, h = cv2.boundingRect(c)
+            aspect = max(w, h) / max(min(w, h), 1)
+            # Score = area * aspect_bonus (darts are elongated)
+            score = area * (1.0 + max(0, aspect - 1.5))
+            if score > best_score:
+                best_score = score
+                best_blob = c
+        
+        if best_blob is not None:
+            clean_mask = np.zeros_like(motion_mask)
+            cv2.drawContours(clean_mask, [best_blob], -1, 255, -1)
+            motion_mask = clean_mask
     
     return gray_diff, motion_mask
 
