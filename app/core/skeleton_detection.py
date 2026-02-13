@@ -644,8 +644,20 @@ def detect_dart_skeleton(
             pass
     return result
 
+_current_method = "yolo"  # Default to YOLO (skeleton not ready for live)
+
 def set_detection_method(method: str):
-    pass
+    global _current_method
+    if method == "skeleton":
+        _current_method = "v10.2_shape_filtered"
+    elif method == "yolo":
+        _current_method = "yolo"
+    elif method == "hough":
+        _current_method = "hough"
+    else:
+        return False
+    print(f"[DETECT] Method set to: {_current_method}")
+    return True
 
 def get_detection_method() -> str:
-    return "v10.2_shape_filtered"
+    return _current_method
