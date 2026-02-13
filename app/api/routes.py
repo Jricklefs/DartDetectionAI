@@ -76,6 +76,9 @@ try:
     load_polygon_calibrations(r"C:/Users/clawd/DartDetectionAI/polygon_calibrations.json")
     HAS_POLYGON = True
     print("[STARTUP] Polygon calibrations loaded successfully")
+except Exception as e:
+    HAS_POLYGON = False
+    print(f"[STARTUP] Polygon calibrations not available: {e}")
 
 # Scoring mode: 'polygon' (weighted vote) or 'line_intersection' (triangulation)
 _scoring_mode = "polygon"
@@ -89,11 +92,6 @@ def set_scoring_mode(mode: str) -> bool:
         _scoring_mode = mode
         return True
     return False
-except ImportError as e:
-    print(f"[STARTUP] Polygon calibration not available: {e}")
-    HAS_POLYGON = False
-    get_polygon_calibration = None
-    score_from_polygon_calibration = None
 
 
 
@@ -1342,12 +1340,12 @@ calibrator = DartboardCalibrator()
 
 
 
-@app.get("/v1/scoring-mode")
+@router.get("/v1/scoring-mode")
 async def get_scoring_mode_endpoint():
     """Get current scoring mode."""
     return {"scoring_mode": get_scoring_mode(), "options": ["polygon", "line_intersection"]}
 
-@app.post("/v1/scoring-mode")
+@router.post("/v1/scoring-mode")
 async def set_scoring_mode_endpoint(request: dict):
     """Set scoring mode: 'polygon' or 'line_intersection'."""
     mode = request.get("mode", "")
