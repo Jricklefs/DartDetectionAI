@@ -1300,7 +1300,7 @@ def score_with_calibration_hybrid(tip_data: Dict[str, Any], calibration_data: Di
         dbg.write(f"  [SCORE-INPUT] {camera_id}: x_px={x_px}, y_px={y_px}, method={detection_method}, HAS_POLYGON={HAS_POLYGON}, tip_keys={list(tip_data.keys())[:8]}\n")
     
     # Use polygon for skeleton/hough detection methods
-    use_polygon = detection_method in ("skeleton", "hough", "v10.2_shape_filtered") and HAS_POLYGON
+    use_polygon = detection_method in ("skeleton", "hough") and HAS_POLYGON
     
     if use_polygon and camera_id:
         poly_cal = get_polygon_calibration(camera_id)
@@ -1629,7 +1629,7 @@ async def detect_tips(
             logger.info(f"[TIMING] Before detection ({detection_method}): {(timing_module.time() - endpoint_start)*1000:.0f}ms since start")
             t_yolo = time.time()
             
-            if detection_method in ("skeleton", "v10.2_shape_filtered"):
+            if detection_method == "skeleton":
                 # Use skeleton-based detection
                 center = calibration_data.get('center', (320, 240))
                 mask = masks.get(cam.camera_id)
@@ -2017,7 +2017,7 @@ async def detect_tips(
             has_camid = 'camera_id' in t
             dbg.write(f"  tip: cam={t.get('camera_id')}, has_line={has_line}, has_camid={has_camid}\n")
     
-    if detection_method in ("skeleton", "hough", "v10.2_shape_filtered") and len(all_tips) >= 2:
+    if detection_method in ("skeleton", "hough") and len(all_tips) >= 2:
         tips_with_lines = [t for t in all_tips if t.get('line')]
         logger.info(f"[LINE-VOTE] {len(tips_with_lines)} tips have line data")
         
