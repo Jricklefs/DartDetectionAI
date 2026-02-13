@@ -3361,14 +3361,14 @@ def vote_on_scores(clusters: List[List[dict]]) -> List[DetectedTip]:
                     boundary_factor = min(1.5, boundary_factor)
                 weight *= boundary_factor
             
-            # ZONE PLAUSIBILITY: outer zones suggest tip found too far from center
-            # This is a common failure mode - finding dart body instead of tip
+            # ZONE PLAUSIBILITY: DISABLED (Feb 12 2026)
+            # Was penalizing single_outer/double zones at 0.3x weight,
+            # assuming outer zones = bad tip detection. But v10.2's shape filter
+            # and perpendicular trim already handle bad detections. This penalty
+            # was causing 2-vs-1 majority votes to LOSE when the correct answer
+            # was in an outer zone (e.g. R15 D3: S1 single_outer got outvoted by T1).
             zone = tip.get('zone', '')
-            if zone in ('single_outer', 'double'):
-                # Outer zones - might be tip detection failure
-                zone_factor = 0.3  # Slight reduction
-            else:
-                zone_factor = 1.0
+            zone_factor = 1.0
             weight *= zone_factor
             
             votes[key] = votes.get(key, 0.0) + weight
