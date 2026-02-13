@@ -81,14 +81,14 @@ except Exception as e:
     print(f"[STARTUP] Polygon calibrations not available: {e}")
 
 # Scoring mode: 'polygon' (weighted vote) or 'line_intersection' (triangulation)
-_scoring_mode = "polygon"
+_scoring_mode = "vote"
 
 def get_scoring_mode():
     return _scoring_mode
 
 def set_scoring_mode(mode: str) -> bool:
     global _scoring_mode
-    if mode in ("polygon", "line_intersection"):
+    if mode in ("vote", "polygon", "line_intersection"):
         _scoring_mode = mode
         return True
     return False
@@ -1343,7 +1343,7 @@ calibrator = DartboardCalibrator()
 @router.get("/v1/scoring-mode")
 async def get_scoring_mode_endpoint():
     """Get current scoring mode."""
-    return {"scoring_mode": get_scoring_mode(), "options": ["polygon", "line_intersection"]}
+    return {"scoring_mode": get_scoring_mode(), "options": ["vote", "line_intersection"]}
 
 @router.post("/v1/scoring-mode")
 async def set_scoring_mode_endpoint(request: dict):
@@ -6610,3 +6610,28 @@ try:
     print(f"[STARTUP] Homography initialized: {list(_homography_cache.keys())}")
 except Exception as e:
     print(f"[STARTUP] Homography init failed (will retry on first detection): {e}")
+
+
+# Detection method: 'skeleton' or 'yolo'
+_detection_method = "skeleton"
+
+@router.get("/v1/settings/method")
+async def get_detection_method_endpoint():
+    """Get current detection method."""
+    return {"method": _detection_method, "options": ["skeleton", "yolo"]}
+
+@router.post("/v1/settings/method")
+async def set_detection_method_endpoint(request: dict):
+    """Set detection method."""
+    global _detection_method
+    method = request.get("method", "")
+    if method in ("skeleton", "yolo"):
+        _detection_method = method
+        # Also update the skeleton_detection module if it has a setter
+        try:
+            from app.core.skeleton_detection import set_detection_method
+            set_detection_method(method)
+        except Exception:
+            pass
+        return {"method": _detection_method, "status": "ok"}
+    return {"error": f"Unknown method: {method}", "options": ["skeleton", "yolo"]}
