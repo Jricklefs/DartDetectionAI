@@ -1300,7 +1300,7 @@ def score_with_calibration_hybrid(tip_data: Dict[str, Any], calibration_data: Di
         dbg.write(f"  [SCORE-INPUT] {camera_id}: x_px={x_px}, y_px={y_px}, method={detection_method}, HAS_POLYGON={HAS_POLYGON}, tip_keys={list(tip_data.keys())[:8]}\n")
     
     # Use polygon for skeleton/hough detection methods
-    use_polygon = detection_method in ("skeleton", "hough", "v10.2_shape_filtered") and HAS_POLYGON
+    use_polygon = detection_method in ("skeleton", "hough") and HAS_POLYGON
     
     if use_polygon and camera_id:
         poly_cal = get_polygon_calibration(camera_id)
@@ -1629,7 +1629,7 @@ async def detect_tips(
             logger.info(f"[TIMING] Before detection ({detection_method}): {(timing_module.time() - endpoint_start)*1000:.0f}ms since start")
             t_yolo = time.time()
             
-            if detection_method in ("skeleton", "v10.2_shape_filtered"):
+            if detection_method == "skeleton":
                 # Use skeleton-based detection
                 center = calibration_data.get('center', (320, 240))
                 mask = masks.get(cam.camera_id)
@@ -1770,16 +1770,7 @@ async def detect_tips(
             # === STEP 1: MASK FILTER (all darts) ===
             # Filter tips to only those INSIDE the NEW mask region
             # This eliminates flight detections and noise
-            # Skip mask filter for skeleton - it already uses diff
-            _is_skeleton = detection_method in ("skeleton", "v10.2_shape_filtered")
-            if _is_skeleton and tips:
-                for t in tips:
-                    t['found_in_new_region'] = True
-                selected_tip = tips[0]
-                selection_method = "skeleton_direct"
-                mask_filter_results = [{"x_px": t.get("x_px",0), "y_px": t.get("y_px",0), "confidence": t.get("confidence",0), "passed_mask": "skeleton_bypass"} for t in tips]
-
-            mask = masks.get(cam.camera_id) if detection_method not in ("skeleton", "v10.2_shape_filtered") else None  # skeleton uses diff directly
+            mask = masks.get(cam.camera_id)
             tips_in_mask = []
             mask_stats = {"has_mask": mask is not None, "new_pixels": 0, "old_pixels": 0}
             if mask is not None:
@@ -2026,7 +2017,7 @@ async def detect_tips(
             has_camid = 'camera_id' in t
             dbg.write(f"  tip: cam={t.get('camera_id')}, has_line={has_line}, has_camid={has_camid}\n")
     
-    if detection_method in ("skeleton", "hough", "v10.2_shape_filtered") and len(all_tips) >= 2:
+    if detection_method in ("skeleton", "hough") and len(all_tips) >= 2:
         tips_with_lines = [t for t in all_tips if t.get('line')]
         logger.info(f"[LINE-VOTE] {len(tips_with_lines)} tips have line data")
         
@@ -3354,11 +3345,21 @@ def vote_on_scores(clusters: List[List[dict]]) -> List[DetectedTip]:
                 weight *= 0.1
                 logger.debug(f"[VOTE] {cam_id} tip NOT in NEW region - weight reduced to {weight:.3f}")
             
-            # BOUNDARY distance - stored for logging only, NOT applied to vote weight
-            # Aggressive boundary penalties were overriding 2-vs-1 camera majorities
-            # (e.g. two cameras say S1 near wire get 0.1x, one says T1 gets 0.9x -> T1 wins)
+            # EXPONENTIAL boundary weighting (more aggressive near wires)
+            # 0° (on wire) = 0.1x, 2° = 0.5x, 5° = 0.9x, 9° (center) = 1.5x
             boundary_dist = tip.get('boundary_distance_deg')
-            boundary_factor = 1.0  # No penalty - let camera majority rule
+            if boundary_dist is not None:
+                if boundary_dist < 1.0:
+                    boundary_factor = 0.1  # Extremely low weight on wire
+                elif boundary_dist < 2.0:
+                    boundary_factor = 0.3  # Very low weight near wire
+                elif boundary_dist < 4.0:
+                    boundary_factor = 0.7  # Reduced weight
+                else:
+                    # Linear from 0.9 at 4° to 1.5 at 9°
+                    boundary_factor = 0.9 + (boundary_dist - 4.0) * 0.12
+                    boundary_factor = min(1.5, boundary_factor)
+                weight *= boundary_factor
             
             # ZONE PLAUSIBILITY: DISABLED (Feb 12 2026)
             # Was penalizing single_outer/double zones at 0.3x weight,
