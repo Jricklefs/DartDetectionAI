@@ -1770,7 +1770,16 @@ async def detect_tips(
             # === STEP 1: MASK FILTER (all darts) ===
             # Filter tips to only those INSIDE the NEW mask region
             # This eliminates flight detections and noise
-            mask = masks.get(cam.camera_id)
+            # Skip mask filter for skeleton - it already uses diff
+            _is_skeleton = detection_method in ("skeleton", "v10.2_shape_filtered")
+            if _is_skeleton and tips:
+                for t in tips:
+                    t['found_in_new_region'] = True
+                selected_tip = tips[0]
+                selection_method = "skeleton_direct"
+                mask_filter_results = [{"x_px": t.get("x_px",0), "y_px": t.get("y_px",0), "confidence": t.get("confidence",0), "passed_mask": "skeleton_bypass"} for t in tips]
+
+            mask = masks.get(cam.camera_id) if detection_method not in ("skeleton", "v10.2_shape_filtered") else None  # skeleton uses diff directly
             tips_in_mask = []
             mask_stats = {"has_mask": mask is not None, "new_pixels": 0, "old_pixels": 0}
             if mask is not None:
