@@ -6136,7 +6136,10 @@ async def replay_benchmark_with_polygon():
 @router.get("/v1/settings/method")
 async def get_method():
     """Get current detection method."""
-    method = get_detection_method()
+    # get_detection_method() returns internal name like "v10.2_shape_filtered"
+    # Map to UI-friendly name
+    internal = get_detection_method()
+    method = "skeleton" if "skeleton" in internal or "v10" in internal or "flight" in internal else "yolo"
     return {
         "method": method,
         "options": ["yolo", "skeleton"],
@@ -6611,27 +6614,3 @@ try:
 except Exception as e:
     print(f"[STARTUP] Homography init failed (will retry on first detection): {e}")
 
-
-# Detection method: 'skeleton' or 'yolo'
-_detection_method = "skeleton"
-
-@router.get("/v1/settings/method")
-async def get_detection_method_endpoint():
-    """Get current detection method."""
-    return {"method": _detection_method, "options": ["skeleton", "yolo"]}
-
-@router.post("/v1/settings/method")
-async def set_detection_method_endpoint(request: dict):
-    """Set detection method."""
-    global _detection_method
-    method = request.get("method", "")
-    if method in ("skeleton", "yolo"):
-        _detection_method = method
-        # Also update the skeleton_detection module if it has a setter
-        try:
-            from app.core.skeleton_detection import set_detection_method
-            set_detection_method(method)
-        except Exception:
-            pass
-        return {"method": _detection_method, "status": "ok"}
-    return {"error": f"Unknown method: {method}", "options": ["skeleton", "yolo"]}
