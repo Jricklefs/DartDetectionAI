@@ -644,7 +644,7 @@ def detect_dart_skeleton(
             pass
     return result
 
-_current_method = "yolo"  # Default to YOLO (skeleton not ready for live)
+_current_method = "v10.2_shape_filtered"  # Default to skeleton (v10.2)
 
 def set_detection_method(method: str):
     global _current_method
