@@ -1282,7 +1282,7 @@ def score_with_calibration(tip_data: Dict[str, Any], calibration_data: Dict[str,
     score = segment * multiplier
     return {"score": score, "multiplier": multiplier, "segment": segment, "zone": zone, "boundary_distance_deg": boundary_distance_deg}
 def score_with_calibration_hybrid(tip_data: Dict[str, Any], calibration_data: Dict[str, Any], 
-                                   camera_id: str = None, detection_method: str = "yolo") -> Dict[str, Any]:
+                                   camera_id: str = None, detection_method: str = "v10.2_shape_filtered") -> Dict[str, Any]:
     """
     Score using polygon or ellipse based on detection method.
     
@@ -1298,6 +1298,9 @@ def score_with_calibration_hybrid(tip_data: Dict[str, Any], calibration_data: Di
     # DEBUG: Log what we're scoring
     with open(r"C:\Users\clawd\skel_debug.txt", "a") as dbg:
         dbg.write(f"  [SCORE-INPUT] {camera_id}: x_px={x_px}, y_px={y_px}, method={detection_method}, HAS_POLYGON={HAS_POLYGON}, tip_keys={list(tip_data.keys())[:8]}\n")
+        # TEMP DEBUG: dump calibration data used for scoring
+        import json as _json
+        dbg.write(f"    [CAL-DEBUG] {camera_id}: center={calibration_data.get('center')}, seg20_idx={calibration_data.get('segment_20_index')}, n_angles={len(calibration_data.get('segment_angles', []))}, first3_angles={calibration_data.get('segment_angles', [])[:3]}\n")
     
     # Use polygon for skeleton/hough detection methods
     use_polygon = detection_method in ("skeleton", "hough") and HAS_POLYGON
@@ -1565,7 +1568,7 @@ async def detect_tips(
     all_tips = []
     camera_results = []
     pipeline_data = {}  # Per-camera detailed detection pipeline
-    yolo_total_ms = 0
+    detect_total_ms = 0
     scoring_total_ms = 0
     
     for cam in request.cameras:
@@ -1624,19 +1627,19 @@ async def detect_tips(
             # Track calibration for benchmark
             calibrations_used[cam.camera_id] = calibration_data
             
-            # Detect tips using selected method (YOLO or Skeleton)
+            # Detect tips using selected method
             detection_method = get_detection_method()
             logger.info(f"[TIMING] Before detection ({detection_method}): {(timing_module.time() - endpoint_start)*1000:.0f}ms since start")
-            t_yolo = time.time()
+            t_detect = time.time()
             
-            if detection_method == "skeleton":
+            if detection_method in ("skeleton", "v10.2_shape_filtered"):
                 # Use skeleton-based detection
                 center = calibration_data.get('center', (320, 240))
                 mask = masks.get(cam.camera_id)
                 
                 # DEBUG: Write to file
                 with open(r"C:\Users\clawd\skel_debug.txt", "a") as dbg:
-                    dbg.write(f"Camera {cam.camera_id}: before_images={request.before_images is not None and len(request.before_images) if request.before_images else 0}\n")
+                    dbg.write(f"[METHOD={detection_method}] Camera {cam.camera_id}: before_images={request.before_images is not None and len(request.before_images) if request.before_images else 0}\n")
                 
                 # Get previous frame - prefer from request, fall back to cache
                 if request.before_images:
@@ -1714,7 +1717,7 @@ async def detect_tips(
                         image_base64=cam.image,
                         calibration_data=calibration_data
                     )
-                    logger.info(f"[DETECT] No previous frame, using YOLO fallback")
+                    logger.info(f"[DETECT] No previous frame, using detection fallback")
             else:
                 # Use YOLO detection (default)
                 tips = calibrator.detect_tips(
@@ -1723,8 +1726,8 @@ async def detect_tips(
                     calibration_data=calibration_data
                 )
             
-            yolo_ms = int((time.time() - t_yolo) * 1000)
-            yolo_total_ms += yolo_ms
+            detect_ms = int((time.time() - t_detect) * 1000)
+            detect_total_ms += detect_ms
             
             # === ADD MM COORDINATES TO ALL TIPS ===
             # Transform pixel coords to dartboard mm coords for cross-camera matching
@@ -1753,9 +1756,9 @@ async def detect_tips(
                 tip['y_mm'] = y_mm
             
             # Keep original tips for debug image AND benchmark
-            all_yolo_tips = [t.copy() for t in tips] if tips else []
+            all_detected_tips = [t.copy() for t in tips] if tips else []
             
-            logger.info(f"[DETECT] Camera {cam.camera_id}: YOLO found {len(tips)} tips ({yolo_ms}ms)")
+            logger.info(f"[DETECT] Camera {cam.camera_id}: Detection found {len(tips)} tips ({detect_ms}ms)")
             
             # Track selected tip and context for debug image
             selected_tip = None
@@ -1873,8 +1876,8 @@ async def detect_tips(
             
             # === BUILD PIPELINE DATA FOR THIS CAMERA ===
             pipeline_data[cam.camera_id] = {
-                "yolo_ms": yolo_ms,
-                "all_yolo_tips": [
+                "detect_ms": detect_ms,
+                "all_detected_tips": [
                     {
                         "x_px": t.get('x_px', 0),
                         "y_px": t.get('y_px', 0),
@@ -1882,7 +1885,7 @@ async def detect_tips(
                         "y_mm": t.get('y_mm', 0),
                         "confidence": t.get('confidence', 0)
                     }
-                    for t in all_yolo_tips
+                    for t in all_detected_tips
                 ],
                 "mask_stats": mask_stats,
                 "mask_filter_results": mask_filter_results,
@@ -1904,7 +1907,7 @@ async def detect_tips(
                 dart_number=dart_number,
                 camera_id=cam.camera_id,
                 image=current_img,
-                all_tips=all_yolo_tips,
+                all_tips=all_detected_tips,
                 selected_tip=selected_tip,
                 known_darts=known_darts_for_debug,
                 new_centroid=new_centroid_for_debug
@@ -1978,6 +1981,9 @@ async def detect_tips(
     if all_tips:
         votes_summary = ", ".join([f"{t.get('camera_id')}={t.get('segment')}x{t.get('multiplier')}" for t in all_tips])
         logger.info(f"[VOTE] Camera votes: {votes_summary}")
+        with open(r"C:\Users\clawd\skel_debug.txt", "a") as dbg:
+            dbg.write(f"[VOTE] Camera votes: {votes_summary}\n")
+            dbg.write(f"[VOTE] Clusters: {len(clustered_tips)}, tips_per_camera: {tips_per_camera if 'tips_per_camera' in dir() else 'not yet'}\n")
     
     # IMPORTANT: When cameras disagree on segment, we need to MERGE clusters and vote
     # If cam0=12, cam1=13, cam2=13, clustering gives us:
@@ -1999,6 +2005,8 @@ async def detect_tips(
         all_tips_merged = [tip for cluster in clustered_tips for tip in cluster]
         clustered_tips = [all_tips_merged]
         logger.info(f"[DETECT] Merged into 1 cluster with {len(all_tips_merged)} tips")
+        with open(r"C:\Users\clawd\skel_debug.txt", "a") as dbg:
+            dbg.write(f"[VOTE] MERGED {len(all_tips_merged)} tips into 1 cluster\n")
     
     # Line intersection voting with homography transform (Autodarts-style)
     line_intersection_result = None
@@ -2166,7 +2174,7 @@ async def detect_tips(
     processing_ms = int((time.time() - start_time) * 1000)
     
     # Collect all timings
-    timings['yolo'] = yolo_total_ms
+    timings['detect'] = detect_total_ms
     timings['scoring'] = scoring_total_ms
     timings['total'] = processing_ms
     
@@ -3321,6 +3329,11 @@ def vote_on_scores(clusters: List[List[dict]]) -> List[DetectedTip]:
         if tips_in_new and tips_fallback:
             logger.info(f"[VOTE] {len(tips_in_new)} tips in NEW region, {len(tips_fallback)} via fallback")
         
+        # Log cluster contents
+        cluster_summary = ", ".join([f"{t.get('camera_id')}={t.get('segment')}x{t.get('multiplier')}" for t in cluster])
+        with open(r"C:\Users\clawd\skel_debug.txt", "a") as dbg:
+            dbg.write(f"[VOTE] Cluster ({len(cluster)} tips): {cluster_summary}\n")
+        
         for tip in cluster:
             key = (tip['segment'], tip['multiplier'])
             cam_id = tip.get('camera_id', 'unknown')
@@ -3371,6 +3384,9 @@ def vote_on_scores(clusters: List[List[dict]]) -> List[DetectedTip]:
             zone_factor = 1.0
             weight *= zone_factor
             
+            with open(r"C:\Users\clawd\skel_debug.txt", "a") as dbg:
+                dbg.write(f"[VOTE]   {cam_id}: {tip['segment']}x{tip['multiplier']} weight={weight:.3f} (conf={tip['confidence']}, cal_q={cal_quality:.2f}, view_q={view_quality:.2f}, bnd={boundary_dist})\n")
+            
             votes[key] = votes.get(key, 0.0) + weight
             total_confidence += weight
             
@@ -3408,6 +3424,31 @@ def vote_on_scores(clusters: List[List[dict]]) -> List[DetectedTip]:
                 logger.info(f"[VOTE]   {seg}x{mult}: {cam_info} total_weight={total_weight:.2f}")
             
             logger.info(f"[VOTE] Initial vote winner: {winning_segment}x{winning_multiplier} (weight={votes[winning_key]:.2f})")
+            with open(r"C:\Users\clawd\skel_debug.txt", "a") as dbg:
+                for (seg, mult), w in sorted(votes.items(), key=lambda x: -x[1]):
+                    dbg.write(f"[VOTE] Tally: {seg}x{mult} = {w:.3f}\n")
+                dbg.write(f"[VOTE] Initial winner: {winning_segment}x{winning_multiplier} (weight={votes[winning_key]:.2f})\n")
+            
+            # MAJORITY OVERRIDE: If 2+ cameras agree on the same segment,
+            # that segment wins regardless of boundary weighting.
+            # Boundary weighting should NOT let a minority camera override a majority.
+            camera_counts = {}  # (seg, mult) -> number of cameras
+            for (seg, mult), details in vote_details.items():
+                camera_counts[(seg, mult)] = len(details)
+            
+            max_camera_count = max(camera_counts.values())
+            majority_keys = [k for k, v in camera_counts.items() if v == max_camera_count]
+            
+            if len(majority_keys) == 1 and max_camera_count >= 2:
+                majority_key = majority_keys[0]
+                if majority_key != winning_key:
+                    maj_seg, maj_mult = majority_key
+                    maj_cams = [d['camera'] for d in vote_details[majority_key]]
+                    logger.warning(f"[VOTE] MAJORITY OVERRIDE: {maj_seg}x{maj_mult} has {max_camera_count} cameras ({maj_cams}) vs weighted winner {winning_segment}x{winning_multiplier}")
+                    with open(r"C:\Users\clawd\skel_debug.txt", "a") as dbg:
+                        dbg.write(f"[VOTE] MAJORITY OVERRIDE: {maj_seg}x{maj_mult} ({max_camera_count} cams) beats {winning_segment}x{winning_multiplier}\n")
+                    winning_key = majority_key
+                    winning_segment, winning_multiplier = majority_key
             
             # POLAR AVERAGING: Only use when vote is close/tied
             # Check if vote is close enough to consider polar averaging

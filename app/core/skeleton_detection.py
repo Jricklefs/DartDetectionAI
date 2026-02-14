@@ -30,6 +30,7 @@ def detect_dart(
     debug: bool = False,
     debug_name: str = "",
 ) -> Dict[str, Any]:
+    barrel_info = []
     result = {
         "tip": None, "confidence": 0.0, "line": None,
         "dart_length": 0.0, "method": "none",
@@ -37,7 +38,7 @@ def detect_dart(
     }
     
     # Step 1: Motion mask
-    motion_mask = _compute_motion_mask(current_frame, previous_frame)
+    motion_mask, high_mask, positive_mask = _compute_motion_mask(current_frame, previous_frame)
     
     # Step 2: Subtract existing darts
     if existing_dart_mask is not None:
@@ -55,7 +56,8 @@ def detect_dart(
     
     # Step 5: Find tip
     tip, tip_method, dart_length = _find_tip_from_flight(
-        motion_mask, flight_centroid, flight_contour, flight_bbox
+        motion_mask, flight_centroid, flight_contour, flight_bbox,
+        high_mask=positive_mask
     )
     if tip is None:
         return result
@@ -77,7 +79,7 @@ def detect_dart(
     if debug:
         result["debug_image"] = _draw_debug(
             current_frame, motion_mask, flight_centroid, flight_contour,
-            tip, line, tip_method, debug_name
+            tip, line, tip_method, debug_name, barrel_info=barrel_info
         )
     
     return result
@@ -128,10 +130,17 @@ def _compute_motion_mask(
     # Morphological OPENING to trim blobby protrusions ("dart herpes")
     # Erode shaves off thin noise fingers, dilate restores the main dart shape
     # Use 3x3 to be gentle — don't want to erase thin shaft pixels
-    open_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    open_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     seed = cv2.morphologyEx(seed, cv2.MORPH_OPEN, open_kernel)
     
-    return seed
+    # Signed diff: positive values = new pixels that APPEARED (new dart)
+    # Negative values = pixels that DISAPPEARED (old dart shifted away)
+    # Only keep strong positive signal as the "new object" mask
+    signed_diff = blur_curr.astype(np.int16) - blur_prev.astype(np.int16)
+    positive_mask = np.zeros_like(mask_high)
+    positive_mask[signed_diff > threshold] = 255
+    
+    return seed, mask_high, positive_mask
 
 
 # =============================================================================
@@ -194,15 +203,19 @@ def _shape_filter(mask: np.ndarray, min_aspect: float = 2.0, min_area: int = 100
 # Trim Perpendicular Noise — darts don't have perpendicular offshoots
 # =============================================================================
 
-def _trim_perpendicular_noise(mask: np.ndarray, max_perp_dist: float = 25.0) -> np.ndarray:
+def _trim_perpendicular_noise(mask: np.ndarray, margin: float = 2.0):
     """
-    Find the main axis of each blob, then delete any pixels that are 
-    too far perpendicular from that axis. Darts are linear — no perpendicular 
-    offshoots. Shadows/reflections create blobby protrusions that stick out 
-    sideways from the dart.
+    Barrel edge clipping: measure the barrel width from the clean side of
+    the shaft (40-80% from flight to tip), then clip everything outside
+    barrel walls + margin. Tapers wider near the flight.
+    
+    Measures both sides of the barrel independently and uses the NARROWER
+    side's Q75 as the true barrel edge — whiskers/thorns on one side
+    cannot influence the measurement.
     """
     num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask)
     cleaned = np.zeros_like(mask)
+    barrel_info_list = []
     
     for label_id in range(1, num_labels):
         area = stats[label_id, cv2.CC_STAT_AREA]
@@ -217,73 +230,81 @@ def _trim_perpendicular_noise(mask: np.ndarray, max_perp_dist: float = 25.0) -> 
             continue
         
         points = np.column_stack((xs, ys)).astype(np.float32)
-        
-        # Fit the main axis via minAreaRect
         rect = cv2.minAreaRect(points)
         (cx, cy), (rw, rh), angle = rect
-        
-        # Ensure long side is the "length"
         if rw < rh:
             rw, rh = rh, rw
             angle += 90
         
-        # If blob isn't elongated at all, keep as-is (might be a bull dart)
-        aspect = rw / (rh + 1)
-        if aspect < 1.5:
+        # If blob isn't elongated, keep as-is (bull dart)
+        if rw / (rh + 1) < 1.5:
             cleaned = cv2.bitwise_or(cleaned, component)
             continue
         
-        # Find the barrel line through progressive erosion for better axis
-        barrel_vx, barrel_vy, barrel_x0, barrel_y0 = None, None, None, None
-        for erode_iter in range(2, 10, 2):
-            kern = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-            eroded = cv2.erode(component, kern, iterations=erode_iter)
-            ey, ex = np.nonzero(eroded)
-            if len(ex) < 10:
-                break
-            erect = cv2.minAreaRect(np.column_stack((ex, ey)).astype(np.float32))
-            (_, (erw, erh), _) = erect
-            if max(erw, erh) / (min(erw, erh) + 1) > 2.5:
-                line_params = cv2.fitLine(
-                    np.column_stack((ex, ey)).astype(np.float32),
-                    cv2.DIST_L2, 0, 0.01, 0.01
-                )
-                barrel_vx, barrel_vy, barrel_x0, barrel_y0 = line_params.flatten()
-                break
+        # Fit barrel axis
+        line_params = cv2.fitLine(points, cv2.DIST_L2, 0, 0.01, 0.01)
+        bvx, bvy, bx0, by0 = line_params.flatten()
         
-        # Fallback: use minAreaRect angle for the line direction
-        if barrel_vx is None:
-            angle_rad = np.deg2rad(angle)
-            barrel_vx = np.cos(angle_rad)
-            barrel_vy = np.sin(angle_rad)
-            barrel_x0 = cx
-            barrel_y0 = cy
+        # Compute perpendicular and along-axis distances
+        dx = xs.astype(np.float64) - bx0
+        dy = ys.astype(np.float64) - by0
+        perp_signed = dx * bvy - dy * bvx
+        perp_dist = np.abs(perp_signed)
+        along_dist = dx * bvx + dy * bvy
         
-        # For each pixel, compute perpendicular distance from barrel line
-        # Line: point (barrel_x0, barrel_y0) + t*(barrel_vx, barrel_vy)
-        # Perp distance = |cross product| / |direction| (direction is unit so just cross)
-        dx = xs.astype(np.float64) - barrel_x0
-        dy = ys.astype(np.float64) - barrel_y0
-        perp_dist = np.abs(dx * barrel_vy - dy * barrel_vx)
+        # Find flight end (centroid) and tip end
+        flight_along = (cx - bx0) * bvx + (cy - by0) * bvy
         
-        # Allow wider near the flight (centroid area) — flight is naturally wider
-        # Use distance along the line from centroid to scale the allowed width
-        along_dist = np.abs(dx * barrel_vx + dy * barrel_vy)
+        # Shaft region: 40-80% from flight toward tip
+        tip_along = np.max(along_dist) if bvy > 0 else np.min(along_dist)
+        shaft_lo = flight_along + (tip_along - flight_along) * 0.4
+        shaft_hi = flight_along + (tip_along - flight_along) * 0.8
+        in_shaft = ((along_dist >= min(shaft_lo, shaft_hi)) & 
+                    (along_dist <= max(shaft_lo, shaft_hi)))
         
-        # Base max perpendicular distance, plus some extra near the center (flight area)
-        # Flight can be ~30px wide, shaft is ~5-10px
-        allowed_perp = max_perp_dist
+        shaft_perps = perp_signed[in_shaft]
+        if len(shaft_perps) < 10:
+            # Not enough shaft pixels, fall back to simple trim
+            keep = perp_dist <= 12.0
+            trimmed = np.zeros_like(component)
+            trimmed[ys[keep], xs[keep]] = 255
+            cleaned = cv2.bitwise_or(cleaned, trimmed)
+            continue
         
-        # Keep pixels within perpendicular tolerance
-        keep = perp_dist <= allowed_perp
+        # Measure each side independently
+        left = np.abs(shaft_perps[shaft_perps < 0])
+        right = np.abs(shaft_perps[shaft_perps >= 0])
         
-        # Create trimmed mask
+        left_q75 = np.percentile(left, 75) if len(left) > 5 else 5.0
+        right_q75 = np.percentile(right, 75) if len(right) > 5 else 5.0
+        
+        # Use the NARROWER side as the true barrel width
+        barrel_half = min(left_q75, right_q75) + margin
+        
+        # Taper: wider near flight, barrel width in shaft
+        flight_half_width = 35.0
+        taper_length = 50.0
+        dist_from_flight = np.abs(along_dist - flight_along)
+        t = np.clip(dist_from_flight / taper_length, 0, 1)
+        allowed = flight_half_width * (1 - t) + barrel_half * t
+        
+        # Store barrel info for debug visualization
+        barrel_info_list.append({
+            "axis_point": (float(bx0), float(by0)),
+            "axis_dir": (float(bvx), float(bvy)),
+            "barrel_half": float(barrel_half),
+            "flight_along": float(flight_along),
+            "tip_along": float(tip_along),
+            "flight_half_width": float(flight_half_width),
+            "taper_length": float(taper_length),
+        })
+        
+        keep = perp_dist <= allowed
         trimmed = np.zeros_like(component)
         trimmed[ys[keep], xs[keep]] = 255
-        
         cleaned = cv2.bitwise_or(cleaned, trimmed)
     
-    return cleaned
+    return cleaned, barrel_info_list
 
 
 # =============================================================================
@@ -321,115 +342,138 @@ def _find_tip_from_flight(
     flight_centroid: Tuple[float, float],
     flight_contour: np.ndarray,
     flight_bbox: Tuple[int, int, int, int],
+    high_mask: np.ndarray = None,
 ) -> Tuple[Optional[Tuple[float, float]], str, float]:
+    """
+    Find the dart tip by tracing a narrow corridor from the flight downward.
+    
+    When multiple darts are on the board, the diff mask merges them.
+    We use the flight centroid (found from the strongest diff signal) and
+    trace a corridor along the shaft direction to find the tip.
+    
+    If high_mask is provided, we use it to find the TRUE new dart flight
+    (strongest diff signal = new dart, not shifted old darts).
+    """
     fcx, fcy = flight_centroid
+    h, w = mask.shape[:2]
     
-    # Isolate dart's connected component
-    num_labels, labels = cv2.connectedComponents(mask)
+    # If high_mask provided, re-find the flight from the strongest signal
+    if high_mask is not None:
+        contours_h, _ = cv2.findContours(high_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if contours_h:
+            # Find the blob with lowest Y centroid (= highest on screen = flight sticking up)
+            # Among blobs that are large enough to be a flight (>50px)
+            flight_candidates = []
+            for c in contours_h:
+                area = cv2.contourArea(c)
+                if area < 50:
+                    continue
+                M = cv2.moments(c)
+                if M["m00"] == 0:
+                    continue
+                cy = M["m01"] / M["m00"]
+                cx = M["m10"] / M["m00"]
+                # Shape prior: dart flights are compact blobs, not thin edges
+                # Old dart shift artifacts are thin crescents (high aspect ratio, small area)
+                x, y, bw, bh = cv2.boundingRect(c)
+                aspect = max(bw, bh) / max(1, min(bw, bh))
+                # Reject very thin shapes (aspect > 6) with small area — likely shift artifacts
+                if aspect > 6 and area < 200:
+                    continue
+                flight_candidates.append((cy, cx, c, area))
+            
+            if flight_candidates:
+                # Pick the LARGEST candidate = strongest diff signal = new dart's flight
+                # New dart is fully new, so it produces the biggest high-threshold blob
+                # Old dart shifts produce smaller edge artifacts
+                flight_candidates.sort(key=lambda x: -x[3])  # Sort by area descending
+                best_cy, best_cx, best_contour, best_area = flight_candidates[0]
+                fcx, fcy = best_cx, best_cy
+                flight_contour = best_contour
+    
+    # Find connected components in full mask
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask)
+    
+    if num_labels <= 1:
+        return None, "none", 0
+    
+    # Find which CC contains the flight
     flight_label = labels[int(fcy), int(fcx)]
-    
     if flight_label == 0:
-        for dy in range(-5, 6):
-            for dx in range(-5, 6):
+        for dy in range(-10, 11):
+            for dx in range(-10, 11):
                 py, px = int(fcy + dy), int(fcx + dx)
-                if 0 <= py < mask.shape[0] and 0 <= px < mask.shape[1]:
-                    if labels[py, px] > 0:
-                        flight_label = labels[py, px]
-                        break
+                if 0 <= py < h and 0 <= px < w and labels[py, px] > 0:
+                    flight_label = labels[py, px]
+                    break
             if flight_label > 0:
                 break
     
     if flight_label == 0:
         return None, "none", 0
     
-    dart_mask = (labels == flight_label).astype(np.uint8) * 255
+    # Get flight CC pixels for PCA direction
+    cc_ys, cc_xs = np.nonzero(labels == flight_label)
+    cc_size = len(cc_ys)
     
-    # Trim perpendicular noise from THIS dart's mask only
-    dart_mask = _trim_perpendicular_noise(dart_mask)
+    # Determine shaft direction using PCA
+    vx, vy = 0.0, 1.0
+    if cc_size >= 20:
+        pts = np.column_stack((cc_xs, cc_ys)).astype(np.float32)
+        mean = pts.mean(axis=0)
+        centered = pts - mean
+        cov = np.cov(centered.T)
+        eigenvalues, eigenvectors = np.linalg.eigh(cov)
+        principal = eigenvectors[:, np.argmax(eigenvalues)]
+        vx, vy = float(principal[0]), float(principal[1])
+        if vy < 0:
+            vx, vy = -vx, -vy
     
-    dart_ys, dart_xs = np.nonzero(dart_mask)
-    if len(dart_xs) < 10:
-        return None, "none", 0
+    mag = np.sqrt(vx**2 + vy**2)
+    if mag > 0:
+        vx, vy = vx / mag, vy / mag
     
-    # Try barrel isolation via progressive erosion
-    barrel_points = None
-    for erode_iter in range(2, 12, 2):
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        eroded = cv2.erode(dart_mask, kernel, iterations=erode_iter)
-        ey, ex = np.nonzero(eroded)
-        if len(ex) < 10:
+    # Trace corridor from flight centroid along shaft direction
+    corridor_half_width = 20
+    perp_x, perp_y = -vy, vx
+    
+    best_tip = None
+    best_tip_y = -1
+    max_steps = 500
+    gap_count = 0
+    max_gap = 15
+    
+    for step in range(1, max_steps):
+        cx = fcx + vx * step
+        cy = fcy + vy * step
+        
+        if cx < 0 or cx >= w or cy < 0 or cy >= h:
             break
-        if len(ex) >= 5:
-            rect = cv2.minAreaRect(np.column_stack((ex, ey)).astype(np.float32))
-            (_, (rw, rh), _) = rect
-            aspect = max(rw, rh) / (min(rw, rh) + 1)
-            if aspect > 2.5:
-                barrel_points = np.column_stack((ex, ey))
-    
-    if barrel_points is not None and len(barrel_points) >= 5:
-        line_params = cv2.fitLine(barrel_points.astype(np.float32),
-                                   cv2.DIST_L2, 0, 0.01, 0.01)
-        vx, vy, x0, y0 = line_params.flatten()
         
-        h_img, w_img = dart_mask.shape[:2]
-        search_width = 15
+        found_pixel = False
+        for offset in range(-corridor_half_width, corridor_half_width + 1):
+            px = int(cx + perp_x * offset)
+            py = int(cy + perp_y * offset)
+            if 0 <= px < w and 0 <= py < h and mask[py, px] > 0:
+                found_pixel = True
+                if py > best_tip_y:
+                    best_tip_y = py
+                    best_tip = (float(px), float(py))
         
-        def walk_line(vx_dir, vy_dir):
-            last_on = (float(x0), float(y0))
-            gap = 0
-            for t in range(1, 400):
-                px = x0 + vx_dir * t
-                py = y0 + vy_dir * t
-                if px < 0 or px >= w_img or py < 0 or py >= h_img:
-                    break
-                found = False
-                for offset in range(-search_width, search_width + 1, 2):
-                    cx_c = int(px + (-vy_dir) * offset)
-                    cy_c = int(py + vx_dir * offset)
-                    if 0 <= cx_c < w_img and 0 <= cy_c < h_img:
-                        if dart_mask[cy_c, cx_c] > 0:
-                            found = True
-                            last_on = (float(px), float(py))
-                            gap = 0
-                            break
-                if not found:
-                    gap += 1
-                    if gap > 20:
-                        break
-            return last_on
-        
-        # Tip is ALWAYS the pixel with the highest Y in the dart mask
-        # Cameras are above looking down — tip = bottom of image = highest Y
-        # Don't rely on barrel line direction — just pick the lowest point
-        tip_y_idx = np.argmax(dart_ys)
-        tip_x = float(dart_xs[tip_y_idx])
-        tip_y = float(dart_ys[tip_y_idx])
-        
-        dart_length = np.sqrt((tip_x - fcx)**2 + (tip_y - fcy)**2)
-        method = "barrel_taper"
-    else:
-        # Fallback: taper profile on full dart mask
-        tip_result = _taper_profile_fallback(dart_mask, dart_xs, dart_ys, flight_centroid)
-        if tip_result is not None:
-            tip_x, tip_y = tip_result
-            dart_length = np.sqrt((tip_x - fcx)**2 + (tip_y - fcy)**2)
-            method = "taper_fallback"
+        if found_pixel:
+            gap_count = 0
         else:
-            dx = dart_xs.astype(np.float64) - fcx
-            dy = dart_ys.astype(np.float64) - fcy
-            dist_sq = dx*dx + dy*dy
-            farthest_idx = np.argmax(dist_sq)
-            tip_x = float(dart_xs[farthest_idx])
-            tip_y = float(dart_ys[farthest_idx])
-            dart_length = np.sqrt(dist_sq[farthest_idx])
-            method = "farthest_fallback"
+            gap_count += 1
+            if gap_count > max_gap:
+                break
     
-    if dart_length < 30:
-        hough_tip = _find_tip_via_hough(dart_mask, flight_centroid)
-        if hough_tip is not None:
-            tip_x, tip_y = hough_tip
-            dart_length = np.sqrt((tip_x - fcx)**2 + (tip_y - fcy)**2)
-            method = "hough"
+    if best_tip is None:
+        tip_idx = np.argmax(cc_ys)
+        best_tip = (float(cc_xs[tip_idx]), float(cc_ys[tip_idx]))
+    
+    tip_x, tip_y = best_tip
+    dart_length = np.sqrt((tip_x - fcx)**2 + (tip_y - fcy)**2)
+    method = "corridor"
     
     return (tip_x, tip_y), method, dart_length
 
@@ -581,7 +625,7 @@ def _compute_line(flight_centroid, tip):
 # Debug Visualization
 # =============================================================================
 
-def _draw_debug(frame, mask, flight_centroid, flight_contour, tip, line, method, name):
+def _draw_debug(frame, mask, flight_centroid, flight_contour, tip, line, method, name, barrel_info=None):
     vis = frame.copy()
     mask_color = np.zeros_like(vis)
     mask_color[mask > 0] = (0, 200, 0)
@@ -608,6 +652,24 @@ def _draw_debug(frame, mask, flight_centroid, flight_contour, tip, line, method,
     cv2.arrowedLine(vis, (fcx, fcy), (tx, ty), (0,255,0), 2, tipLength=0.1)
     
     dart_len = np.sqrt((tx-fcx)**2 + (ty-fcy)**2)
+    # Draw barrel edge lines
+    if barrel_info:
+        for bi in barrel_info:
+            bx0, by0 = bi["axis_point"]
+            bvx, bvy = bi["axis_dir"]
+            bh = bi["barrel_half"]
+            # Perpendicular direction
+            px, py = -bvy, bvx
+            # Draw barrel walls as cyan lines along the full dart length
+            extent = 200  # pixels along axis
+            for side in [1, -1]:
+                # Offset from axis by barrel_half in perpendicular direction
+                ox = px * bh * side
+                oy = py * bh * side
+                p1 = (int(bx0 - bvx*100 + ox), int(by0 - bvy*100 + oy))
+                p2 = (int(bx0 + bvx*extent + ox), int(by0 + bvy*extent + oy))
+                cv2.line(vis, p1, p2, (255, 255, 0), 1)  # cyan barrel edges
+    
     cv2.putText(vis, f"{name} | len={dart_len:.0f}px | {method}",
                 (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
     return vis
@@ -644,8 +706,17 @@ def detect_dart_skeleton(
             pass
     return result
 
+_current_detection_method = "v10.2_shape_filtered"
+
 def set_detection_method(method: str):
-    pass
+    global _current_detection_method
+    method_map = {
+        "skeleton": "v10.2_shape_filtered",
+        "yolo": "yolo",
+        "hough": "hough",
+    }
+    _current_detection_method = method_map.get(method, method)
+    return True
 
 def get_detection_method() -> str:
-    return "v10.2_shape_filtered"
+    return _current_detection_method
