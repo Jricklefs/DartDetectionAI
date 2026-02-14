@@ -560,6 +560,24 @@ def set_last_raw_images(board_id: str, images: Dict[str, np.ndarray]):
     """Store raw images for next dart's "previous" reference."""
     with _cache_lock:
         _last_raw_images[board_id] = {k: v.copy() for k, v in images.items()}
+def store_dart_mask(board_id: str, cam_id: str, mask: np.ndarray):
+    """Store a dart's detection mask for future subtraction."""
+    with _cache_lock:
+        cache = _mask_cache.get(board_id)
+        if cache and "prev_dart_masks" in cache:
+            if cam_id not in cache["prev_dart_masks"]:
+                cache["prev_dart_masks"][cam_id] = []
+            cache["prev_dart_masks"][cam_id].append(mask.copy())
+
+def get_prev_dart_masks(board_id: str, cam_id: str) -> list:
+    """Get list of previous dart masks for a camera."""
+    with _cache_lock:
+        cache = _mask_cache.get(board_id)
+        if cache and "prev_dart_masks" in cache:
+            return [m.copy() for m in cache["prev_dart_masks"].get(cam_id, [])]
+        return []
+
+
 
 def _cleanup_old_cache():
     """Remove cache entries older than TTL."""
@@ -589,7 +607,10 @@ def init_board_cache(board_id: str, baseline_images: Dict[str, np.ndarray]):
             "dart_locations": dart_locations,
             # Source of truth: winning camera's dart locations
             # Format: [(cam_id, x, y, dart_number), ...]
-            "source_of_truth": []
+            "source_of_truth": [],
+            # Full detection masks from previous darts (for subtraction)
+            # Format: {cam_id: [mask1, mask2, ...]}
+            "prev_dart_masks": {cam_id: [] for cam_id in baseline_images.keys()}
         }
     
     # Initialize background models with baseline images
@@ -976,7 +997,11 @@ def clear_dart_locations(board_id: str):
         if cache and "dart_locations" in cache:
             for cam_id in cache["dart_locations"]:
                 cache["dart_locations"][cam_id] = []
-            logger.info(f"[LOCATION] Cleared all dart locations for board {board_id}")
+            # Also clear accumulated prev dart masks
+            if "prev_dart_masks" in cache:
+                for cam_id in cache["prev_dart_masks"]:
+                    cache["prev_dart_masks"][cam_id] = []
+            logger.info(f"[LOCATION] Cleared all dart locations and prev masks for board {board_id}")
 
 def has_cache(board_id: str) -> bool:
     """Check if board has cache initialized."""
@@ -1677,6 +1702,9 @@ async def detect_tips(
                             detect_dart_skeleton._polygon_cache = {}
                         detect_dart_skeleton._polygon_cache[cam.camera_id] = polygon
                     
+                    # Get accumulated prev dart masks for this camera
+                    prev_masks = get_prev_dart_masks(board_id, cam.camera_id)
+
                     skel_result = detect_dart_skeleton(
                         current_img, 
                         prev_img, 
@@ -1687,7 +1715,8 @@ async def detect_tips(
                         use_adaptive_threshold=True,
                         board_radius=board_radius,
                         debug=True,
-                        debug_name=f"dart{dart_number}_{cam.camera_id}"
+                        debug_name=f"dart{dart_number}_{cam.camera_id}",
+                        prev_dart_masks=prev_masks if prev_masks else None
                     )
                     
                     # DEBUG: Log skeleton result
@@ -1707,6 +1736,14 @@ async def detect_tips(
                             "line": line_info,  # (vx, vy, x0, y0) for line intersection voting
                             "camera_id": cam.camera_id  # Required for homography transform
                         }]
+                        # Store this dart's mask for next dart's subtraction
+                        from app.core.skeleton_detection import _compute_motion_mask, _shape_filter
+                        try:
+                            det_mask, _, _ = _compute_motion_mask(current_img, prev_img)
+                            det_mask = _shape_filter(det_mask)
+                            store_dart_mask(board_id, cam.camera_id, det_mask)
+                        except Exception as e:
+                            logger.warning(f"Failed to store dart mask: {e}")
                         logger.info(f"[DETECT] Skeleton found tip at ({tip_x:.1f}, {tip_y:.1f}) view_quality={skel_result.get('view_quality', 0.5):.2f} line={line_info}")
                     else:
                         tips = []
@@ -4209,9 +4246,27 @@ async def replay_single_dart(request: ReplayRequest):
                 else:
                     from app.core.skeleton_detection import detect_dart_skeleton
                     debug_name = f"{cam_id}_{dart_path.parent.name}_{dart_path.name}"
+                    # Compute prev dart masks from previous darts in this round
+                    prev_masks_for_replay = []
+                    try:
+                        from app.core.skeleton_detection import _compute_motion_mask, _shape_filter
+                        for prev_num in range(1, current_dart_num):
+                            prev_raw = dart_path.parent / f"dart_{prev_num}" / f"{cam_id}_raw.jpg"
+                            prev_prev = dart_path.parent / f"dart_{prev_num}" / f"{cam_id}_previous.jpg"
+                            if prev_raw.exists() and prev_prev.exists():
+                                p_raw = cv2.imread(str(prev_raw))
+                                p_prev = cv2.imread(str(prev_prev))
+                                if p_raw is not None and p_prev is not None:
+                                    pm, _, _ = _compute_motion_mask(p_raw, p_prev)
+                                    pm = _shape_filter(pm)
+                                    prev_masks_for_replay.append(pm)
+                    except Exception as e:
+                        logger.warning(f"[BENCHMARK] Failed to compute prev masks: {e}")
+
                     result = detect_dart_skeleton(img, baseline, center=center,
                         existing_dart_locations=existing_locations,
-                        debug=request.debug, debug_name=debug_name)
+                        debug=request.debug, debug_name=debug_name,
+                        prev_dart_masks=prev_masks_for_replay if prev_masks_for_replay else None)
                 
                 if result.get("tip"):
                     tip_x, tip_y = result["tip"]

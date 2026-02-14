@@ -26,6 +26,7 @@ def detect_dart(
     board_center: Tuple[float, float] = (640, 360),
     board_radius: Optional[float] = None,
     existing_dart_mask: Optional[np.ndarray] = None,
+    prev_dart_masks: Optional[List[np.ndarray]] = None,
     camera_id: str = "",
     debug: bool = False,
     debug_name: str = "",
@@ -42,7 +43,16 @@ def detect_dart(
     motion_mask, high_mask, positive_mask = _compute_motion_mask(current_frame, previous_frame)
     
     # Step 2: Subtract existing darts
-    if existing_dart_mask is not None:
+    # Prefer full previous dart masks over point-based circles
+    if prev_dart_masks and len(prev_dart_masks) > 0:
+        combined_prev = np.zeros_like(motion_mask)
+        for pm in prev_dart_masks:
+            if pm is not None and pm.shape == motion_mask.shape:
+                combined_prev = cv2.bitwise_or(combined_prev, pm)
+        motion_mask = cv2.bitwise_and(motion_mask, cv2.bitwise_not(combined_prev))
+        # Also subtract from positive mask so flight detection ignores prev darts
+        positive_mask = cv2.bitwise_and(positive_mask, cv2.bitwise_not(combined_prev))
+    elif existing_dart_mask is not None:
         motion_mask = cv2.bitwise_and(motion_mask, cv2.bitwise_not(existing_dart_mask))
     
     # Step 3: Shape filter — keep only elongated (dart-shaped) blobs
@@ -718,7 +728,9 @@ def detect_dart_skeleton(
     result = detect_dart(
         current_frame=current_frame, previous_frame=previous_frame,
         board_center=center, board_radius=board_radius,
-        existing_dart_mask=existing_mask, camera_id=camera_id,
+        existing_dart_mask=existing_mask,
+        prev_dart_masks=kwargs.get("prev_dart_masks"),
+        camera_id=camera_id,
         debug=debug, debug_name=debug_name,
     )
     
