@@ -137,6 +137,21 @@ def detect_dart(
     if tip is None:
         return result
     
+    # Step 5c: Line projection for occluded tips
+    # When a dart is partially hidden (e.g., D3 behind D1+D2), the visible mask
+    # only shows the flight + some barrel. The highest-Y tip is just the bottom
+    # of the visible portion, not the real tip. PCA line through the visible mask
+    # gives the shaft direction - project it forward to find where the tip would be.
+    # Only activates when dart_length is short (< 100px = likely occluded).
+    if flight_centroid is not None and board_center is not None and board_radius is not None:
+        projected_tip, proj_method = _project_tip_along_line(
+            motion_mask, flight_centroid, tip, board_center, board_radius
+        )
+        if projected_tip is not None:
+            tip = projected_tip
+            tip_method = proj_method
+            dart_length = np.sqrt((tip[0] - flight_centroid[0])**2 + (tip[1] - flight_centroid[1])**2)
+    
     # Step 6: Sub-pixel refinement
     gray = cv2.cvtColor(current_frame, cv2.COLOR_BGR2GRAY) if len(current_frame.shape) == 3 else current_frame
     tip = _refine_tip_subpixel(tip, gray, motion_mask)
@@ -684,6 +699,106 @@ def _refine_tip_subpixel(tip, gray, mask, roi_size=10):
         return (float(coords[idx, 0]), float(coords[idx, 1]))
     return tip
 
+
+
+def _project_tip_along_line(mask, flight_centroid, tip, board_center, board_radius, 
+                             min_dart_length=100):
+    """
+    Line projection for occluded tips.
+    
+    When a dart is partially hidden behind another dart, the visible mask may only
+    show the flight + some barrel. The "highest Y" tip lands on the visible portion,
+    not where the tip actually hits the board.
+    
+    Solution: fit a PCA line through ALL visible mask pixels to get the shaft direction,
+    then project that line forward from the flight toward the board. The projected point
+    is where the tip WOULD be if the dart continued in a straight line.
+    
+    Only activates when:
+    - dart_length < min_dart_length (tip is suspiciously close to flight = likely occluded)
+    - board_center and board_radius are available
+    - PCA line has a clear direction (not a round blob)
+    
+    Returns:
+        (projected_tip, method_name) if projection improved the tip
+        (None, None) if projection not needed or failed
+    """
+    if board_center is None or board_radius is None or board_radius <= 0:
+        return None, None
+    
+    # Check if dart is too short (likely occluded)
+    fcx, fcy = flight_centroid
+    tx, ty = tip
+    dart_length = np.sqrt((tx - fcx)**2 + (ty - fcy)**2)
+    
+    if dart_length >= min_dart_length:
+        return None, None  # Dart is long enough, no projection needed
+    
+    # Fit PCA line through all mask pixels
+    ys, xs = np.nonzero(mask)
+    if len(ys) < 50:
+        return None, None  # Not enough pixels for reliable PCA
+    
+    # PCA: find principal axis of the mask
+    mean_x, mean_y = np.mean(xs), np.mean(ys)
+    coords = np.column_stack([xs - mean_x, ys - mean_y])
+    cov = np.cov(coords.T)
+    eigenvalues, eigenvectors = np.linalg.eigh(cov)
+    
+    # Principal component = direction of most variance = shaft direction
+    # eigh returns in ascending order, so [-1] is the largest eigenvalue
+    pc = eigenvectors[:, -1]  # (dx, dy) direction
+    
+    # Check elongation: if eigenvalue ratio is low, mask is too round for reliable direction
+    if eigenvalues[-1] < 1e-6:
+        return None, None
+    elongation = eigenvalues[-1] / max(eigenvalues[0], 1e-6)
+    if elongation < 3.0:
+        return None, None  # Not elongated enough - direction unreliable
+    
+    # Orient the line so it points AWAY from flight (toward tip = higher Y)
+    # Flight is at the top (low Y), tip is at the bottom (high Y)
+    vx, vy = pc[0], pc[1]
+    
+    # Direction should go from flight toward higher Y (toward board)
+    # Check: does moving along (vx, vy) from flight centroid increase Y?
+    if vy < 0:
+        vx, vy = -vx, -vy  # Flip to point downward (toward board)
+    
+    # Project from the flight centroid along the PCA direction
+    # Walk until we reach a reasonable tip distance or hit board edge
+    # A typical dart is 150-300px long in the image
+    # Project to where the tip should be: estimate based on board_radius
+    # The tip should be somewhere on the board, so project until we reach
+    # board_radius distance from center, or a max reasonable dart length
+    
+    best_tip = None
+    best_y = -1
+    
+    # Walk along the line in small steps
+    for step in range(10, 500, 5):
+        px = fcx + vx * step
+        py = fcy + vy * step
+        
+        # Check if still on/near board
+        dist_from_center = np.sqrt((px - board_center[0])**2 + (py - board_center[1])**2)
+        if dist_from_center > board_radius * 1.1:
+            break  # Past the board edge, stop
+        
+        # Track the farthest point on the board (highest Y within board)
+        if py > best_y:
+            best_y = py
+            best_tip = (float(px), float(py))
+    
+    if best_tip is None:
+        return None, None
+    
+    # Only use projection if it's significantly better than original tip
+    proj_length = np.sqrt((best_tip[0] - fcx)**2 + (best_tip[1] - fcy)**2)
+    if proj_length < dart_length * 1.5:
+        return None, None  # Projection didn't extend much, not worth it
+    
+    return best_tip, "line_projection"
 
 def _compute_line(flight_centroid, tip):
     fcx, fcy = flight_centroid
