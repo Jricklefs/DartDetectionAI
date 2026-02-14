@@ -2785,6 +2785,8 @@ def intersect_lines_2d(x1, y1, x2, y2, x3, y3, x4, y4):
     return (ix, iy)
 
 
+
+
 def triangulate_with_line_intersection(camera_results, calibrations):
     """
     Autodarts-style line intersection triangulation.
@@ -2847,6 +2849,12 @@ def triangulate_with_line_intersection(camera_results, calibrations):
         # Per-camera vote using ellipse scoring (proven accurate)
         vote = score_from_ellipse_calibration(tip[0], tip[1], cal)
         
+        # Check if warped tip is plausibly on the board (dist <= 1.2 in normalized space)
+        # Projected tips from occluded darts can land way off board (dist > 1.5)
+        tip_dist = np.sqrt(tip_n[0]**2 + tip_n[1]**2)
+        tip_reliable = tip_dist <= 1.2
+        mask_quality = result.get('mask_quality', 1.0)
+        
         cam_lines[cam_id] = {
             'line_start': p1_n,
             'line_end': p2_n,
@@ -2855,9 +2863,12 @@ def triangulate_with_line_intersection(camera_results, calibrations):
             'H': H,
             'H_inv': H_inv,
             'vote': vote,
+            'tip_reliable': tip_reliable,
+            'tip_dist': tip_dist,
+            'mask_quality': mask_quality,
         }
         
-        logger.info(f"[LINE_INTERSECT] {cam_id}: tip_px={tip} -> S{vote['segment']} (ellipse)")
+        logger.info(f"[LINE_INTERSECT] {cam_id}: tip_px={tip} -> S{vote['segment']} (ellipse) tip_dist={tip_dist:.3f} reliable={tip_reliable}")
     
     if len(cam_lines) < 2:
         logger.warning("[LINE_INTERSECT] Need at least 2 cameras with PCA lines")
@@ -2905,6 +2916,12 @@ def triangulate_with_line_intersection(camera_results, calibrations):
             else:
                 continue
             
+            # Check if both cameras have reliable tips (on-board)
+            both_reliable = cam_lines[c1].get('tip_reliable', True) and cam_lines[c2].get('tip_reliable', True)
+            # Intersection distance from board center
+            ix_dist = np.sqrt(ix[0]**2 + ix[1]**2)
+            ix_on_board = ix_dist <= 1.3
+            
             intersections.append({
                 'cam1': c1,
                 'cam2': c2,
@@ -2914,50 +2931,60 @@ def triangulate_with_line_intersection(camera_results, calibrations):
                 'total_error': total_err,
                 'score': score,
                 'all_cam_scores': scores_from_cams,
+                'both_reliable': both_reliable,
+                'ix_on_board': ix_on_board,
+                'ix_dist': ix_dist,
             })
             
-            logger.info(f"[LINE_INTERSECT] {c1}x{c2}: S{score['segment']} err={total_err:.4f}")
+            logger.info(f"[LINE_INTERSECT] {c1}x{c2}: S{score['segment']} err={total_err:.4f} reliable={both_reliable} on_board={ix_on_board}")
     
     if not intersections:
         logger.warning("[LINE_INTERSECT] No valid intersections found")
         return None
     
     # Step 3: Pick the best intersection
-    # Strategy: majority vote first (if 2+ intersections agree on segment),
-    # then lowest error among the majority. Falls back to overall lowest error.
-    all_segs = [ix['score']['segment'] for ix in intersections]
+    # Strategy: prefer intersections from reliable camera pairs (both tips on-board),
+    # then majority vote, then lowest error.
+    from collections import Counter
+    
+    # Separate reliable vs unreliable intersections
+    reliable_ix = [ix for ix in intersections if ix.get('both_reliable', True) and ix.get('ix_on_board', True)]
+    
+    # Use reliable intersections if available, otherwise fall back to all
+    working_ix = reliable_ix if reliable_ix else intersections
+    
+    all_segs = [ix['score']['segment'] for ix in working_ix]
     
     if len(set(all_segs)) == 1:
-        # All agree — pick lowest error
-        best = min(intersections, key=lambda x: x['total_error'])
+        best = min(working_ix, key=lambda x: x['total_error'])
         method = 'UnanimousCam'
-        confidence = 1.0
+        confidence = 1.0 if len(working_ix) >= 2 else 0.8
     else:
-        # Find the segment with most votes
-        from collections import Counter
         seg_counts = Counter(all_segs)
         most_common_seg, count = seg_counts.most_common(1)[0]
         
         if count >= 2:
-            # Majority exists — pick lowest error among majority
-            majority = [ix for ix in intersections if ix['score']['segment'] == most_common_seg]
+            majority = [ix for ix in working_ix if ix['score']['segment'] == most_common_seg]
             best = min(majority, key=lambda x: x['total_error'])
             method = 'Cam+1'
             confidence = 0.8
         else:
-            # No majority — also check per-camera votes
-            cam_segs = [data['vote']['segment'] for data in cam_lines.values()]
+            # No majority in intersections — check reliable per-camera votes
+            reliable_cams = {cid: data for cid, data in cam_lines.items() if data.get('tip_reliable', True)}
+            if reliable_cams:
+                cam_segs = [data['vote']['segment'] for data in reliable_cams.values()]
+            else:
+                cam_segs = [data['vote']['segment'] for data in cam_lines.values()]
             cam_counts = Counter(cam_segs)
             cam_majority_seg, cam_count = cam_counts.most_common(1)[0]
             
-            # If per-camera tips agree, prefer intersections matching that segment
-            matching = [ix for ix in intersections if ix['score']['segment'] == cam_majority_seg]
+            matching = [ix for ix in working_ix if ix['score']['segment'] == cam_majority_seg]
             if matching and cam_count >= 2:
                 best = min(matching, key=lambda x: x['total_error'])
                 method = 'CamVote'
                 confidence = 0.7
             else:
-                best = min(intersections, key=lambda x: x['total_error'])
+                best = min(working_ix, key=lambda x: x['total_error'])
                 method = 'BestError'
                 confidence = 0.5
     
