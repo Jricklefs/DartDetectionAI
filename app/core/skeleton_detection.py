@@ -42,8 +42,12 @@ def detect_dart(
     # Step 1: Motion mask
     motion_mask, high_mask, positive_mask = _compute_motion_mask(current_frame, previous_frame)
     
-    # Step 2: Subtract existing darts
-    # Prefer full previous dart masks over point-based circles
+    # Step 2: Subtract previous dart masks
+    # When dart 2 or 3 lands, the motion mask includes ALL darts (current - baseline).
+    # We subtract the actual detection masks from previous darts so only the NEW dart remains.
+    # This handles the "dart shift" problem: when a new dart impacts, old darts physically move,
+    # creating motion artifacts. By subtracting D1's mask from D2's detection (and D1+D2 from D3),
+    # we isolate just the new dart. No dilation on prev masks - they're used as-is.
     if prev_dart_masks and len(prev_dart_masks) > 0:
         combined_prev = np.zeros_like(motion_mask)
         for pm in prev_dart_masks:
@@ -80,12 +84,14 @@ def detect_dart(
     mask_quality = max(0.1, mask_quality)  # Floor at 0.1
     result["mask_quality"] = mask_quality
     
-    # Step 4: Find the flight blob
+    # Step 4: Find the flight blob (largest bright region = flight feathers)
+    # The flight is typically the most visible part of the dart from above.
+    # We use it as an anchor point - the tip is always on the opposite end.
     flight = _find_flight_blob(motion_mask, min_area=80)
     if flight is not None:
         flight_centroid, flight_contour, flight_bbox = flight
         
-        # Step 5: Find tip
+        # Step 5: Find tip using flight as reference
         tip, tip_method, dart_length = _find_tip_from_flight(
             motion_mask, flight_centroid, flight_contour, flight_bbox,
             high_mask=positive_mask,
@@ -96,7 +102,12 @@ def detect_dart(
         tip_method = "none"
         dart_length = 0.0
     
-    # Fallback: if no flight found or tip detection failed, just use highest Y of clean mask
+    # Step 5b: Fallback when flight detection fails
+    # Sometimes the flight blob doesn't pass shape filtering (e.g., partially occluded
+    # by another dart, or the mask is fragmented). But the mask still has valid dart pixels.
+    # In this case, skip flight detection entirely and just find the tip directly from the mask.
+    # Rule: TIP = HIGHEST Y PIXEL (lowest point in image, closest to board surface).
+    # Cameras are mounted above looking down, so highest Y = closest to board = dart tip.
     if tip is None and mask_pixels > 200:
         from scipy import ndimage as ndi
         clean = motion_mask.copy()
@@ -463,9 +474,23 @@ def _find_tip_from_flight(
     if flight_label == 0:
         return None, "none", 0
 
-    # Tip = highest Y pixel in the mask, but filter out noise first
-    # 1. Remove tiny blobs (< 100px)
-    # 2. Remove outlier blobs far from the main dart body
+    # === TIP DETECTION: HIGHEST Y OF CLEANED MASK ===
+    # The tip is ALWAYS the lowest point in the image (highest Y value).
+    # Cameras are above looking down, so highest Y = closest to board = where tip is stuck.
+    #
+    # But we can't just blindly take max(Y) because:
+    # 1. Tiny noise blobs (<100px) from lighting/shadow changes appear randomly
+    # 2. Outlier blobs far from the dart body (e.g., old dart shift artifacts) can
+    #    appear below the actual tip, stealing the "highest Y" position
+    #
+    # Cleaning strategy:
+    # 1. Remove connected components < 100px (noise specks)
+    # 2. Find the largest remaining CC (the main dart body)
+    # 3. Remove other CCs that are BOTH far (>200px) AND small (<20% of main)
+    #    - This keeps barrel/shaft fragments that are disconnected from flight
+    #    - But removes distant noise blobs that would pull the tip off-target
+    # 4. Filter to board radius (+ 15% margin) to exclude off-board pixels
+    # 5. Take highest Y of what survives = tip
     from scipy import ndimage as ndi
     clean_mask = mask.copy()
     labeled_all, n_all = ndi.label(clean_mask)
