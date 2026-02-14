@@ -84,7 +84,7 @@ except Exception as e:
 # Performance: debug file writes OFF by default. Set env DARTDETECT_SKEL_DEBUG=true to enable.
 SKEL_DEBUG = os.environ.get("DARTDETECT_SKEL_DEBUG", "false").lower() == "true"
 
-_scoring_mode = "vote"
+_scoring_mode = "line_intersection"
 
 def get_scoring_mode():
     return _scoring_mode
@@ -229,7 +229,7 @@ def save_training_data(camera_id: str, image_base64: str, segment: int, multipli
 
 # === Benchmark System ===
 # Comprehensive logging for accuracy analysis - enabled via Settings UI
-BENCHMARK_ENABLED = False  # Set via API when logging is enabled in Settings
+BENCHMARK_ENABLED = True  # Default ON - benchmark always records
 # === Stereo Calibration ===
 # Triangulation mode: "ellipse" (default) or "stereo" (requires checkerboard calibration)
 TRIANGULATION_MODE = os.environ.get("DARTDETECT_TRIANGULATION", "ellipse")
