@@ -129,44 +129,37 @@ def _compute_motion_mask(
     
     blur_curr = cv2.GaussianBlur(gray_curr, (blur_size, blur_size), 0)
     blur_prev = cv2.GaussianBlur(gray_prev, (blur_size, blur_size), 0)
+    diff = cv2.absdiff(blur_curr, blur_prev)
     
-    # Signed diff: positive = new pixels APPEARED, negative = old pixels DISAPPEARED
-    # Using positive-only diff prevents old dart shift artifacts from bloating the mask
-    signed_diff = blur_curr.astype(np.int16) - blur_prev.astype(np.int16)
+    # Multi-threshold hysteresis
+    _, mask_high = cv2.threshold(diff, threshold, 255, cv2.THRESH_BINARY)
+    _, mask_low = cv2.threshold(diff, max(5, threshold // 3), 255, cv2.THRESH_BINARY)
     
-    # Positive-only diff for tight masks (only NEW pixels)
-    pos_diff = np.clip(signed_diff, 0, 255).astype(np.uint8)
-    
-    # Also keep absdiff for shaft bridging (shaft may be darker than background in some lighting)
-    abs_diff = cv2.absdiff(blur_curr, blur_prev)
-    
-    # High threshold seeds from POSITIVE diff only (tight — no old dart halos)
-    _, mask_high = cv2.threshold(pos_diff, threshold, 255, cv2.THRESH_BINARY)
-    
-    # Low threshold from absdiff (permissive — allows shaft bridging)
-    _, mask_low = cv2.threshold(abs_diff, max(5, threshold // 3), 255, cv2.THRESH_BINARY)
-    
-    # Close on low mask to bridge flight-shaft gaps
-    close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    # Aggressive close on low mask to bridge flight→shaft gaps
+    # The shaft is thin and faint — need to connect it to the bright flight
+    close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
     mask_low = cv2.morphologyEx(mask_low, cv2.MORPH_CLOSE, close_kernel)
     
-    # Hysteresis: grow positive seeds into connected low-threshold pixels
-    # Seeds are tight (positive-only), growth is permissive (absdiff)
-    # This gives tight masks that still bridge faint shaft sections
+    # Hysteresis: grow high-threshold seeds into connected low-threshold pixels
     seed = mask_high.copy()
-    dilate_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    for _ in range(30):
+    dilate_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    for _ in range(50):  # more iterations to reach further along shaft
         expanded = cv2.dilate(seed, dilate_kernel, iterations=1)
         new_pixels = cv2.bitwise_and(expanded, mask_low)
         if np.array_equal(new_pixels, seed):
             break
         seed = new_pixels
     
-    # Morphological OPENING to trim blobby protrusions
+    # Morphological OPENING to trim blobby protrusions ("dart herpes")
+    # Erode shaves off thin noise fingers, dilate restores the main dart shape
+    # Use 3x3 to be gentle — don't want to erase thin shaft pixels
     open_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     seed = cv2.morphologyEx(seed, cv2.MORPH_OPEN, open_kernel)
     
-    # Pure positive mask for flight selection
+    # Signed diff: positive values = new pixels that APPEARED (new dart)
+    # Negative values = pixels that DISAPPEARED (old dart shifted away)
+    # Only keep strong positive signal as the "new object" mask
+    signed_diff = blur_curr.astype(np.int16) - blur_prev.astype(np.int16)
     positive_mask = np.zeros_like(mask_high)
     positive_mask[signed_diff > threshold] = 255
     
