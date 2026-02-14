@@ -2656,10 +2656,11 @@ def line_intersection_2d(line1, line2):
 
 def build_perspective_transform(calibration):
     """
-    Build perspective transform using 4 points exactly 90° apart on the outer double ring.
+    Build perspective transform using multi-ring homography.
     
-    CRITICAL: segment_angles are measured from the BOARD CENTER (not ellipse center).
-    The ray-ellipse intersection must originate from the board center too.
+    Uses all available ellipse rings (outer_double, inner_double, outer_triple,
+    inner_triple) x 20 segment boundaries = up to 80 control points, plus
+    the board center. More constraints = more accurate transform.
     """
     import numpy as np
     import cv2
@@ -2667,51 +2668,41 @@ def build_perspective_transform(calibration):
     center = calibration.get('center', [0, 0])
     seg_angles = calibration.get('segment_angles', [])
     seg20_idx = calibration.get('segment_20_index', 0)
-    ode = calibration.get('outer_double_ellipse')
     
-    if not ode or len(seg_angles) < 20:
+    if len(seg_angles) < 20:
         return None
     
-    bcx, bcy = float(center[0]), float(center[1])  # Board center
-    ecx, ecy = ode[0]  # Ellipse center
-    width, height = ode[1]
-    angle_deg = ode[2]
-    a = width / 2
-    b = height / 2
-    rot = np.radians(angle_deg)
-    cos_r, sin_r = np.cos(rot), np.sin(rot)
+    bcx, bcy = float(center[0]), float(center[1])
     
-    def ray_board_center_to_ellipse(angle):
-        """
-        Find where a ray FROM BOARD CENTER at 'angle' intersects the outer double ellipse.
+    RING_RADII = {
+        'outer_double_ellipse':  1.0000,
+        'inner_double_ellipse':  0.9529,
+        'outer_triple_ellipse':  0.6294,
+        'inner_triple_ellipse':  0.5824,
+    }
+    
+    def ray_to_ellipse(angle, ellipse_data):
+        ecx, ecy = ellipse_data[0]
+        width, height = ellipse_data[1]
+        angle_deg = ellipse_data[2]
+        ea = width / 2
+        eb = height / 2
+        rot = np.radians(angle_deg)
+        cos_r, sin_r = np.cos(rot), np.sin(rot)
         
-        Ray: P(t) = (bcx + t*cos(angle), bcy + t*sin(angle)), t > 0
-        Ellipse: ((x-ecx)*cos(r) + (y-ecy)*sin(r))^2/a^2 + (-(x-ecx)*sin(r) + (y-ecy)*cos(r))^2/b^2 = 1
-        
-        Substitute and solve quadratic in t.
-        """
         dx = np.cos(angle)
         dy = np.sin(angle)
-        
-        # Offset from ellipse center to board center
         ox = bcx - ecx
         oy = bcy - ecy
         
-        # Rotated coordinates
-        # u = (ox + t*dx)*cos_r + (oy + t*dy)*sin_r
-        # v = -(ox + t*dx)*sin_r + (oy + t*dy)*cos_r
-        # u = u0 + t*du, v = v0 + t*dv
         u0 = ox * cos_r + oy * sin_r
         du = dx * cos_r + dy * sin_r
         v0 = -ox * sin_r + oy * cos_r
         dv = -dx * sin_r + dy * cos_r
         
-        # Ellipse equation: u^2/a^2 + v^2/b^2 = 1
-        # (u0 + t*du)^2/a^2 + (v0 + t*dv)^2/b^2 = 1
-        # At^2 + Bt + C = 0
-        A = du*du/(a*a) + dv*dv/(b*b)
-        B = 2*(u0*du/(a*a) + v0*dv/(b*b))
-        C = u0*u0/(a*a) + v0*v0/(b*b) - 1
+        A = du*du/(ea*ea) + dv*dv/(eb*eb)
+        B = 2*(u0*du/(ea*ea) + v0*dv/(eb*eb))
+        C = u0*u0/(ea*ea) + v0*v0/(eb*eb) - 1
         
         disc = B*B - 4*A*C
         if disc < 0:
@@ -2721,7 +2712,6 @@ def build_perspective_transform(calibration):
         t1 = (-B + sqrt_disc) / (2*A)
         t2 = (-B - sqrt_disc) / (2*A)
         
-        # Pick the positive t (ray goes outward from board center)
         t = max(t1, t2) if min(t1, t2) < 0 else min(t1, t2)
         if t <= 0:
             t = max(t1, t2)
@@ -2730,26 +2720,29 @@ def build_perspective_transform(calibration):
         
         return [bcx + t * dx, bcy + t * dy]
     
-    # Use ALL 20 segment boundary points for better-constrained homography.
-    # Also include the board center -> (0,0) as an additional constraint.
     src_points = []
     dst_points = []
     
-    for idx in range(20):
-        px_pt = ray_board_center_to_ellipse(seg_angles[idx])
-        if px_pt is None:
+    for ring_key, norm_radius in RING_RADII.items():
+        ellipse_data = calibration.get(ring_key)
+        if not ellipse_data:
             continue
-        src_points.append(px_pt)
         
-        board_idx = (idx - seg20_idx) % 20
-        board_angle = -np.pi/2 + board_idx * (2 * np.pi / 20)
-        dst_points.append([np.cos(board_angle), np.sin(board_angle)])
+        for idx in range(20):
+            px_pt = ray_to_ellipse(seg_angles[idx], ellipse_data)
+            if px_pt is None:
+                continue
+            src_points.append(px_pt)
+            
+            board_idx = (idx - seg20_idx) % 20
+            board_angle = -np.pi/2 + board_idx * (2 * np.pi / 20)
+            dst_points.append([norm_radius * np.cos(board_angle),
+                             norm_radius * np.sin(board_angle)])
     
-    # Add board center as a constraint
     src_points.append([bcx, bcy])
     dst_points.append([0.0, 0.0])
     
-    if len(src_points) < 4:
+    if len(src_points) < 10:
         return None
     
     src = np.array(src_points, dtype=np.float32)
