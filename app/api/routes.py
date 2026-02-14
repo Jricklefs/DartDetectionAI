@@ -2730,26 +2730,32 @@ def build_perspective_transform(calibration):
         
         return [bcx + t * dx, bcy + t * dy]
     
-    # 4 points at 90° intervals: indices 0, 5, 10, 15
-    indices = [0, 5, 10, 15]
-    
+    # Use ALL 20 segment boundary points for better-constrained homography.
+    # Also include the board center -> (0,0) as an additional constraint.
     src_points = []
     dst_points = []
     
-    for idx in indices:
+    for idx in range(20):
         px_pt = ray_board_center_to_ellipse(seg_angles[idx])
         if px_pt is None:
-            return None
+            continue
         src_points.append(px_pt)
         
         board_idx = (idx - seg20_idx) % 20
         board_angle = -np.pi/2 + board_idx * (2 * np.pi / 20)
         dst_points.append([np.cos(board_angle), np.sin(board_angle)])
     
+    # Add board center as a constraint
+    src_points.append([bcx, bcy])
+    dst_points.append([0.0, 0.0])
+    
+    if len(src_points) < 4:
+        return None
+    
     src = np.array(src_points, dtype=np.float32)
     dst = np.array(dst_points, dtype=np.float32)
     
-    H = cv2.getPerspectiveTransform(src, dst)
+    H, mask = cv2.findHomography(src, dst, cv2.RANSAC, 3.0)
     return H
 
 def warp_point(H, px, py):

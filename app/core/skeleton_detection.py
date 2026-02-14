@@ -162,92 +162,131 @@ def detect_dart(
     
     # Step 7b: Line through dart shaft for line intersection triangulation.
     # Used by triangulate_with_line_intersection() to intersect lines from multiple cameras.
-    # Strategy: 
-    #   1. Try Hough line detection (finds actual straight edges = shaft)
-    #   2. Fallback: PCA on thin part of mask only (exclude flight blob)
-    #   3. Last resort: PCA on full mask
+    # Strategy:
+    #   1. Canny edge on GRAYSCALE IMAGE within mask -> find real barrel edges -> dual Hough -> average
+    #   2. Fallback: cv2.fitLine on shaft contour (robust to outliers)
+    #   3. Last resort: Full mask PCA
     pca_line = None
     if mask_pixels > 50:
         try:
-            # --- Method 1: Hough line detection ---
-            # Skeleton the mask to get 1px-wide lines, then Hough
-            skeleton = cv2.ximgproc.thinning(motion_mask) if hasattr(cv2, 'ximgproc') else None
-            if skeleton is None:
-                # Manual thinning fallback: erode until thin
-                thin = motion_mask.copy()
-                kernel = np.ones((3,3), np.uint8)
-                for _ in range(5):
-                    eroded = cv2.erode(thin, kernel)
-                    if np.count_nonzero(eroded) < 20:
-                        break
-                    thin = eroded
-                skeleton = thin
+            # Reference direction from flight->tip
+            ref_angle = None
+            if flight_centroid is not None and tip is not None:
+                rdx = tip[0] - flight_centroid[0]
+                rdy = tip[1] - flight_centroid[1]
+                ref_len = np.sqrt(rdx*rdx + rdy*rdy)
+                if ref_len > 10:
+                    ref_angle = np.arctan2(rdy, rdx)
+
+            # --- Method 1: Canny on grayscale image within dilated mask region ---
+            # The actual barrel has sharp edges in the original image.
+            # Dilate mask slightly to include edge pixels just outside mask boundary.
+            gray_for_edges = cv2.cvtColor(current_frame, cv2.COLOR_BGR2GRAY) if len(current_frame.shape) == 3 else current_frame
+            dilated_mask = cv2.dilate(motion_mask, np.ones((5,5), np.uint8), iterations=2)
+            masked_gray = cv2.bitwise_and(gray_for_edges, dilated_mask)
+            edges = cv2.Canny(masked_gray, 30, 100)
+            # Only keep edges near the mask
+            edges = cv2.bitwise_and(edges, dilated_mask)
             
-            hough_lines = cv2.HoughLinesP(skeleton, 1, np.pi/180, threshold=15,
+            hough_lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=15,
                                           minLineLength=20, maxLineGap=10)
             
-            if hough_lines is not None and len(hough_lines) > 0:
-                # Pick the longest Hough line
-                best_len = 0
-                best_line = None
+            if hough_lines is not None and len(hough_lines) > 0 and ref_angle is not None:
+                # Filter lines parallel to dart axis (within 20 deg)
+                parallel_lines = []
                 for hl in hough_lines:
                     x1h, y1h, x2h, y2h = hl[0]
-                    length = np.sqrt((x2h-x1h)**2 + (y2h-y1h)**2)
-                    if length > best_len:
-                        best_len = length
-                        best_line = hl[0]
+                    a = np.arctan2(y2h - y1h, x2h - x1h)
+                    diff_a = abs(a - ref_angle)
+                    diff_a = min(diff_a, np.pi - diff_a)
+                    if diff_a < np.radians(20):
+                        length = np.sqrt((x2h-x1h)**2 + (y2h-y1h)**2)
+                        parallel_lines.append((hl[0], length, a))
                 
-                if best_line is not None:
-                    x1h, y1h, x2h, y2h = best_line
-                    dx, dy = float(x2h - x1h), float(y2h - y1h)
+                if len(parallel_lines) >= 2:
+                    parallel_lines.sort(key=lambda x: -x[1])
+                    cos_ref = np.cos(ref_angle)
+                    sin_ref = np.sin(ref_angle)
+                    
+                    offsets = []
+                    for seg, length, a in parallel_lines:
+                        mx = (seg[0] + seg[2]) / 2.0
+                        my = (seg[1] + seg[3]) / 2.0
+                        if flight_centroid is not None:
+                            dx_f = mx - flight_centroid[0]
+                            dy_f = my - flight_centroid[1]
+                            perp = -dx_f * sin_ref + dy_f * cos_ref
+                        else:
+                            perp = 0
+                        offsets.append(perp)
+                    
+                    pos_lines = [(seg, l, a) for (seg, l, a), off in zip(parallel_lines, offsets) if off >= 0]
+                    neg_lines = [(seg, l, a) for (seg, l, a), off in zip(parallel_lines, offsets) if off < 0]
+                    
+                    if pos_lines and neg_lines:
+                        s1 = pos_lines[0][0]
+                        s2 = neg_lines[0][0]
+                        ax1 = (s1[0] + s2[0]) / 2.0
+                        ay1 = (s1[1] + s2[1]) / 2.0
+                        ax2 = (s1[2] + s2[2]) / 2.0
+                        ay2 = (s1[3] + s2[3]) / 2.0
+                        dx, dy = ax2 - ax1, ay2 - ay1
+                        norm = np.sqrt(dx*dx + dy*dy)
+                        if norm > 0:
+                            vx, vy = dx/norm, dy/norm
+                            if vy < 0:
+                                vx, vy = -vx, -vy
+                            pca_line = {
+                                'vx': vx, 'vy': vy,
+                                'x0': (ax1 + ax2) / 2.0, 'y0': (ay1 + ay2) / 2.0,
+                                'elongation': (pos_lines[0][1] + neg_lines[0][1]) / 2,
+                                'method': 'dual_edge_hough',
+                            }
+                
+                if pca_line is None and parallel_lines:
+                    seg = parallel_lines[0][0]
+                    dx, dy = float(seg[2] - seg[0]), float(seg[3] - seg[1])
                     norm = np.sqrt(dx*dx + dy*dy)
                     if norm > 0:
                         vx, vy = dx/norm, dy/norm
-                        # Ensure points toward tip (vy > 0)
                         if vy < 0:
                             vx, vy = -vx, -vy
-                        mx = (x1h + x2h) / 2.0
-                        my = (y1h + y2h) / 2.0
                         pca_line = {
                             'vx': vx, 'vy': vy,
-                            'x0': mx, 'y0': my,
-                            'elongation': best_len,
-                            'method': 'hough',
+                            'x0': (seg[0] + seg[2]) / 2.0, 'y0': (seg[1] + seg[3]) / 2.0,
+                            'elongation': parallel_lines[0][1],
+                            'method': 'edge_hough',
                         }
-            
-            # --- Method 2: Shaft-only PCA (exclude flight) ---
-            if pca_line is None and flight_centroid is not None and tip is not None:
-                ys_all, xs_all = np.nonzero(motion_mask)
-                if len(xs_all) > 20:
-                    # Flight is the widest part. Measure width at each y-level
-                    # and keep only the thinner half (shaft region)
-                    pts_all = np.column_stack([xs_all, ys_all])
-                    
-                    # Use tip and flight to define shaft region:
-                    # Keep pixels in the middle 60% between flight and tip
-                    fy, ty = flight_centroid[1], tip[1]
-                    if abs(ty - fy) > 20:
-                        y_min = min(fy, ty) + 0.2 * abs(ty - fy)
-                        y_max = max(fy, ty) - 0.2 * abs(ty - fy)
-                        shaft_mask = (ys_all >= y_min) & (ys_all <= y_max)
-                        shaft_pts = pts_all[shaft_mask]
+
+            # --- Method 2: Robust fitLine on shaft contour ---
+            if pca_line is None:
+                contours, _ = cv2.findContours(motion_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                if contours:
+                    largest_contour = max(contours, key=cv2.contourArea)
+                    if len(largest_contour) > 10:
+                        # If we have flight/tip info, filter to shaft region
+                        pts = largest_contour.reshape(-1, 2)
+                        if flight_centroid is not None and tip is not None:
+                            fy, ty = flight_centroid[1], tip[1]
+                            if abs(ty - fy) > 20:
+                                y_min = min(fy, ty) + 0.15 * abs(ty - fy)
+                                y_max = max(fy, ty) - 0.15 * abs(ty - fy)
+                                shaft_mask_r = (pts[:, 1] >= y_min) & (pts[:, 1] <= y_max)
+                                shaft_pts = pts[shaft_mask_r]
+                                if len(shaft_pts) > 10:
+                                    pts = shaft_pts
                         
-                        if len(shaft_pts) > 10:
-                            mean = shaft_pts.mean(axis=0).astype(np.float64)
-                            centered = shaft_pts.astype(np.float64) - mean
-                            cov = np.cov(centered.T)
-                            eigenvalues, eigenvectors = np.linalg.eigh(cov)
-                            pc = eigenvectors[:, np.argmax(eigenvalues)]
-                            vx, vy = float(pc[0]), float(pc[1])
-                            if vy < 0:
-                                vx, vy = -vx, -vy
-                            elongation = max(eigenvalues) / (min(eigenvalues) + 1e-6)
-                            pca_line = {
-                                'vx': vx, 'vy': vy,
-                                'x0': float(mean[0]), 'y0': float(mean[1]),
-                                'elongation': elongation,
-                                'method': 'shaft_pca',
-                            }
+                        line_params = cv2.fitLine(pts.astype(np.float32), cv2.DIST_HUBER, 0, 0.01, 0.01)
+                        vx, vy = float(line_params[0]), float(line_params[1])
+                        x0, y0 = float(line_params[2]), float(line_params[3])
+                        if vy < 0:
+                            vx, vy = -vx, -vy
+                        pca_line = {
+                            'vx': vx, 'vy': vy,
+                            'x0': x0, 'y0': y0,
+                            'elongation': len(pts),
+                            'method': 'fitline_huber',
+                        }
             
             # --- Method 3: Full mask PCA (last resort) ---
             if pca_line is None:
