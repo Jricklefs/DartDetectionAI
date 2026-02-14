@@ -87,7 +87,7 @@ def score_from_ellipse_calibration(
                 best_i = i
         segment_idx = best_i
 
-    segment_number = SEGMENT_ORDER[(segment_idx + seg20_idx) % 20]
+    segment_number = SEGMENT_ORDER[(segment_idx - seg20_idx) % 20]
 
     # --- Determine zone using ellipse radii at this angle ---
     zones = []  # (max_radius, zone_name, multiplier)

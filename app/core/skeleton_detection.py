@@ -82,16 +82,47 @@ def detect_dart(
     
     # Step 4: Find the flight blob
     flight = _find_flight_blob(motion_mask, min_area=80)
-    if flight is None:
-        return result
+    if flight is not None:
+        flight_centroid, flight_contour, flight_bbox = flight
+        
+        # Step 5: Find tip
+        tip, tip_method, dart_length = _find_tip_from_flight(
+            motion_mask, flight_centroid, flight_contour, flight_bbox,
+            high_mask=positive_mask,
+            board_center=board_center, board_radius=board_radius
+        )
+    else:
+        tip = None
+        tip_method = "none"
+        dart_length = 0.0
     
-    flight_centroid, flight_contour, flight_bbox = flight
+    # Fallback: if no flight found or tip detection failed, just use highest Y of clean mask
+    if tip is None and mask_pixels > 200:
+        from scipy import ndimage as ndi
+        clean = motion_mask.copy()
+        lbl_all, n_all = ndi.label(clean)
+        for lb in range(1, n_all + 1):
+            if np.sum(lbl_all == lb) < 100:
+                clean[lbl_all == lb] = 0
+        ys, xs = np.nonzero(clean)
+        if len(ys) == 0:
+            ys, xs = np.nonzero(motion_mask)
+        if len(ys) > 0:
+            # Filter to board radius if available
+            if board_center is not None and board_radius is not None and board_radius > 0:
+                dists = np.sqrt((xs - board_center[0])**2 + (ys - board_center[1])**2)
+                on_board = dists <= board_radius * 1.15
+                if np.any(on_board):
+                    xs, ys = xs[on_board], ys[on_board]
+            idx = np.argmax(ys)
+            tip = (float(xs[idx]), float(ys[idx]))
+            tip_method = "highest_y_fallback"
+            # Use mask centroid as fake flight for dart_length
+            fcx, fcy = np.mean(xs), np.mean(ys)
+            dart_length = np.sqrt((tip[0] - fcx)**2 + (tip[1] - fcy)**2)
+            if flight is None:
+                flight_centroid = (fcx, fcy)
     
-    # Step 5: Find tip
-    tip, tip_method, dart_length = _find_tip_from_flight(
-        motion_mask, flight_centroid, flight_contour, flight_bbox,
-        high_mask=positive_mask
-    )
     if tip is None:
         return result
     
@@ -376,26 +407,20 @@ def _find_tip_from_flight(
     flight_contour: np.ndarray,
     flight_bbox: Tuple[int, int, int, int],
     high_mask: np.ndarray = None,
+    board_center: Tuple[float, float] = None,
+    board_radius: float = None,
 ) -> Tuple[Optional[Tuple[float, float]], str, float]:
     """
-    Find the dart tip by tracing a narrow corridor from the flight downward.
-    
-    When multiple darts are on the board, the diff mask merges them.
-    We use the flight centroid (found from the strongest diff signal) and
-    trace a corridor along the shaft direction to find the tip.
-    
-    If high_mask is provided, we use it to find the TRUE new dart flight
-    (strongest diff signal = new dart, not shifted old darts).
+    Find the dart tip: highest Y pixel in the flight's connected component.
+    Cameras are above looking down, so highest Y = closest to board = tip.
     """
     fcx, fcy = flight_centroid
     h, w = mask.shape[:2]
-    
-    # If high_mask provided, re-find the flight from the strongest signal
+
+    # If high_mask provided, re-find flight from strongest positive signal
     if high_mask is not None:
         contours_h, _ = cv2.findContours(high_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if contours_h:
-            # Find the blob with lowest Y centroid (= highest on screen = flight sticking up)
-            # Among blobs that are large enough to be a flight (>50px)
             flight_candidates = []
             for c in contours_h:
                 area = cv2.contourArea(c)
@@ -406,30 +431,23 @@ def _find_tip_from_flight(
                     continue
                 cy = M["m01"] / M["m00"]
                 cx = M["m10"] / M["m00"]
-                # Shape prior: dart flights are compact blobs, not thin edges
-                # Old dart shift artifacts are thin crescents (high aspect ratio, small area)
                 x, y, bw, bh = cv2.boundingRect(c)
                 aspect = max(bw, bh) / max(1, min(bw, bh))
-                # Reject very thin shapes (aspect > 6) with small area — likely shift artifacts
                 if aspect > 6 and area < 200:
                     continue
                 flight_candidates.append((cy, cx, c, area))
-            
+
             if flight_candidates:
-                # Pick the LARGEST candidate = strongest diff signal = new dart's flight
-                # New dart is fully new, so it produces the biggest high-threshold blob
-                # Old dart shifts produce smaller edge artifacts
-                flight_candidates.sort(key=lambda x: -x[3])  # Sort by area descending
+                flight_candidates.sort(key=lambda x: -x[3])
                 best_cy, best_cx, best_contour, best_area = flight_candidates[0]
                 fcx, fcy = best_cx, best_cy
                 flight_contour = best_contour
-    
-    # Find connected components in full mask
+
+    # Find connected components
     num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask)
-    
     if num_labels <= 1:
         return None, "none", 0
-    
+
     # Find which CC contains the flight
     flight_label = labels[int(fcy), int(fcx)]
     if flight_label == 0:
@@ -441,74 +459,72 @@ def _find_tip_from_flight(
                     break
             if flight_label > 0:
                 break
-    
+
     if flight_label == 0:
         return None, "none", 0
+
+    # Tip = highest Y pixel in the mask, but filter out noise first
+    # 1. Remove tiny blobs (< 100px)
+    # 2. Remove outlier blobs far from the main dart body
+    from scipy import ndimage as ndi
+    clean_mask = mask.copy()
+    labeled_all, n_all = ndi.label(clean_mask)
     
-    # Get flight CC pixels for PCA direction
-    cc_ys, cc_xs = np.nonzero(labels == flight_label)
-    cc_size = len(cc_ys)
-    
-    # Determine shaft direction using PCA
-    vx, vy = 0.0, 1.0
-    if cc_size >= 20:
-        pts = np.column_stack((cc_xs, cc_ys)).astype(np.float32)
-        mean = pts.mean(axis=0)
-        centered = pts - mean
-        cov = np.cov(centered.T)
-        eigenvalues, eigenvectors = np.linalg.eigh(cov)
-        principal = eigenvectors[:, np.argmax(eigenvalues)]
-        vx, vy = float(principal[0]), float(principal[1])
-        if vy < 0:
-            vx, vy = -vx, -vy
-    
-    mag = np.sqrt(vx**2 + vy**2)
-    if mag > 0:
-        vx, vy = vx / mag, vy / mag
-    
-    # Trace corridor from flight centroid along shaft direction
-    corridor_half_width = 20
-    perp_x, perp_y = -vy, vx
-    
-    best_tip = None
-    best_tip_y = -1
-    max_steps = 500
-    gap_count = 0
-    max_gap = 15
-    
-    for step in range(1, max_steps):
-        cx = fcx + vx * step
-        cy = fcy + vy * step
-        
-        if cx < 0 or cx >= w or cy < 0 or cy >= h:
-            break
-        
-        found_pixel = False
-        for offset in range(-corridor_half_width, corridor_half_width + 1):
-            px = int(cx + perp_x * offset)
-            py = int(cy + perp_y * offset)
-            if 0 <= px < w and 0 <= py < h and mask[py, px] > 0:
-                found_pixel = True
-                if py > best_tip_y:
-                    best_tip_y = py
-                    best_tip = (float(px), float(py))
-        
-        if found_pixel:
-            gap_count = 0
+    # Remove tiny blobs
+    cc_sizes = []
+    for lbl in range(1, n_all + 1):
+        sz = np.sum(labeled_all == lbl)
+        if sz < 100:
+            clean_mask[labeled_all == lbl] = 0
         else:
-            gap_count += 1
-            if gap_count > max_gap:
-                break
+            cc_sizes.append((lbl, sz))
     
-    if best_tip is None:
-        tip_idx = np.argmax(cc_ys)
-        best_tip = (float(cc_xs[tip_idx]), float(cc_ys[tip_idx]))
+    # Find largest CC and remove outlier blobs far from it
+    if len(cc_sizes) > 1:
+        cc_sizes.sort(key=lambda x: -x[1])
+        main_label = cc_sizes[0][0]
+        main_ys, main_xs = np.nonzero(labeled_all == main_label)
+        main_cy, main_cx = np.mean(main_ys), np.mean(main_xs)
+        
+        # Remove blobs that are far from main AND small (noise outliers)
+        # Keep large blobs even if distant (could be barrel/shaft separated from flight)
+        main_size = cc_sizes[0][1]
+        for lbl, sz in cc_sizes[1:]:
+            blob_ys, blob_xs = np.nonzero(labeled_all == lbl)
+            blob_cy, blob_cx = np.mean(blob_ys), np.mean(blob_xs)
+            dist_to_main = np.sqrt((blob_cx - main_cx)**2 + (blob_cy - main_cy)**2)
+            # Only remove if: far away AND small (< 20% of main blob)
+            # Large blobs near the dart are likely barrel/shaft, keep them
+            if dist_to_main > 200 and sz < main_size * 0.2:
+                clean_mask[labeled_all == lbl] = 0
     
-    tip_x, tip_y = best_tip
+    all_ys, all_xs = np.nonzero(clean_mask)
+    
+    if len(all_ys) == 0:
+        # Fallback to raw mask if filtering removed everything
+        all_ys, all_xs = np.nonzero(mask)
+        if len(all_ys) == 0:
+            return None, "no_mask", 0.0
+    
+    # Filter to pixels within board radius (+ 10% margin) if we know the board
+    # This prevents grabbing off-board noise as the "tip"
+    if board_center is not None and board_radius is not None and board_radius > 0:
+        dists = np.sqrt((all_xs - board_center[0])**2 + (all_ys - board_center[1])**2)
+        on_board = dists <= board_radius * 1.15  # 15% margin for edge darts
+        if np.any(on_board):
+            all_xs = all_xs[on_board]
+            all_ys = all_ys[on_board]
+    
+    # Highest Y across all surviving pixels = tip
+    tip_idx = np.argmax(all_ys)
+    tip_x = float(all_xs[tip_idx])
+    tip_y = float(all_ys[tip_idx])
+    
     dart_length = np.sqrt((tip_x - fcx)**2 + (tip_y - fcy)**2)
-    method = "corridor"
     
-    return (tip_x, tip_y), method, dart_length
+    return (tip_x, tip_y), "highest_y_clean_mask", dart_length
+
+
 
 
 def _taper_profile_fallback(

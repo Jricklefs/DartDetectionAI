@@ -4263,8 +4263,15 @@ async def replay_single_dart(request: ReplayRequest):
                     except Exception as e:
                         logger.warning(f"[BENCHMARK] Failed to compute prev masks: {e}")
 
+                    # Get board_radius from outer_double_ellipse
+                    replay_board_radius = None
+                    ode = cal.get('outer_double_ellipse')
+                    if ode and len(ode) >= 2:
+                        replay_board_radius = max(ode[1][0], ode[1][1]) / 2
+                    
                     result = detect_dart_skeleton(img, baseline, center=center,
                         existing_dart_locations=existing_locations,
+                        board_radius=replay_board_radius,
                         debug=request.debug, debug_name=debug_name,
                         prev_dart_masks=prev_masks_for_replay if prev_masks_for_replay else None)
                 
