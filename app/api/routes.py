@@ -81,7 +81,7 @@ except Exception as e:
     print(f"[STARTUP] Polygon calibrations not available: {e}")
 
 # Scoring mode: 'polygon' (weighted vote) or 'line_intersection' (triangulation)
-_scoring_mode = "line_intersection"
+_scoring_mode = "vote"
 
 def get_scoring_mode():
     return _scoring_mode
@@ -522,8 +522,34 @@ def find_recent_dart_on_disk(dart_number: int, game_id: str = None) -> str:
         return None
 
 
-# === Mask Cache for Differential Detection ===
-# Like Machine Darts: 0=background, 76=new dart, 152=old dart
+# =============================================================================
+# MASK CACHE SYSTEM — Differential Detection State Management
+# =============================================================================
+#
+# This is the core state machine for tracking darts between throws.
+# Inspired by Machine Darts' 3-value mask approach:
+#
+#   0   (MASK_BG)  = Background — no dart here
+#   76  (MASK_NEW) = New dart — just landed, not yet confirmed
+#   152 (MASK_OLD) = Old dart — confirmed from a previous throw
+#
+# LIFECYCLE:
+#   1. Board clear → init_board_cache(): stores baseline images, creates empty masks
+#   2. Dart 1 lands → detect_tips(): motion detected vs baseline, tips found, mask=76
+#   3. Dart 1 confirmed → promote_new_to_old(): mask 76→152
+#   4. Dart 2 lands → update_masks_with_diff(): new motion pixels=76, dart 1 stays=152
+#   5. Tips filtered to NEW region only (76), so old dart tips are ignored
+#   6. Repeat for dart 3
+#
+# The cache also stores:
+#   - baseline images (empty board reference)
+#   - per-camera dart tip locations (for distance-based duplicate rejection)
+#   - source-of-truth positions (confirmed mm coords for elimination matching)
+#   - previous dart detection masks (for mask subtraction in skeleton detection)
+#
+# Thread-safe: all access protected by _cache_lock (threading.Lock)
+# TTL: entries expire after 5 minutes to prevent stale state
+# =============================================================================
 MASK_NEW = 76
 MASK_OLD = 152
 MASK_BG = 0
@@ -561,7 +587,13 @@ def set_last_raw_images(board_id: str, images: Dict[str, np.ndarray]):
     with _cache_lock:
         _last_raw_images[board_id] = {k: v.copy() for k, v in images.items()}
 def store_dart_mask(board_id: str, cam_id: str, mask: np.ndarray):
-    """Store a dart's detection mask for future subtraction."""
+    """
+    Store a dart's detection mask for future subtraction.
+    
+    After dart N is confirmed, its motion mask is stored here. When dart N+1
+    is detected, skeleton_detection subtracts all previous masks so only the
+    NEW dart's pixels remain. This is how we handle the "dart shift" problem.
+    """
     with _cache_lock:
         cache = _mask_cache.get(board_id)
         if cache and "prev_dart_masks" in cache:
@@ -590,7 +622,14 @@ def _cleanup_old_cache():
             logger.info(f"Cache expired for board {bid}")
 
 def init_board_cache(board_id: str, baseline_images: Dict[str, np.ndarray]):
-    """Initialize cache with baseline (empty board) images."""
+    """
+    Initialize cache with baseline (empty board) images.
+    
+    Called when dart 1 arrives (before any darts are on the board).
+    The current images become the baseline — all future darts are detected
+    as differences from this reference. Also initializes empty masks,
+    dart location lists, and source-of-truth storage.
+    """
     with _cache_lock:
         masks = {}
         dart_locations = {}
@@ -816,14 +855,21 @@ def find_new_tip_by_elimination_mm(tips: List[dict], board_id: str, cam_id: str,
     """
     Find the new dart tip by eliminating known dart locations using MM COORDINATES.
     
-    Uses PER-CAMERA matching: compares this camera's tips against this camera's
-    historical dart positions, since mm coords aren't perfectly calibrated across cameras.
+    When skeleton detection finds multiple tips (e.g., it sees dart 1 AND dart 2),
+    we need to figure out which one is NEW. We compare each tip's mm position against
+    previously confirmed dart positions. Tips that match a known dart (within 20mm)
+    are eliminated; what's left is the new dart.
+    
+    IMPORTANT: Uses PER-CAMERA matching — compares this camera's tips against THIS
+    camera's stored history. Each camera has its own mm calibration with slight errors,
+    so cam0's (50, -30)mm might be cam1's (48, -32)mm for the same physical point.
+    Matching across cameras would fail due to these calibration offsets.
     
     Args:
         tips: List of tips, each must have 'x_mm' and 'y_mm' set
         board_id: Board ID for cache lookup
         cam_id: Camera ID to match against (uses that camera's stored history)
-        match_threshold_mm: Distance in mm to consider a match (default 20mm)
+        match_threshold_mm: Distance in mm to consider a match (default 20mm ≈ width of a segment)
     
     Returns the new tip, or None if can't determine.
     """
@@ -1516,7 +1562,38 @@ async def detect_tips(
     api_key: str = Depends(verify_api_key)
 ):
     """
-    Detect dart tips in images with mask-based differential detection.
+    Main detection endpoint — the heart of the DartDetect pipeline.
+    
+    Called by DartGame API whenever a dart lands. Receives images from all cameras,
+    runs the full detection + scoring pipeline, returns the dart's score.
+    
+    === REQUEST PROCESSING PIPELINE ===
+    
+    1. IMAGE DECODE: Base64 → numpy arrays for each camera
+    2. MASK MANAGEMENT:
+       - Dart 1: Initialize baseline (empty board), create fresh masks
+       - Dart 2+: Compute diff vs baseline, mark NEW pixels (76) in mask
+    3. PER-CAMERA DETECTION (skeleton_detection.py):
+       - Motion mask (current - previous frame)
+       - Subtract previous dart masks (isolate only the new dart)
+       - Shape filter (reject non-dart blobs)
+       - Find tip (highest Y pixel = closest to board)
+       - Compute PCA line through dart shaft
+    4. MM ELIMINATION:
+       - Convert all tips to mm coordinates using calibration
+       - For dart 2+: eliminate tips that match previously confirmed dart positions
+       - This handles the case where skeleton detection finds old darts too
+    5. MASK FILTERING:
+       - Filter tips to only those inside the NEW mask region (76)
+       - Tips outside NEW region are likely old darts or noise
+    6. LINE INTERSECTION TRIANGULATION:
+       - Warp PCA lines from all cameras into common board space
+       - Intersect lines to triangulate true dart position
+       - Vote on segment using intersection hierarchy
+    7. WEIGHTED VOTING (fallback):
+       - If triangulation unavailable, use weighted per-camera voting
+       - Weight by cal quality, view quality, mask quality, boundary distance
+    8. RESULT: Return scored dart with segment, multiplier, confidence
     
     Like Machine Darts: maintains 3-value mask (0=bg, 76=new, 152=old).
     Dart 1: Init baseline, detect tips, mark as NEW, then promote to OLD.
@@ -2656,11 +2733,25 @@ def line_intersection_2d(line1, line2):
 
 def build_perspective_transform(calibration):
     """
-    Build perspective transform using multi-ring homography.
+    Build perspective transform using multi-ring homography with RANSAC.
     
-    Uses all available ellipse rings (outer_double, inner_double, outer_triple,
-    inner_triple) x 20 segment boundaries = up to 80 control points, plus
-    the board center. More constraints = more accurate transform.
+    Maps pixel coordinates → normalized board space (unit circle where outer double = 1.0).
+    Used by triangulate_with_line_intersection() to warp PCA lines into a common
+    coordinate system where lines from different cameras can be intersected.
+    
+    === APPROACH ===
+    For each ring ellipse (outer_double, inner_double, outer_triple, inner_triple),
+    shoot 20 rays from BOARD CENTER at each segment boundary angle, find where each
+    ray hits the ellipse → that's a pixel-space control point. Map it to the
+    corresponding point in normalized board space (angle + normalized radius).
+    
+    Up to 80 control points + board center = 81 constraints for findHomography().
+    More points = better RANSAC fit = more robust to calibration noise.
+    
+    === NORMALIZED BOARD SPACE ===
+    Origin = board center. Outer double ring = radius 1.0.
+    Other rings are proportional: triple inner ≈ 0.58, triple outer ≈ 0.63, etc.
+    Segment 20 is at the top (-90°), going clockwise.
     """
     import numpy as np
     import cv2
@@ -2672,8 +2763,13 @@ def build_perspective_transform(calibration):
     if len(seg_angles) < 20:
         return None
     
+    # Board center in pixel space — this is where we shoot rays FROM.
     bcx, bcy = float(center[0]), float(center[1])
     
+    # Normalized radii for each ring (outer double = 1.0, others proportional to real mm)
+    # These come from standard dartboard measurements:
+    #   outer_double = 170mm, inner_double = 162mm → 162/170 = 0.9529
+    #   outer_triple = 107mm, inner_triple = 99mm  → 99/170 = 0.5824, 107/170 = 0.6294
     RING_RADII = {
         'outer_double_ellipse':  1.0000,
         'inner_double_ellipse':  0.9529,
@@ -2682,46 +2778,71 @@ def build_perspective_transform(calibration):
     }
     
     def ray_to_ellipse(angle, ellipse_data):
-        ecx, ecy = ellipse_data[0]
-        width, height = ellipse_data[1]
-        angle_deg = ellipse_data[2]
-        ea = width / 2
-        eb = height / 2
+        """
+        Shoot a ray from BOARD CENTER at the given angle, find where it hits the ellipse.
+        
+        CRITICAL: Ray origin is the BOARD CENTER (bcx, bcy), NOT the ellipse center.
+        These differ by ~60px due to camera perspective angle! The board center is
+        where the wires physically converge. The ellipse center is the geometric center
+        of the fitted ellipse, which shifts due to foreshortening.
+        
+        Using the ellipse center would produce wrong intersection points because the
+        segment boundary angles (from calibration) are measured from the board center.
+        
+        Math: parametric ray P = (bcx, bcy) + t*(cos(angle), sin(angle))
+        Transform to ellipse-local coords, solve quadratic for t, pick the positive root.
+        """
+        # Ellipse parameters (OpenCV RotatedRect format)
+        ecx, ecy = ellipse_data[0]       # Ellipse center (NOT board center!)
+        width, height = ellipse_data[1]   # Full width/height of ellipse
+        angle_deg = ellipse_data[2]       # Rotation angle in degrees
+        ea = width / 2                     # Semi-major axis
+        eb = height / 2                    # Semi-minor axis
         rot = np.radians(angle_deg)
         cos_r, sin_r = np.cos(rot), np.sin(rot)
         
+        # Ray direction from the given angle
         dx = np.cos(angle)
         dy = np.sin(angle)
+        # Offset: ray origin (board center) relative to ellipse center
         ox = bcx - ecx
         oy = bcy - ecy
         
-        u0 = ox * cos_r + oy * sin_r
-        du = dx * cos_r + dy * sin_r
-        v0 = -ox * sin_r + oy * cos_r
-        dv = -dx * sin_r + dy * cos_r
+        # Transform ray into ellipse-local (rotated, axis-aligned) coordinates
+        # u,v are coordinates along the ellipse's own axes
+        u0 = ox * cos_r + oy * sin_r      # Starting u (origin offset in ellipse frame)
+        du = dx * cos_r + dy * sin_r      # Direction u component
+        v0 = -ox * sin_r + oy * cos_r     # Starting v
+        dv = -dx * sin_r + dy * cos_r     # Direction v component
         
+        # Solve: (u0 + t*du)²/a² + (v0 + t*dv)²/b² = 1
+        # This is a standard quadratic At² + Bt + C = 0
         A = du*du/(ea*ea) + dv*dv/(eb*eb)
         B = 2*(u0*du/(ea*ea) + v0*dv/(eb*eb))
         C = u0*u0/(ea*ea) + v0*v0/(eb*eb) - 1
         
         disc = B*B - 4*A*C
         if disc < 0:
-            return None
+            return None  # Ray misses ellipse entirely
         
         sqrt_disc = np.sqrt(disc)
         t1 = (-B + sqrt_disc) / (2*A)
         t2 = (-B - sqrt_disc) / (2*A)
         
+        # Pick the smallest POSITIVE t (first intersection in ray direction)
+        # If board center is inside the ellipse (usual case), one t is negative
         t = max(t1, t2) if min(t1, t2) < 0 else min(t1, t2)
         if t <= 0:
             t = max(t1, t2)
         if t <= 0:
             return None
         
+        # Convert back to pixel coordinates
         return [bcx + t * dx, bcy + t * dy]
     
-    src_points = []
-    dst_points = []
+    # === Build control point pairs: pixel space (src) → normalized board space (dst) ===
+    src_points = []  # Pixel coordinates (where ray hits ellipse)
+    dst_points = []  # Normalized board coordinates (angle + radius)
     
     for ring_key, norm_radius in RING_RADII.items():
         ellipse_data = calibration.get(ring_key)
@@ -2729,25 +2850,32 @@ def build_perspective_transform(calibration):
             continue
         
         for idx in range(20):
+            # Shoot ray from board center at this segment boundary angle
             px_pt = ray_to_ellipse(seg_angles[idx], ellipse_data)
             if px_pt is None:
                 continue
             src_points.append(px_pt)
             
+            # Map to normalized board space:
+            # board_idx accounts for rotation alignment (seg20_idx)
+            # board_angle places segment 20 at top (-π/2), going clockwise
             board_idx = (idx - seg20_idx) % 20
             board_angle = -np.pi/2 + board_idx * (2 * np.pi / 20)
             dst_points.append([norm_radius * np.cos(board_angle),
                              norm_radius * np.sin(board_angle)])
     
+    # Add board center as an anchor point (maps to origin)
     src_points.append([bcx, bcy])
     dst_points.append([0.0, 0.0])
     
     if len(src_points) < 10:
-        return None
+        return None  # Not enough control points for reliable homography
     
     src = np.array(src_points, dtype=np.float32)
     dst = np.array(dst_points, dtype=np.float32)
     
+    # RANSAC homography: robust to outlier control points from noisy calibration
+    # Reprojection threshold = 3.0 pixels
     H, mask = cv2.findHomography(src, dst, cv2.RANSAC, 3.0)
     return H
 
@@ -2784,11 +2912,39 @@ def triangulate_with_line_intersection(camera_results, calibrations):
     """
     Autodarts-style line intersection triangulation.
     
-    1. Build perspective transform per camera from calibration
-    2. Warp each camera's PCA line into normalized board space
-    3. Intersect all camera pairs in normalized space
-    4. Warp best intersection point BACK to pixel space
-    5. Score using proven ellipse scoring (not normalized coords)
+    This is the PRIMARY scoring method. Each camera detects a dart and fits a PCA line
+    along its shaft. By warping these lines into a common coordinate system and finding
+    where they intersect, we triangulate the dart's true position — even when individual
+    cameras can't see the tip clearly.
+    
+    === PIPELINE ===
+    
+    Step 1: BUILD PERSPECTIVE TRANSFORMS
+      For each camera, build a homography (pixel → normalized board space) using
+      build_perspective_transform(). Warp the camera's PCA line endpoints into
+      normalized space. Also score each camera's tip individually with ellipse scoring.
+    
+    Step 2: PAIRWISE INTERSECTIONS
+      For every pair of cameras (3 cameras → 3 pairs), intersect their warped lines
+      in normalized board space. Compute error as the sum of distances from each
+      camera's warped tip to the intersection point. Warp the intersection back to
+      PIXEL space and score with ellipse scoring (more accurate than scoring in
+      normalized space because ellipses capture the actual ring curvature).
+    
+    Step 3: PICK BEST INTERSECTION — Voting Hierarchy
+      Priority order (highest to lowest confidence):
+    
+      UnanimousCam (conf=1.0): All intersections agree on the same segment.
+        → Pick the one with lowest error. Very high confidence.
+    
+      Cam+1 (conf=0.8): Majority of intersections agree (≥2 of 3).
+        → Pick the majority segment with lowest error.
+    
+      CamVote (conf=0.7): Intersections disagree, but per-camera ellipse votes
+        show a majority. Use that segment if any intersection matches it.
+    
+      BestError (conf=0.5): No consensus at all. Just pick lowest-error intersection.
+        → Least confident — likely an edge case or bad detection.
     
     Args:
         camera_results: dict of cam_id -> detection result (must have 'pca_line' and 'tip')
@@ -2804,7 +2960,12 @@ def triangulate_with_line_intersection(camera_results, calibrations):
     
     from app.core.ellipse_scoring import score_from_ellipse_calibration
     
-    # Step 1: Build perspective transforms and warp lines
+    # =================================================================
+    # STEP 1: Build perspective transforms, warp PCA lines to normalized space
+    # =================================================================
+    # For each camera that has a PCA line (from skeleton detection) and a tip,
+    # compute the homography, warp two points along the PCA line into normalized
+    # space, and also score the tip with ellipse scoring for per-camera voting.
     cam_lines = {}
     
     for cam_id, result in camera_results.items():
@@ -2867,7 +3028,13 @@ def triangulate_with_line_intersection(camera_results, calibrations):
         logger.warning("[LINE_INTERSECT] Need at least 2 cameras with PCA lines")
         return None
     
-    # Step 2: Compute all pairwise intersections
+    # =================================================================
+    # STEP 2: Compute all pairwise intersections in normalized space
+    # =================================================================
+    # With 3 cameras we get 3 pairs: (cam0,cam1), (cam0,cam2), (cam1,cam2).
+    # Each pair's lines should intersect near the dart tip position.
+    # Error = how far each camera's warped tip is from the intersection.
+    # Low error = lines agree well. High error = something's off (bad mask, occlusion).
     cam_ids = sorted(cam_lines.keys())
     intersections = []
     
@@ -2935,9 +3102,11 @@ def triangulate_with_line_intersection(camera_results, calibrations):
         logger.warning("[LINE_INTERSECT] No valid intersections found")
         return None
     
-    # Step 3: Pick the best intersection
-    # Strategy: prefer intersections from reliable camera pairs (both tips on-board),
-    # then majority vote, then lowest error.
+    # =================================================================
+    # STEP 3: Pick the best intersection using voting hierarchy
+    # =================================================================
+    # Filter to "reliable" intersections first (both cameras have on-board tips).
+    # Then apply the voting hierarchy: Unanimous > Majority > CamVote > BestError.
     from collections import Counter
     
     # Separate reliable vs unreliable intersections
@@ -3145,9 +3314,23 @@ def vote_with_line_intersection(tips_with_lines: List[dict], calibration_data: d
 
 
 
-# ============================================================================
-# Homography Transform for Line Intersection (Autodarts-style)
-# ============================================================================
+# =============================================================================
+# HOMOGRAPHY TRANSFORM — Pixel ↔ MM Coordinate Mapping
+# =============================================================================
+#
+# Maps between pixel coordinates (what the camera sees) and physical dartboard
+# coordinates (mm from center). Used for:
+#   1. Line intersection in mm space (vote_with_line_intersection_mm)
+#   2. Cross-camera coordinate comparison
+#   3. Debug visualization on dartboard diagrams
+#
+# The homography is computed from 20 polygon calibration points (double_outers)
+# that sit on the outer double ring at known mm positions (170mm radius).
+# cv2.findHomography with RANSAC gives a 3x3 perspective transform matrix.
+#
+# CRITICAL: seg20_idx alignment must be correct or the entire board is rotated.
+# Empirically verified values: cam0=12, cam1=0, cam2=7
+# =============================================================================
 
 # Standard dartboard measurements (mm from center)
 DARTBOARD_MM = {
@@ -3244,12 +3427,30 @@ def init_homographies():
 
 def compute_homography_for_camera(camera_id: str, polygon_calibration, seg20_idx=None) -> bool:
     """
-    Compute homography matrix from polygon calibration points.
+    Compute homography matrix from 20-point polygon calibration.
     
-    Uses the 20 double_outers points (pixel positions on double ring)
-    mapped to standard dartboard mm coordinates.
+    Maps pixel coordinates → mm coordinates on the dartboard using the 20
+    double_outers points (pixel positions where wires cross the double ring)
+    mapped to their known positions in standard dartboard mm coordinates.
     
-    seg20_idx: which polygon point index corresponds to segment 20 (from YOLO calibration)
+    === ROTATION ALIGNMENT (seg20_idx) ===
+    The polygon calibration gives us 20 points around the double ring, but we
+    need to know WHICH point corresponds to WHICH segment. seg20_idx tells us
+    which polygon point index is at the segment 20 boundary.
+    
+    Example: cam0 has seg20_idx=12, meaning polygon_calibration.double_outers[12]
+    corresponds to the 20/1 boundary on the physical board.
+    
+    We rotate the standard mm destination points so that standard_pts[0] (the 20/1
+    boundary in mm space) aligns with polygon point[seg20_idx] in pixel space.
+    
+    These indices were empirically verified against benchmark corrections.
+    Getting this wrong rotates the entire scoring by N segments (catastrophic).
+    
+    Args:
+        camera_id: Camera identifier (e.g., "cam0")
+        polygon_calibration: Object with .double_outers (20 pixel points) and .bull
+        seg20_idx: Which polygon point index = segment 20 boundary (from YOLO cal)
     
     Returns True if successful, False otherwise.
     """
@@ -3267,24 +3468,20 @@ def compute_homography_for_camera(camera_id: str, polygon_calibration, seg20_idx
         import cv2
         import numpy as np
         
-        # Source points: pixel coordinates from calibration
+        # Source points: 20 pixel coordinates on the double ring from YOLO polygon calibration
         src_points = np.array(polygon_calibration.double_outers, dtype=np.float32)
         bull = polygon_calibration.bull
         
-        # Find correct alignment by testing all 20 rotations.
-        # For each, compute homography, then verify a KNOWN point maps correctly.
-        # We use segment 20 center: should be near (0, -radius)mm (top of board).
-        # DIRECT MAPPING using seg20_idx
-        # polygon point[seg20_idx] = segment 20 on the board
-        # standard_pts[0] = segment 20 position in mm
-        # Rotate so point[seg20_idx] maps to standard_pts[0]
-        
+        # Destination points: 20 standard mm coordinates for the double ring boundaries
+        # These are fixed (known from dartboard geometry: 170mm radius, 18° spacing)
         standard_pts = get_standard_board_boundary_points()
         
+        # Rotate destination points so polygon point[seg20_idx] → standard_pts[0] (= S20 boundary)
+        # This alignment is critical: wrong seg20_idx = entire board rotated = all scores wrong
         if seg20_idx is not None:
             rotated_dst = standard_pts[-seg20_idx:] + standard_pts[:-seg20_idx] if seg20_idx > 0 else standard_pts[:]
         else:
-            # Fallback: no seg20 info
+            # Fallback: no seg20 info — assumes polygon[0] = standard[0] (usually wrong!)
             rotated_dst = standard_pts[:]
         
         dst_points = np.array(rotated_dst, dtype=np.float32)
@@ -3477,9 +3674,21 @@ def vote_with_line_intersection_mm(tips_with_lines: List[dict]) -> dict:
     """
     Line intersection voting in mm space (Autodarts-style).
     
-    1. Transform each camera's line from pixels to mm using homography
-    2. Intersect lines in mm space
-    3. Return intersection point in mm
+    Similar to triangulate_with_line_intersection() but works in mm coordinates
+    instead of normalized board space. Uses the polygon-based homography
+    (compute_homography_for_camera) rather than the ellipse-based one
+    (build_perspective_transform).
+    
+    Pipeline:
+      1. Transform each camera's PCA line from pixel space → mm using cached homography
+      2. Find pairwise intersections of all camera lines in mm space
+      3. Weighted average of intersection points (weighted by camera confidence)
+      4. Check spread: if intersections disagree by >50mm, reject (lines are unreliable)
+      5. Return averaged (x_mm, y_mm) for scoring with score_from_mm_position()
+    
+    This is used as an alternative to the normalized-space triangulation.
+    The mm-space approach is more intuitive for debugging (you can measure real distances)
+    but requires accurate polygon calibration with correct seg20_idx alignment.
     """
     # Debug: force re-init homographies if cache empty
     global _homography_initialized, _homography_cache
@@ -3656,14 +3865,47 @@ def score_from_mm_position(x_mm: float, y_mm: float) -> dict:
 
 def vote_on_scores(clusters: List[List[dict]]) -> List[DetectedTip]:
     """
-    For each cluster (same dart seen by multiple cameras), vote on the score.
+    Weighted voting system: given the same dart seen by multiple cameras, decide the score.
     
-    ENHANCED VOTING (Feb 2026):
-    - Tips found IN the NEW mask region get full weight
-    - Tips found via centroid fallback get 0.1x weight
-    - Darts near wire boundaries (<2°) get "low_confidence" flag
-    - Camera disagreement is detected and logged
-    - Exponential boundary weighting (more aggressive near wires)
+    Each camera independently detects the tip and scores it. When cameras disagree
+    (which happens near wire boundaries), we use weighted voting to pick the winner.
+    
+    === WEIGHT FACTORS (multiplicative) ===
+    
+    1. Base weight = YOLO confidence (0-1)
+    
+    2. Calibration quality (cal_quality: 0-1 → 0.5x-1.5x)
+       Higher YOLO ring detection quality = more trusted camera.
+    
+    3. View quality (view_quality: 0-1 → 0.5x-1.5x)
+       Cameras seeing the dart from the side (elongated) give better tips than
+       cameras looking straight down at the flight. Based on dart_length in pixels.
+    
+    4. Mask quality (mask_quality: 0-1 → direct multiplier)
+       Clean single-dart mask = 1.0. Merged/oversized masks = lower.
+       Detects when multiple darts bleed together in the motion mask.
+    
+    5. NEW region bonus (found_in_new_region: bool)
+       Tips found IN the differential mask's NEW region get full weight.
+       Tips found via centroid fallback (outside NEW region) get 0.1x weight.
+       This is the strongest filter — NEW region = the tip IS where the new dart landed.
+    
+    6. Boundary distance (boundary_distance_deg: 0-9°)
+       Exponential penalty near wire boundaries:
+         0° (on wire) = 0.1x, 2° = 0.3x, 4° = 0.7x, 9° (center) = 1.5x
+       Darts near wires could be in either adjacent segment — low trust.
+    
+    === OVERRIDE MECHANISMS ===
+    
+    Majority Override: If 2+ cameras agree on the same segment, that segment wins
+    regardless of boundary weighting. Prevents a single camera with a favorable
+    boundary distance from overriding a 2-camera consensus.
+    
+    Polar Averaging: When the vote is close (2nd place ≥ 70% of 1st place weight),
+    compute weighted average of all tips in polar coordinates (angle, normalized distance).
+    Score the averaged position. If it differs from the vote winner and isn't on a wire,
+    use the averaged result. This handles cases where cameras are split between adjacent
+    segments but the true position is clear when averaged.
     """
     detected_tips = []
     
@@ -3722,6 +3964,11 @@ def vote_on_scores(clusters: List[List[dict]]) -> List[DetectedTip]:
         for tip in cluster:
             key = (tip['segment'], tip['multiplier'])
             cam_id = tip.get('camera_id', 'unknown')
+            
+            # === WEIGHT CALCULATION ===
+            # All factors multiply together. Final weight determines this camera's
+            # influence on the vote. A camera with great calibration, clear view,
+            # clean mask, and tip far from wires gets ~2-3x weight vs a poor one.
             
             # Base weight is YOLO confidence
             weight = tip['confidence']

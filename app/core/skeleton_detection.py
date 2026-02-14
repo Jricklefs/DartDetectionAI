@@ -6,6 +6,44 @@ Additions:
 - Shape filtering: darts are elongated. Reject blobs that aren't dart-shaped.
 - Previous dart pixel subtraction
 - LAB + CLAHE only in the motion mask (not two-pass)
+
+=== DETECTION PIPELINE OVERVIEW ===
+
+This module finds the TIP of a newly-thrown dart by comparing the current camera
+frame against the previous frame (differential detection). It returns the tip
+position, a PCA line through the dart shaft (for line-intersection triangulation),
+and quality metrics used by the voting system.
+
+Pipeline steps:
+  1. Motion mask: absdiff(current, previous) → hysteresis threshold → morphological cleanup
+  2. Previous dart subtraction: subtract masks from darts 1/2 so only the NEW dart remains
+  3. Shape filter: reject non-elongated blobs (shadows, noise = "dart herpes")
+  4. Flight detection: find the largest bright blob (the flight feathers)
+  5. Tip detection: highest Y pixel in cleaned mask (cameras are above, so highest Y = tip)
+  6. Line projection: if dart is partially occluded, project PCA line forward to estimate tip
+  7. Sub-pixel refinement: snap tip to nearest Canny edge for sub-pixel accuracy
+  8. PCA line computation: fit a line through the dart shaft for line-intersection voting
+     - Method 1: Dual Hough lines on Canny edges (barrel edges), averaged → best accuracy
+     - Method 2: cv2.fitLine with Huber loss on shaft contour (robust to outliers)
+     - Method 3: Full-mask PCA (last resort, least accurate)
+
+=== KEY DESIGN DECISIONS ===
+
+- TIP = HIGHEST Y: Cameras are mounted above the board looking down. The tip is the
+  point closest to the board surface = lowest in 3D = highest Y in the image.
+
+- HYSTERESIS THRESHOLDING: The flight feathers produce strong motion signal, but the
+  thin metal shaft is faint. We use a high threshold to find confident "seed" pixels
+  (mostly flight), then grow into connected low-threshold pixels to capture the shaft.
+
+- SHAPE FILTER: Shadows, reflections, and lighting changes create blobby motion artifacts.
+  Real darts are elongated (aspect ratio ≥ 2.0). Rejecting round blobs eliminates most
+  false positives without losing any real darts.
+
+- PREVIOUS DART SUBTRACTION: When dart 2 lands, the motion mask shows BOTH darts
+  (current - baseline has dart 1 + dart 2). We subtract dart 1's stored detection mask
+  so only dart 2's pixels remain. This also handles "dart shift" — when a new dart
+  impacts, old darts physically move slightly, creating spurious motion.
 """
 
 import cv2

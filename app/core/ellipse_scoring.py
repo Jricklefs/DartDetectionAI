@@ -1,6 +1,37 @@
 """
 Ellipse-based dart scoring using YOLO ring calibration data.
 Replaces polygon scoring with accurate curved ring boundaries.
+
+=== HOW IT WORKS ===
+Each dartboard ring (bullseye, bull, triple, double) is detected by YOLO as an
+ellipse in the camera image. Due to camera perspective, these aren't perfect circles
+— they're ellipses with varying eccentricity depending on camera angle.
+
+Given a dart tip at pixel (x, y), we:
+1. Compute the angle from board center to the tip
+2. At that angle, compute the radius of each ring's ellipse (using polar ellipse formula)
+3. Compare the tip's distance from center against each ring radius
+4. The first ring whose radius exceeds the tip's distance = the zone the dart is in
+
+This is more accurate than polygon scoring because ellipses follow the actual
+curved ring boundaries instead of approximating with straight line segments.
+
+=== DARTBOARD ZONE LAYOUT (cross-section from center outward) ===
+
+    |<-Bullseye->|<--Bull-->|<---Single Inner--->|<-Triple->|<--Single Outer-->|<-Double->|  MISS
+    |    D50     |   S25    |        Sx1         |   Sx3    |       Sx1        |   Sx2    |
+    0           6.35      15.9                  99  107    162   170
+                                              (mm from center)
+
+    In pixel space, each boundary is an ellipse (not a circle) because the
+    camera views the board at an angle.
+
+=== SEGMENT LAYOUT ===
+20 segments of 18° each, ordered clockwise starting from the top:
+20, 1, 18, 4, 13, 6, 10, 15, 2, 17, 3, 19, 7, 16, 8, 11, 14, 9, 12, 5
+
+segment_angles[] from calibration = 20 boundary angles between segments.
+seg20_idx = which boundary index corresponds to segment 20's starting edge.
 """
 import numpy as np
 from typing import Dict, Any, Tuple, Optional, List
@@ -11,9 +42,16 @@ SEGMENT_ORDER = [20, 1, 18, 4, 13, 6, 10, 15, 2, 17, 3, 19, 7, 16, 8, 11, 14, 9,
 def ellipse_radius_at_angle(ellipse: list, angle_rad: float) -> float:
     """
     Calculate the radius of an ellipse at a given angle from its center.
-    ellipse: [[cx, cy], [width, height], rotation_deg]  (OpenCV format)
-    angle_rad: angle from center in image coordinates
-    Returns: distance from ellipse center to edge at that angle.
+    
+    Uses the polar form of an ellipse: r = ab / sqrt((b·cos(θ))² + (a·sin(θ))²)
+    where θ is the angle relative to the ellipse's own rotated axes (not image axes).
+    
+    Args:
+        ellipse: [[cx, cy], [width, height], rotation_deg] — OpenCV RotatedRect format
+        angle_rad: angle from center in image coordinates (atan2 convention)
+    
+    Returns:
+        Distance from ellipse center to edge at that angle (in pixels).
     """
     (cx, cy), (w, h), rot_deg = ellipse[0], ellipse[1], ellipse[2]
     a = w / 2.0  # semi-major
@@ -56,7 +94,10 @@ def score_from_ellipse_calibration(
     angle = np.arctan2(dy, dx)  # radians, same coordinate system as segment_angles
 
     # --- Determine segment ---
-    # segment_angles are boundaries; segment i is between boundary i and boundary (i+1)
+    # segment_angles[] contains 20 boundary angles (radians) from calibration.
+    # Segment i occupies the angular wedge between boundary[i] and boundary[(i+1) % 20].
+    # seg20_idx tells us which boundary index is the start of segment 20,
+    # so we can map from boundary index to the actual segment number using SEGMENT_ORDER.
     segment_idx = None
     for i in range(20):
         a1 = segment_angles[i]
@@ -90,7 +131,10 @@ def score_from_ellipse_calibration(
     segment_number = SEGMENT_ORDER[(segment_idx - seg20_idx) % 20]
 
     # --- Determine zone using ellipse radii at this angle ---
-    zones = []  # (max_radius, zone_name, multiplier)
+    # For each ring ellipse, compute its radius at the tip's angle.
+    # Build a sorted list of (radius, zone_name, multiplier, score) from inside out.
+    # The tip falls in the first zone whose radius exceeds the tip's distance from center.
+    zones = []  # (max_radius, zone_name, multiplier, score_value)
 
     # Build zone boundaries from inside out
     bullseye_ell = calibration.get("bullseye_ellipse")
@@ -134,7 +178,9 @@ def score_from_ellipse_calibration(
             score = mult * seg_score
             break
 
-    # Confidence: higher when further from zone boundary
+    # Confidence: higher when the tip is further from a zone boundary (wire).
+    # Darts right on a wire could go either way, so confidence is low.
+    # Darts clearly in the middle of a zone get high confidence.
     confidence = 0.8  # default
     for i, (max_r, zname, mult, seg_score) in enumerate(zones):
         if dist <= max_r:
