@@ -81,7 +81,7 @@ except Exception as e:
     print(f"[STARTUP] Polygon calibrations not available: {e}")
 
 # Scoring mode: 'polygon' (weighted vote) or 'line_intersection' (triangulation)
-_scoring_mode = "vote"
+_scoring_mode = "line_intersection"
 
 def get_scoring_mode():
     return _scoring_mode
