@@ -160,10 +160,123 @@ def detect_dart(
     line = _compute_line(flight_centroid, tip)
     view_quality = min(1.0, dart_length / 150.0) if dart_length > 0 else 0.3
     
+    # Step 7b: Line through dart shaft for line intersection triangulation.
+    # Used by triangulate_with_line_intersection() to intersect lines from multiple cameras.
+    # Strategy: 
+    #   1. Try Hough line detection (finds actual straight edges = shaft)
+    #   2. Fallback: PCA on thin part of mask only (exclude flight blob)
+    #   3. Last resort: PCA on full mask
+    pca_line = None
+    if mask_pixels > 50:
+        try:
+            # --- Method 1: Hough line detection ---
+            # Skeleton the mask to get 1px-wide lines, then Hough
+            skeleton = cv2.ximgproc.thinning(motion_mask) if hasattr(cv2, 'ximgproc') else None
+            if skeleton is None:
+                # Manual thinning fallback: erode until thin
+                thin = motion_mask.copy()
+                kernel = np.ones((3,3), np.uint8)
+                for _ in range(5):
+                    eroded = cv2.erode(thin, kernel)
+                    if np.count_nonzero(eroded) < 20:
+                        break
+                    thin = eroded
+                skeleton = thin
+            
+            hough_lines = cv2.HoughLinesP(skeleton, 1, np.pi/180, threshold=15,
+                                          minLineLength=20, maxLineGap=10)
+            
+            if hough_lines is not None and len(hough_lines) > 0:
+                # Pick the longest Hough line
+                best_len = 0
+                best_line = None
+                for hl in hough_lines:
+                    x1h, y1h, x2h, y2h = hl[0]
+                    length = np.sqrt((x2h-x1h)**2 + (y2h-y1h)**2)
+                    if length > best_len:
+                        best_len = length
+                        best_line = hl[0]
+                
+                if best_line is not None:
+                    x1h, y1h, x2h, y2h = best_line
+                    dx, dy = float(x2h - x1h), float(y2h - y1h)
+                    norm = np.sqrt(dx*dx + dy*dy)
+                    if norm > 0:
+                        vx, vy = dx/norm, dy/norm
+                        # Ensure points toward tip (vy > 0)
+                        if vy < 0:
+                            vx, vy = -vx, -vy
+                        mx = (x1h + x2h) / 2.0
+                        my = (y1h + y2h) / 2.0
+                        pca_line = {
+                            'vx': vx, 'vy': vy,
+                            'x0': mx, 'y0': my,
+                            'elongation': best_len,
+                            'method': 'hough',
+                        }
+            
+            # --- Method 2: Shaft-only PCA (exclude flight) ---
+            if pca_line is None and flight_centroid is not None and tip is not None:
+                ys_all, xs_all = np.nonzero(motion_mask)
+                if len(xs_all) > 20:
+                    # Flight is the widest part. Measure width at each y-level
+                    # and keep only the thinner half (shaft region)
+                    pts_all = np.column_stack([xs_all, ys_all])
+                    
+                    # Use tip and flight to define shaft region:
+                    # Keep pixels in the middle 60% between flight and tip
+                    fy, ty = flight_centroid[1], tip[1]
+                    if abs(ty - fy) > 20:
+                        y_min = min(fy, ty) + 0.2 * abs(ty - fy)
+                        y_max = max(fy, ty) - 0.2 * abs(ty - fy)
+                        shaft_mask = (ys_all >= y_min) & (ys_all <= y_max)
+                        shaft_pts = pts_all[shaft_mask]
+                        
+                        if len(shaft_pts) > 10:
+                            mean = shaft_pts.mean(axis=0).astype(np.float64)
+                            centered = shaft_pts.astype(np.float64) - mean
+                            cov = np.cov(centered.T)
+                            eigenvalues, eigenvectors = np.linalg.eigh(cov)
+                            pc = eigenvectors[:, np.argmax(eigenvalues)]
+                            vx, vy = float(pc[0]), float(pc[1])
+                            if vy < 0:
+                                vx, vy = -vx, -vy
+                            elongation = max(eigenvalues) / (min(eigenvalues) + 1e-6)
+                            pca_line = {
+                                'vx': vx, 'vy': vy,
+                                'x0': float(mean[0]), 'y0': float(mean[1]),
+                                'elongation': elongation,
+                                'method': 'shaft_pca',
+                            }
+            
+            # --- Method 3: Full mask PCA (last resort) ---
+            if pca_line is None:
+                ys_pca, xs_pca = np.nonzero(motion_mask)
+                if len(xs_pca) > 10:
+                    pts = np.column_stack([xs_pca.astype(np.float64), ys_pca.astype(np.float64)])
+                    mean = pts.mean(axis=0)
+                    centered = pts - mean
+                    cov = np.cov(centered.T)
+                    eigenvalues, eigenvectors = np.linalg.eigh(cov)
+                    pc = eigenvectors[:, np.argmax(eigenvalues)]
+                    vx, vy = float(pc[0]), float(pc[1])
+                    if vy < 0:
+                        vx, vy = -vx, -vy
+                    elongation = max(eigenvalues) / (min(eigenvalues) + 1e-6)
+                    pca_line = {
+                        'vx': vx, 'vy': vy,
+                        'x0': float(mean[0]), 'y0': float(mean[1]),
+                        'elongation': elongation,
+                        'method': 'full_pca',
+                    }
+        except Exception:
+            pass
+
     result.update({
         "tip": tip, "confidence": 0.8, "line": line,
         "dart_length": dart_length, "method": tip_method,
         "view_quality": view_quality,
+        "pca_line": pca_line,
     })
     
     if debug:

@@ -2653,6 +2653,327 @@ def line_intersection_2d(line1, line2):
     return (ix, iy)
 
 
+
+def build_perspective_transform(calibration):
+    """
+    Build perspective transform using 4 points exactly 90° apart on the outer double ring.
+    
+    CRITICAL: segment_angles are measured from the BOARD CENTER (not ellipse center).
+    The ray-ellipse intersection must originate from the board center too.
+    """
+    import numpy as np
+    import cv2
+    
+    center = calibration.get('center', [0, 0])
+    seg_angles = calibration.get('segment_angles', [])
+    seg20_idx = calibration.get('segment_20_index', 0)
+    ode = calibration.get('outer_double_ellipse')
+    
+    if not ode or len(seg_angles) < 20:
+        return None
+    
+    bcx, bcy = float(center[0]), float(center[1])  # Board center
+    ecx, ecy = ode[0]  # Ellipse center
+    width, height = ode[1]
+    angle_deg = ode[2]
+    a = width / 2
+    b = height / 2
+    rot = np.radians(angle_deg)
+    cos_r, sin_r = np.cos(rot), np.sin(rot)
+    
+    def ray_board_center_to_ellipse(angle):
+        """
+        Find where a ray FROM BOARD CENTER at 'angle' intersects the outer double ellipse.
+        
+        Ray: P(t) = (bcx + t*cos(angle), bcy + t*sin(angle)), t > 0
+        Ellipse: ((x-ecx)*cos(r) + (y-ecy)*sin(r))^2/a^2 + (-(x-ecx)*sin(r) + (y-ecy)*cos(r))^2/b^2 = 1
+        
+        Substitute and solve quadratic in t.
+        """
+        dx = np.cos(angle)
+        dy = np.sin(angle)
+        
+        # Offset from ellipse center to board center
+        ox = bcx - ecx
+        oy = bcy - ecy
+        
+        # Rotated coordinates
+        # u = (ox + t*dx)*cos_r + (oy + t*dy)*sin_r
+        # v = -(ox + t*dx)*sin_r + (oy + t*dy)*cos_r
+        # u = u0 + t*du, v = v0 + t*dv
+        u0 = ox * cos_r + oy * sin_r
+        du = dx * cos_r + dy * sin_r
+        v0 = -ox * sin_r + oy * cos_r
+        dv = -dx * sin_r + dy * cos_r
+        
+        # Ellipse equation: u^2/a^2 + v^2/b^2 = 1
+        # (u0 + t*du)^2/a^2 + (v0 + t*dv)^2/b^2 = 1
+        # At^2 + Bt + C = 0
+        A = du*du/(a*a) + dv*dv/(b*b)
+        B = 2*(u0*du/(a*a) + v0*dv/(b*b))
+        C = u0*u0/(a*a) + v0*v0/(b*b) - 1
+        
+        disc = B*B - 4*A*C
+        if disc < 0:
+            return None
+        
+        sqrt_disc = np.sqrt(disc)
+        t1 = (-B + sqrt_disc) / (2*A)
+        t2 = (-B - sqrt_disc) / (2*A)
+        
+        # Pick the positive t (ray goes outward from board center)
+        t = max(t1, t2) if min(t1, t2) < 0 else min(t1, t2)
+        if t <= 0:
+            t = max(t1, t2)
+        if t <= 0:
+            return None
+        
+        return [bcx + t * dx, bcy + t * dy]
+    
+    # 4 points at 90° intervals: indices 0, 5, 10, 15
+    indices = [0, 5, 10, 15]
+    
+    src_points = []
+    dst_points = []
+    
+    for idx in indices:
+        px_pt = ray_board_center_to_ellipse(seg_angles[idx])
+        if px_pt is None:
+            return None
+        src_points.append(px_pt)
+        
+        board_idx = (idx - seg20_idx) % 20
+        board_angle = -np.pi/2 + board_idx * (2 * np.pi / 20)
+        dst_points.append([np.cos(board_angle), np.sin(board_angle)])
+    
+    src = np.array(src_points, dtype=np.float32)
+    dst = np.array(dst_points, dtype=np.float32)
+    
+    H = cv2.getPerspectiveTransform(src, dst)
+    return H
+
+def warp_point(H, px, py):
+    """Warp a single point from pixel space to normalized board space using homography."""
+    import numpy as np
+    pt = np.array([px, py, 1.0])
+    warped = H @ pt
+    if abs(warped[2]) < 1e-10:
+        return None
+    return (warped[0] / warped[2], warped[1] / warped[2])
+
+
+def intersect_lines_2d(x1, y1, x2, y2, x3, y3, x4, y4):
+    """
+    Find intersection of two lines in 2D.
+    Line 1: (x1,y1)-(x2,y2), Line 2: (x3,y3)-(x4,y4)
+    Returns (x, y) or None if parallel.
+    """
+    denom = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4)
+    if abs(denom) < 1e-10:
+        return None  # parallel
+    
+    t = ((x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4)) / denom
+    
+    ix = x1 + t * (x2 - x1)
+    iy = y1 + t * (y2 - y1)
+    return (ix, iy)
+
+
+def triangulate_with_line_intersection(camera_results, calibrations):
+    """
+    Autodarts-style line intersection triangulation.
+    
+    1. Build perspective transform per camera from calibration
+    2. Warp each camera's PCA line into normalized board space
+    3. Intersect all camera pairs in normalized space
+    4. Warp best intersection point BACK to pixel space
+    5. Score using proven ellipse scoring (not normalized coords)
+    
+    Args:
+        camera_results: dict of cam_id -> detection result (must have 'pca_line' and 'tip')
+        calibrations: dict of cam_id -> calibration data
+    
+    Returns:
+        dict with 'segment', 'multiplier', 'method', 'intersections', 'coords',
+        per-camera 'detections', and 'confidence'
+    """
+    import numpy as np
+    import logging
+    logger = logging.getLogger(__name__)
+    
+    from app.core.ellipse_scoring import score_from_ellipse_calibration
+    
+    # Step 1: Build perspective transforms and warp lines
+    cam_lines = {}
+    
+    for cam_id, result in camera_results.items():
+        pca = result.get('pca_line')
+        tip = result.get('tip')
+        if not pca or not tip:
+            continue
+        
+        cal = calibrations.get(cam_id)
+        if not cal:
+            continue
+        
+        H = build_perspective_transform(cal)
+        if H is None:
+            continue
+        
+        # Compute inverse homography for warping back
+        H_inv = np.linalg.inv(H)
+        
+        vx, vy = pca['vx'], pca['vy']
+        x0, y0 = pca['x0'], pca['y0']
+        
+        # Two points along the PCA line in pixel space
+        p1_px = (x0 - vx * 200, y0 - vy * 200)  # flight end
+        p2_px = (float(tip[0]), float(tip[1]))     # tip
+        
+        # Warp to normalized space
+        p1_n = warp_point(H, p1_px[0], p1_px[1])
+        p2_n = warp_point(H, p2_px[0], p2_px[1])
+        tip_n = warp_point(H, tip[0], tip[1])
+        
+        if p1_n is None or p2_n is None or tip_n is None:
+            continue
+        
+        # Per-camera vote using ellipse scoring (proven accurate)
+        vote = score_from_ellipse_calibration(tip[0], tip[1], cal)
+        
+        cam_lines[cam_id] = {
+            'line_start': p1_n,
+            'line_end': p2_n,
+            'tip_normalized': tip_n,
+            'tip_pixel': tip,
+            'H': H,
+            'H_inv': H_inv,
+            'vote': vote,
+        }
+        
+        logger.info(f"[LINE_INTERSECT] {cam_id}: tip_px={tip} -> S{vote['segment']} (ellipse)")
+    
+    if len(cam_lines) < 2:
+        logger.warning("[LINE_INTERSECT] Need at least 2 cameras with PCA lines")
+        return None
+    
+    # Step 2: Compute all pairwise intersections
+    cam_ids = sorted(cam_lines.keys())
+    intersections = []
+    
+    for i in range(len(cam_ids)):
+        for j in range(i + 1, len(cam_ids)):
+            c1, c2 = cam_ids[i], cam_ids[j]
+            l1 = cam_lines[c1]
+            l2 = cam_lines[c2]
+            
+            ix = intersect_lines_2d(
+                l1['line_start'][0], l1['line_start'][1],
+                l1['line_end'][0], l1['line_end'][1],
+                l2['line_start'][0], l2['line_start'][1],
+                l2['line_end'][0], l2['line_end'][1]
+            )
+            
+            if ix is None:
+                continue
+            
+            # Error: distance from each camera's warped tip to the intersection
+            err1 = np.sqrt((ix[0] - l1['tip_normalized'][0])**2 + (ix[1] - l1['tip_normalized'][1])**2)
+            err2 = np.sqrt((ix[0] - l2['tip_normalized'][0])**2 + (ix[1] - l2['tip_normalized'][1])**2)
+            total_err = err1 + err2
+            
+            # Warp intersection point BACK to each camera's pixel space and score with ellipse
+            scores_from_cams = []
+            for cam_id in [c1, c2]:
+                H_inv = cam_lines[cam_id]['H_inv']
+                px_pt = warp_point(H_inv, ix[0], ix[1])
+                if px_pt is not None:
+                    cal = calibrations.get(cam_id)
+                    if cal:
+                        s = score_from_ellipse_calibration(px_pt[0], px_pt[1], cal)
+                        scores_from_cams.append(s)
+            
+            # Use the first camera's ellipse score for this intersection
+            if scores_from_cams:
+                score = scores_from_cams[0]
+            else:
+                continue
+            
+            intersections.append({
+                'cam1': c1,
+                'cam2': c2,
+                'coords': ix,
+                'error1': err1,
+                'error2': err2,
+                'total_error': total_err,
+                'score': score,
+                'all_cam_scores': scores_from_cams,
+            })
+            
+            logger.info(f"[LINE_INTERSECT] {c1}x{c2}: S{score['segment']} err={total_err:.4f}")
+    
+    if not intersections:
+        logger.warning("[LINE_INTERSECT] No valid intersections found")
+        return None
+    
+    # Step 3: Pick the best intersection
+    # Strategy: majority vote first (if 2+ intersections agree on segment),
+    # then lowest error among the majority. Falls back to overall lowest error.
+    all_segs = [ix['score']['segment'] for ix in intersections]
+    
+    if len(set(all_segs)) == 1:
+        # All agree — pick lowest error
+        best = min(intersections, key=lambda x: x['total_error'])
+        method = 'UnanimousCam'
+        confidence = 1.0
+    else:
+        # Find the segment with most votes
+        from collections import Counter
+        seg_counts = Counter(all_segs)
+        most_common_seg, count = seg_counts.most_common(1)[0]
+        
+        if count >= 2:
+            # Majority exists — pick lowest error among majority
+            majority = [ix for ix in intersections if ix['score']['segment'] == most_common_seg]
+            best = min(majority, key=lambda x: x['total_error'])
+            method = 'Cam+1'
+            confidence = 0.8
+        else:
+            # No majority — also check per-camera votes
+            cam_segs = [data['vote']['segment'] for data in cam_lines.values()]
+            cam_counts = Counter(cam_segs)
+            cam_majority_seg, cam_count = cam_counts.most_common(1)[0]
+            
+            # If per-camera tips agree, prefer intersections matching that segment
+            matching = [ix for ix in intersections if ix['score']['segment'] == cam_majority_seg]
+            if matching and cam_count >= 2:
+                best = min(matching, key=lambda x: x['total_error'])
+                method = 'CamVote'
+                confidence = 0.7
+            else:
+                best = min(intersections, key=lambda x: x['total_error'])
+                method = 'BestError'
+                confidence = 0.5
+    
+    logger.info(f"[LINE_INTERSECT] RESULT: S{best['score']['segment']} method={method} conf={confidence} err={best['total_error']:.4f}")
+    
+    return {
+        'segment': best['score']['segment'],
+        'multiplier': best['score']['multiplier'],
+        'method': method,
+        'confidence': confidence,
+        'coords': best['coords'],
+        'best_intersection': best,
+        'all_intersections': intersections,
+        'per_camera': {cam_id: {
+            'vote': data['vote'],
+            'tip_normalized': data['tip_normalized'],
+            'tip_pixel': data['tip_pixel']
+        } for cam_id, data in cam_lines.items()}
+    }
+
+
+
 def vote_with_line_intersection(tips_with_lines: List[dict], calibration_data: dict, save_debug: bool = True) -> dict:
     """
     Autodarts-style voting using line intersections.
