@@ -1703,6 +1703,7 @@ async def detect_tips(
                             "confidence": skel_result.get("confidence", 0.5),
                             "method": "skeleton",
                             "view_quality": skel_result.get("view_quality", 0.5),
+                            "mask_quality": skel_result.get("mask_quality", 1.0),
                             "line": line_info,  # (vx, vy, x0, y0) for line intersection voting
                             "camera_id": cam.camera_id  # Required for homography transform
                         }]
@@ -3353,6 +3354,10 @@ def vote_on_scores(clusters: List[List[dict]]) -> List[DetectedTip]:
             view_factor = 0.5 + view_quality  # 0 quality = 0.5x, 1.0 quality = 1.5x
             weight *= view_factor
             
+            # Mask quality: clean single-dart mask = 1.0, merged darts = lower
+            mask_quality = tip.get('mask_quality', 1.0)
+            weight *= mask_quality
+            
             # MAJOR weight reduction for tips NOT found in NEW region
             if not tip.get('found_in_new_region', True):
                 weight *= 0.1
@@ -3385,7 +3390,7 @@ def vote_on_scores(clusters: List[List[dict]]) -> List[DetectedTip]:
             weight *= zone_factor
             
             with open(r"C:\Users\clawd\skel_debug.txt", "a") as dbg:
-                dbg.write(f"[VOTE]   {cam_id}: {tip['segment']}x{tip['multiplier']} weight={weight:.3f} (conf={tip['confidence']}, cal_q={cal_quality:.2f}, view_q={view_quality:.2f}, bnd={boundary_dist})\n")
+                dbg.write(f"[VOTE]   {cam_id}: {tip['segment']}x{tip['multiplier']} weight={weight:.3f} (conf={tip['confidence']}, cal_q={cal_quality:.2f}, view_q={view_quality:.2f}, mask_q={mask_quality:.2f}, bnd={boundary_dist})\n")
             
             votes[key] = votes.get(key, 0.0) + weight
             total_confidence += weight
@@ -4147,11 +4152,13 @@ async def replay_single_dart(request: ReplayRequest):
             tip_confidence = selected.get("confidence", 0)
             line_result = None  # No line info for rescore_only
             view_quality = 0.5  # Default for rescore_only
+            mask_quality_val = 1.0
         else:
             # Re-run tip detection using requested method
             tip_x, tip_y, tip_confidence = None, None, 0
             line_result = None
             view_quality = 0.5  # Will be updated if skeleton/hough
+            mask_quality_val = 1.0
             
             if request.method in ("skeleton", "hough") and cam_id in baselines:
                 # Use classical CV detection
@@ -4211,6 +4218,7 @@ async def replay_single_dart(request: ReplayRequest):
                     tip_confidence = result.get("confidence", 0.5)
                     line_result = result.get("line")  # (vx, vy, x0, y0) if available
                     view_quality = result.get("view_quality", 0.5)
+                    mask_quality_val = result.get("mask_quality", 1.0)
             
             # Fall back to YOLO if no tip found or YOLO method requested
             if tip_x is None:
@@ -4257,7 +4265,8 @@ async def replay_single_dart(request: ReplayRequest):
                 "tip_x": tip_x,
                 "tip_y": tip_y,
                 "line": line_result,  # (vx, vy, x0, y0) or None
-                "view_quality": view_quality
+                "view_quality": view_quality,
+                "mask_quality": mask_quality_val if 'mask_quality_val' in dir() else 1.0
             })
     
     if not camera_votes:
@@ -4280,8 +4289,9 @@ async def replay_single_dart(request: ReplayRequest):
         seg = v["segment"]
         conf = v.get("confidence", 1.0)
         view_q = v.get("view_quality", 0.5)
-        # Combined weight: confidence * (0.5 + 0.5*view_quality) to give view_quality some influence
-        weight = conf * (0.5 + 0.5 * view_q)
+        mask_q = v.get("mask_quality", 1.0)
+        # Combined weight: confidence * view * mask quality
+        weight = conf * (0.5 + 0.5 * view_q) * mask_q
         segment_votes[seg] = segment_votes.get(seg, 0) + weight
     
     winning_segment = max(segment_votes.keys(), key=lambda k: segment_votes[k])
@@ -4293,7 +4303,8 @@ async def replay_single_dart(request: ReplayRequest):
             mult = v["multiplier"]
             conf = v.get("confidence", 1.0)
             view_q = v.get("view_quality", 0.5)
-            weight = conf * (0.5 + 0.5 * view_q)
+            mask_q = v.get("mask_quality", 1.0)
+            weight = conf * (0.5 + 0.5 * view_q) * mask_q
             multiplier_votes[mult] = multiplier_votes.get(mult, 0) + weight
     
     if multiplier_votes:

@@ -35,6 +35,7 @@ def detect_dart(
         "tip": None, "confidence": 0.0, "line": None,
         "dart_length": 0.0, "method": "none",
         "view_quality": 0.5, "debug_image": None,
+        "mask_quality": 1.0,
     }
     
     # Step 1: Motion mask
@@ -46,6 +47,28 @@ def detect_dart(
     
     # Step 3: Shape filter — keep only elongated (dart-shaped) blobs
     motion_mask = _shape_filter(motion_mask)
+    
+    # Step 3b: Mask quality — how clean is this mask?
+    # A single dart mask is typically 2000-8000 px. Merged darts = much larger.
+    mask_pixels = np.count_nonzero(motion_mask)
+    num_components = 0
+    if mask_pixels > 0:
+        n_labels, _, stats, _ = cv2.connectedComponentsWithStats(motion_mask)
+        # Count components > 200px (ignore tiny noise)
+        num_components = sum(1 for i in range(1, n_labels) if stats[i, cv2.CC_STAT_AREA] > 200)
+    
+    # Quality heuristics:
+    # - Normal single dart: 1000-8000px, 1-2 components → quality 1.0
+    # - Merged darts: >12000px or >3 large components → quality drops
+    mask_quality = 1.0
+    if mask_pixels > 12000:
+        # Oversized mask — likely merged darts
+        mask_quality = min(1.0, 8000.0 / mask_pixels)
+    if num_components > 3:
+        # Many large blobs — messy mask
+        mask_quality *= 0.5
+    mask_quality = max(0.1, mask_quality)  # Floor at 0.1
+    result["mask_quality"] = mask_quality
     
     # Step 4: Find the flight blob
     flight = _find_flight_blob(motion_mask, min_area=80)
