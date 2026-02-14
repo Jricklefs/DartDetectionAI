@@ -2153,7 +2153,7 @@ async def detect_tips(
                 has_camid = 'camera_id' in t
                 dbg.write(f"  tip: cam={t.get('camera_id')}, has_line={has_line}, has_camid={has_camid}\n")
     
-    if detection_method in ("skeleton", "hough") and len(all_tips) >= 2:
+    if detection_method in ("skeleton", "hough", "v10.2_shape_filtered") and len(all_tips) >= 2:
         tips_with_lines = [t for t in all_tips if t.get('line')]
         logger.info(f"[LINE-VOTE] {len(tips_with_lines)} tips have line data")
         
