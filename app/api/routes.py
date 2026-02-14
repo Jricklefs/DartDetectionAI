@@ -1675,6 +1675,7 @@ async def detect_tips(
     timings['mask'] = int((time.time() - t0) * 1000)
     
     all_tips = []
+    camera_calibrations = {}  # cam_id -> calibration_data for triangulate_with_line_intersection
     camera_results = []
     pipeline_data = {}  # Per-camera detailed detection pipeline
     detect_total_ms = 0
@@ -2057,6 +2058,7 @@ async def detect_tips(
                 tip['boundary_distance_deg'] = score_info.get('boundary_distance_deg')  # For weighted voting
                 tip['calibration_quality'] = calibration_data.get('quality', 0.5)  # Camera calibration quality for voting
                 all_tips.append(tip)
+                camera_calibrations[cam.camera_id] = calibration_data  # Store for line intersection
                 
                 # Save training data if enabled
                 save_training_data(
@@ -2162,71 +2164,59 @@ async def detect_tips(
                 dbg.write(f"[LINE-VOTE] {len(tips_with_lines)} tips have line data\n")
         
         if len(tips_with_lines) >= 2:
-            # Try line intersection in mm space using homography
-            mm_result = vote_with_line_intersection_mm(tips_with_lines)
+            # Build camera_results and calibrations dicts for triangulate_with_line_intersection
+            tri_camera_results = {}
+            tri_calibrations = {}
+            for t in tips_with_lines:
+                cam_id = t.get('camera_id')
+                line = t.get('line')  # (vx, vy, x0, y0) tuple
+                if cam_id and line and len(line) >= 4:
+                    tri_camera_results[cam_id] = {
+                        'pca_line': {'vx': float(line[0]), 'vy': float(line[1]), 'x0': float(line[2]), 'y0': float(line[3])},
+                        'tip': (float(t.get('x_px', 0)), float(t.get('y_px', 0))),
+                        'mask_quality': t.get('mask_quality', 1.0),
+                    }
+                    if cam_id in camera_calibrations:
+                        tri_calibrations[cam_id] = camera_calibrations[cam_id]
             
-            # Debug: log mm result
-            if SKEL_DEBUG:
-                with open(r"C:\Users\clawd\skel_debug.txt", "a") as dbg:
-                    dbg.write(f"[LINE-VOTE] mm_result={mm_result}\n")
-            
-            if mm_result and mm_result.get('x_mm') is not None:
-                # Score by transforming mm back to pixel space and using polygon scorer
-                # The polygon scorer has verified correct segment mapping
-                score_result = None
+            tri_result = None
+            if len(tri_camera_results) >= 2 and len(tri_calibrations) >= 2:
                 try:
-                    # Try each camera's inverse homography to get pixel coords
-                    for cam_id_try in ['cam0', 'cam1', 'cam2']:
-                        px_point = transform_mm_to_pixel(mm_result['x_mm'], mm_result['y_mm'], cam_id_try)
-                        if px_point is not None:
-                            poly_cal = get_polygon_calibration(cam_id_try)
-                            if poly_cal:
-                                from app.core.polygon_calibration import score_from_polygon_calibration as _score_poly
-                                score_result = _score_poly((px_point[0], px_point[1]), poly_cal)
-                                if score_result and score_result.get('segment', 0) > 0:
-                                    score_result['scoring_method'] = 'line_intersection_polygon'
-                                    if SKEL_DEBUG:
-                                        with open(r"C:\Users\clawd\skel_debug.txt", "a") as dbg:
-                                            dbg.write(f"[LINE-VOTE] mm->px via {cam_id_try}: ({px_point[0]:.0f},{px_point[1]:.0f}) -> S{score_result['segment']}x{score_result['multiplier']}\n")
-                                    break
+                    tri_result = triangulate_with_line_intersection(tri_camera_results, tri_calibrations)
                 except Exception as e:
+                    logger.error(f"[LINE-VOTE] triangulate_with_line_intersection failed: {e}", exc_info=True)
                     if SKEL_DEBUG:
                         with open(r"C:\Users\clawd\skel_debug.txt", "a") as dbg:
-                            dbg.write(f"[LINE-VOTE] mm->polygon failed: {e}\n")
+                            dbg.write(f"[LINE-VOTE] triangulate_with_line_intersection error: {e}\n")
+            
+            # Debug: log result
+            if SKEL_DEBUG:
+                with open(r"C:\Users\clawd\skel_debug.txt", "a") as dbg:
+                    dbg.write(f"[LINE-VOTE] tri_result={tri_result}\n")
+            
+            if tri_result and tri_result.get('segment') is not None:
+                seg = tri_result['segment']
+                mult = tri_result['multiplier']
+                score_val = seg * mult if seg > 0 else (50 if mult == 2 else 25)
+                zone = tri_result.get('zone', 'single' if mult == 1 else ('double' if mult == 2 else 'triple'))
+                method = tri_result.get('method', 'line_intersection')
+                confidence = tri_result.get('confidence', 0.8)
                 
-                # Fallback to mm scoring if polygon didn't work
-                if not score_result or score_result.get('segment', 0) == 0:
-                    score_result = score_from_mm_position(mm_result['x_mm'], mm_result['y_mm'])
+                logger.info(f"[LINE-VOTE] triangulate result: S{seg}x{mult} method={method} conf={confidence:.2f}")
                 
-                if SKEL_DEBUG:
-                    with open(r"C:\Users\clawd\skel_debug.txt", "a") as dbg:
-                        dbg.write(f"[LINE-VOTE] intersection=({mm_result['x_mm']:.1f}, {mm_result['y_mm']:.1f})mm -> {score_result.get('segment')}x{score_result.get('multiplier')} zone={score_result.get('zone')}\n")
-                
-                if score_result.get('score', 0) > 0 or score_result.get('zone') in ('inner_bull', 'outer_bull'):
-                    logger.info(f"[LINE-VOTE] MM intersection scored: {score_result.get('segment')}x{score_result.get('multiplier')}")
-                    
-                    detected_tips = [DetectedTip(
-                        x_mm=round(mm_result['x_mm'], 2),
-                        y_mm=round(mm_result['y_mm'], 2),
-                        segment=score_result['segment'],
-                        multiplier=score_result['multiplier'],
-                        zone=score_result.get('zone', 'unknown'),
-                        score=score_result['score'],
-                        confidence=0.9,
-                        cameras_seen=[t.get('camera_id') for t in tips_with_lines]
-                    )]
-                    line_intersection_result = mm_result
-                    
-                    # Save debug image showing line intersection
-                    try:
-                        _save_line_debug_image(tips_with_lines, 
-                            [l for l in lines_mm if True],  # pass lines_mm from outer scope
-                            (mm_result['x_mm'], mm_result['y_mm']),
-                            f"{score_result.get('segment')}x{score_result.get('multiplier')}")
-                    except Exception:
-                        pass
-                else:
-                    logger.info(f"[LINE-VOTE] MM intersection outside board, falling back to voting")
+                detected_tips = [DetectedTip(
+                    x_mm=0,
+                    y_mm=0,
+                    segment=seg,
+                    multiplier=mult,
+                    zone=zone,
+                    score=score_val,
+                    confidence=confidence,
+                    cameras_seen=[t.get('camera_id') for t in tips_with_lines]
+                )]
+                line_intersection_result = tri_result
+            else:
+                logger.info(f"[LINE-VOTE] triangulate returned None, falling back to voting")
     
     # Score using configured mode
     weighted_tips = vote_on_scores(clustered_tips)
