@@ -81,6 +81,9 @@ except Exception as e:
     print(f"[STARTUP] Polygon calibrations not available: {e}")
 
 # Scoring mode: 'polygon' (weighted vote) or 'line_intersection' (triangulation)
+# Performance: debug file writes OFF by default. Set env DARTDETECT_SKEL_DEBUG=true to enable.
+SKEL_DEBUG = os.environ.get("DARTDETECT_SKEL_DEBUG", "false").lower() == "true"
+
 _scoring_mode = "vote"
 
 def get_scoring_mode():
@@ -1367,11 +1370,12 @@ def score_with_calibration_hybrid(tip_data: Dict[str, Any], calibration_data: Di
     y_px = tip_data.get('y_px', 0)
     
     # DEBUG: Log what we're scoring
-    with open(r"C:\Users\clawd\skel_debug.txt", "a") as dbg:
-        dbg.write(f"  [SCORE-INPUT] {camera_id}: x_px={x_px}, y_px={y_px}, method={detection_method}, HAS_POLYGON={HAS_POLYGON}, tip_keys={list(tip_data.keys())[:8]}\n")
-        # TEMP DEBUG: dump calibration data used for scoring
-        import json as _json
-        dbg.write(f"    [CAL-DEBUG] {camera_id}: center={calibration_data.get('center')}, seg20_idx={calibration_data.get('segment_20_index')}, n_angles={len(calibration_data.get('segment_angles', []))}, first3_angles={calibration_data.get('segment_angles', [])[:3]}\n")
+    if SKEL_DEBUG:
+        with open(r"C:\Users\clawd\skel_debug.txt", "a") as dbg:
+            dbg.write(f"  [SCORE-INPUT] {camera_id}: x_px={x_px}, y_px={y_px}, method={detection_method}, HAS_POLYGON={HAS_POLYGON}, tip_keys={list(tip_data.keys())[:8]}\n")
+            # TEMP DEBUG: dump calibration data used for scoring
+            import json as _json
+            dbg.write(f"    [CAL-DEBUG] {camera_id}: center={calibration_data.get('center')}, seg20_idx={calibration_data.get('segment_20_index')}, n_angles={len(calibration_data.get('segment_angles', []))}, first3_angles={calibration_data.get('segment_angles', [])[:3]}\n")
     
     # Use polygon for skeleton/hough detection methods
     use_polygon = detection_method in ("skeleton", "hough") and HAS_POLYGON
@@ -1615,8 +1619,11 @@ async def detect_tips(
     
     # Warmup model if it's been idle (prevents cold start latency)
     t0 = time.time()
-    if calibrator.tip_detector and calibrator.tip_detector.is_initialized:
-        calibrator.tip_detector.maybe_warmup()
+    # Skip warmup for skeleton mode - no YOLO model needed
+    detection_method = get_detection_method()
+    if detection_method not in ("skeleton", "v10.2_shape_filtered"):
+        if calibrator.tip_detector and calibrator.tip_detector.is_initialized:
+            calibrator.tip_detector.maybe_warmup()
     timings['warmup'] = int((time.time() - t0) * 1000)
     
     logger.info(f"")
@@ -1740,8 +1747,9 @@ async def detect_tips(
                 mask = masks.get(cam.camera_id)
                 
                 # DEBUG: Write to file
-                with open(r"C:\Users\clawd\skel_debug.txt", "a") as dbg:
-                    dbg.write(f"[METHOD={detection_method}] Camera {cam.camera_id}: before_images={request.before_images is not None and len(request.before_images) if request.before_images else 0}\n")
+                if SKEL_DEBUG:
+                    with open(r"C:\Users\clawd\skel_debug.txt", "a") as dbg:
+                        dbg.write(f"[METHOD={detection_method}] Camera {cam.camera_id}: before_images={request.before_images is not None and len(request.before_images) if request.before_images else 0}\n")
                 
                 # Get previous frame - prefer from request, fall back to cache
                 if request.before_images:
@@ -1797,8 +1805,9 @@ async def detect_tips(
                     )
                     
                     # DEBUG: Log skeleton result
-                    with open(r"C:\Users\clawd\skel_debug.txt", "a") as dbg:
-                        dbg.write(f"  {cam.camera_id} skeleton: tip={skel_result.get('tip')}, conf={skel_result.get('confidence'):.3f}\n")
+                    if SKEL_DEBUG:
+                        with open(r"C:\Users\clawd\skel_debug.txt", "a") as dbg:
+                            dbg.write(f"  {cam.camera_id} skeleton: tip={skel_result.get('tip')}, conf={skel_result.get('confidence'):.3f}\n")
                     
                     if skel_result.get("tip"):
                         tip_x, tip_y = skel_result["tip"]
@@ -2039,8 +2048,9 @@ async def detect_tips(
                 tip['camera_id'] = cam.camera_id
                 tip['segment'] = score_info.get('segment', 0)
                 # DEBUG: Log score
-                with open(r"C:\Users\clawd\skel_debug.txt", "a") as dbg:
-                    dbg.write(f"    {cam.camera_id} scored: {score_info.get('segment')}x{score_info.get('multiplier')} = {score_info.get('score')}\n")
+                if SKEL_DEBUG:
+                    with open(r"C:\Users\clawd\skel_debug.txt", "a") as dbg:
+                        dbg.write(f"    {cam.camera_id} scored: {score_info.get('segment')}x{score_info.get('multiplier')} = {score_info.get('score')}\n")
                 tip['multiplier'] = score_info.get('multiplier', 1)
                 tip['zone'] = score_info.get('zone', 'miss')
                 tip['score'] = score_info.get('score', 0)
@@ -2096,9 +2106,10 @@ async def detect_tips(
     if all_tips:
         votes_summary = ", ".join([f"{t.get('camera_id')}={t.get('segment')}x{t.get('multiplier')}" for t in all_tips])
         logger.info(f"[VOTE] Camera votes: {votes_summary}")
-        with open(r"C:\Users\clawd\skel_debug.txt", "a") as dbg:
-            dbg.write(f"[VOTE] Camera votes: {votes_summary}\n")
-            dbg.write(f"[VOTE] Clusters: {len(clustered_tips)}, tips_per_camera: {tips_per_camera if 'tips_per_camera' in dir() else 'not yet'}\n")
+        if SKEL_DEBUG:
+            with open(r"C:\Users\clawd\skel_debug.txt", "a") as dbg:
+                dbg.write(f"[VOTE] Camera votes: {votes_summary}\n")
+                dbg.write(f"[VOTE] Clusters: {len(clustered_tips)}, tips_per_camera: {tips_per_camera if 'tips_per_camera' in dir() else 'not yet'}\n")
     
     # IMPORTANT: When cameras disagree on segment, we need to MERGE clusters and vote
     # If cam0=12, cam1=13, cam2=13, clustering gives us:
@@ -2120,8 +2131,9 @@ async def detect_tips(
         all_tips_merged = [tip for cluster in clustered_tips for tip in cluster]
         clustered_tips = [all_tips_merged]
         logger.info(f"[DETECT] Merged into 1 cluster with {len(all_tips_merged)} tips")
-        with open(r"C:\Users\clawd\skel_debug.txt", "a") as dbg:
-            dbg.write(f"[VOTE] MERGED {len(all_tips_merged)} tips into 1 cluster\n")
+        if SKEL_DEBUG:
+            with open(r"C:\Users\clawd\skel_debug.txt", "a") as dbg:
+                dbg.write(f"[VOTE] MERGED {len(all_tips_merged)} tips into 1 cluster\n")
     
     # Line intersection voting with homography transform (Autodarts-style)
     line_intersection_result = None
@@ -2133,27 +2145,30 @@ async def detect_tips(
     logger.info(f"[LINE-VOTE] detection_method={detection_method}, all_tips={len(all_tips)}")
     
     # Debug: log line data to file
-    with open(r"C:\Users\clawd\skel_debug.txt", "a") as dbg:
-        dbg.write(f"[LINE-VOTE] method={detection_method}, tips={len(all_tips)}\n")
-        for t in all_tips:
-            has_line = 'line' in t and t['line'] is not None
-            has_camid = 'camera_id' in t
-            dbg.write(f"  tip: cam={t.get('camera_id')}, has_line={has_line}, has_camid={has_camid}\n")
+    if SKEL_DEBUG:
+        with open(r"C:\Users\clawd\skel_debug.txt", "a") as dbg:
+            dbg.write(f"[LINE-VOTE] method={detection_method}, tips={len(all_tips)}\n")
+            for t in all_tips:
+                has_line = 'line' in t and t['line'] is not None
+                has_camid = 'camera_id' in t
+                dbg.write(f"  tip: cam={t.get('camera_id')}, has_line={has_line}, has_camid={has_camid}\n")
     
     if detection_method in ("skeleton", "hough") and len(all_tips) >= 2:
         tips_with_lines = [t for t in all_tips if t.get('line')]
         logger.info(f"[LINE-VOTE] {len(tips_with_lines)} tips have line data")
         
-        with open(r"C:\Users\clawd\skel_debug.txt", "a") as dbg:
-            dbg.write(f"[LINE-VOTE] {len(tips_with_lines)} tips have line data\n")
+        if SKEL_DEBUG:
+            with open(r"C:\Users\clawd\skel_debug.txt", "a") as dbg:
+                dbg.write(f"[LINE-VOTE] {len(tips_with_lines)} tips have line data\n")
         
         if len(tips_with_lines) >= 2:
             # Try line intersection in mm space using homography
             mm_result = vote_with_line_intersection_mm(tips_with_lines)
             
             # Debug: log mm result
-            with open(r"C:\Users\clawd\skel_debug.txt", "a") as dbg:
-                dbg.write(f"[LINE-VOTE] mm_result={mm_result}\n")
+            if SKEL_DEBUG:
+                with open(r"C:\Users\clawd\skel_debug.txt", "a") as dbg:
+                    dbg.write(f"[LINE-VOTE] mm_result={mm_result}\n")
             
             if mm_result and mm_result.get('x_mm') is not None:
                 # Score by transforming mm back to pixel space and using polygon scorer
@@ -2170,19 +2185,22 @@ async def detect_tips(
                                 score_result = _score_poly((px_point[0], px_point[1]), poly_cal)
                                 if score_result and score_result.get('segment', 0) > 0:
                                     score_result['scoring_method'] = 'line_intersection_polygon'
-                                    with open(r"C:\Users\clawd\skel_debug.txt", "a") as dbg:
-                                        dbg.write(f"[LINE-VOTE] mm->px via {cam_id_try}: ({px_point[0]:.0f},{px_point[1]:.0f}) -> S{score_result['segment']}x{score_result['multiplier']}\n")
+                                    if SKEL_DEBUG:
+                                        with open(r"C:\Users\clawd\skel_debug.txt", "a") as dbg:
+                                            dbg.write(f"[LINE-VOTE] mm->px via {cam_id_try}: ({px_point[0]:.0f},{px_point[1]:.0f}) -> S{score_result['segment']}x{score_result['multiplier']}\n")
                                     break
                 except Exception as e:
-                    with open(r"C:\Users\clawd\skel_debug.txt", "a") as dbg:
-                        dbg.write(f"[LINE-VOTE] mm->polygon failed: {e}\n")
+                    if SKEL_DEBUG:
+                        with open(r"C:\Users\clawd\skel_debug.txt", "a") as dbg:
+                            dbg.write(f"[LINE-VOTE] mm->polygon failed: {e}\n")
                 
                 # Fallback to mm scoring if polygon didn't work
                 if not score_result or score_result.get('segment', 0) == 0:
                     score_result = score_from_mm_position(mm_result['x_mm'], mm_result['y_mm'])
                 
-                with open(r"C:\Users\clawd\skel_debug.txt", "a") as dbg:
-                    dbg.write(f"[LINE-VOTE] intersection=({mm_result['x_mm']:.1f}, {mm_result['y_mm']:.1f})mm -> {score_result.get('segment')}x{score_result.get('multiplier')} zone={score_result.get('zone')}\n")
+                if SKEL_DEBUG:
+                    with open(r"C:\Users\clawd\skel_debug.txt", "a") as dbg:
+                        dbg.write(f"[LINE-VOTE] intersection=({mm_result['x_mm']:.1f}, {mm_result['y_mm']:.1f})mm -> {score_result.get('segment')}x{score_result.get('multiplier')} zone={score_result.get('zone')}\n")
                 
                 if score_result.get('score', 0) > 0 or score_result.get('zone') in ('inner_bull', 'outer_bull'):
                     logger.info(f"[LINE-VOTE] MM intersection scored: {score_result.get('segment')}x{score_result.get('multiplier')}")
@@ -2216,15 +2234,17 @@ async def detect_tips(
     if _scoring_mode == "line_intersection" and line_intersection_result and detected_tips:
         # Use line intersection result
         li_tip = detected_tips[0]
-        with open(r"C:\Users\clawd\skel_debug.txt", "a") as dbg:
-            dbg.write(f"[LINE-VOTE] Using LINE-INTERSECTION: S{li_tip.segment}x{li_tip.multiplier}={li_tip.score}\n")
+        if SKEL_DEBUG:
+            with open(r"C:\Users\clawd\skel_debug.txt", "a") as dbg:
+                dbg.write(f"[LINE-VOTE] Using LINE-INTERSECTION: S{li_tip.segment}x{li_tip.multiplier}={li_tip.score}\n")
         # detected_tips already set from line intersection
     else:
         # Use polygon weighted vote (default)
         if line_intersection_result and detected_tips:
             li_tip = detected_tips[0]
-            with open(r"C:\Users\clawd\skel_debug.txt", "a") as dbg:
-                dbg.write(f"[LINE-VOTE] LINE-INTERSECTION would score: S{li_tip.segment}x{li_tip.multiplier}={li_tip.score}\n")
+            if SKEL_DEBUG:
+                with open(r"C:\Users\clawd\skel_debug.txt", "a") as dbg:
+                    dbg.write(f"[LINE-VOTE] LINE-INTERSECTION would score: S{li_tip.segment}x{li_tip.multiplier}={li_tip.score}\n")
         detected_tips = weighted_tips
         line_intersection_result = None
     
@@ -2233,9 +2253,10 @@ async def detect_tips(
         winner = detected_tips[0]
         method = "LINE-INTERSECTION" if line_intersection_result else "WEIGHTED-VOTE"
         logger.info(f"[VOTE] WINNER: {winner.segment}x{winner.multiplier}={winner.score} via {method} (from {len(all_tips)} cameras)")
-        with open(r"C:\Users\clawd\skel_debug.txt", "a") as dbg:
-            dbg.write(f"[VOTE] WINNER: {winner.segment}x{winner.multiplier}={winner.score} via {method}\n")
-            dbg.write(f"---\n")
+        if SKEL_DEBUG:
+            with open(r"C:\Users\clawd\skel_debug.txt", "a") as dbg:
+                dbg.write(f"[VOTE] WINNER: {winner.segment}x{winner.multiplier}={winner.score} via {method}\n")
+                dbg.write(f"---\n")
     
     # DartSensor triggers once per dart - we should only return 1 tip per request
     # Take the most confident one if multiple were detected
@@ -3486,11 +3507,13 @@ def compute_homography_for_camera(camera_id: str, polygon_calibration, seg20_idx
         
         dst_points = np.array(rotated_dst, dtype=np.float32)
         
-        with open(r'C:\Users\clawd\skel_debug.txt', 'a') as dbg:
-            dbg.write(f'[HOMOGRAPHY] {camera_id}: seg20_idx={seg20_idx}\n')
+        if SKEL_DEBUG:
+            with open(r'C:\Users\clawd\skel_debug.txt', 'a') as dbg:
+                dbg.write(f'[HOMOGRAPHY] {camera_id}: seg20_idx={seg20_idx}\n')
         logger.info(f"[HOMOGRAPHY] {camera_id}: seg20_idx={seg20_idx}")
-        with open(r'C:\Users\clawd\skel_debug.txt', 'a') as dbg:
-            dbg.write(f'[HOMOGRAPHY] {camera_id}: seg20_idx={seg20_idx}, src_pts={len(src_points)}, dst_pts={len(dst_points)}\n')
+        if SKEL_DEBUG:
+            with open(r'C:\Users\clawd\skel_debug.txt', 'a') as dbg:
+                dbg.write(f'[HOMOGRAPHY] {camera_id}: seg20_idx={seg20_idx}, src_pts={len(src_points)}, dst_pts={len(dst_points)}\n')
         
         # Compute homography: maps pixels -> mm
         H, mask = cv2.findHomography(src_points, dst_points, cv2.RANSAC, 5.0)
@@ -3666,8 +3689,9 @@ def _save_line_debug_image(tips_with_lines, lines_mm, intersection_mm, label="")
         
         cv2.imwrite(r"C:\Users\clawd\DartDetectionAI\debug_images\line_intersection.jpg", img)
     except Exception as e:
-        with open(r'C:\Users\clawd\skel_debug.txt', 'a') as dbg:
-            dbg.write(f'[LINE-DBG-IMG] Error: {e}\n')
+        if SKEL_DEBUG:
+            with open(r'C:\Users\clawd\skel_debug.txt', 'a') as dbg:
+                dbg.write(f'[LINE-DBG-IMG] Error: {e}\n')
 
 
 def vote_with_line_intersection_mm(tips_with_lines: List[dict]) -> dict:
@@ -3692,29 +3716,34 @@ def vote_with_line_intersection_mm(tips_with_lines: List[dict]) -> dict:
     """
     # Debug: force re-init homographies if cache empty
     global _homography_initialized, _homography_cache
-    with open(r'C:\\Users\\clawd\\skel_debug.txt', 'a') as dbg:
-        dbg.write(f'[LINE-MM-DBG] cache_keys={list(_homography_cache.keys())}, init={_homography_initialized}\n')
+    if SKEL_DEBUG:
+        with open(r'C:\\Users\\clawd\\skel_debug.txt', 'a') as dbg:
+            dbg.write(f'[LINE-MM-DBG] cache_keys={list(_homography_cache.keys())}, init={_homography_initialized}\n')
     if not _homography_cache:
         _homography_initialized = False
         init_homographies()
-        with open(r'C:\\Users\\clawd\\skel_debug.txt', 'a') as dbg:
-            dbg.write(f'[LINE-MM-DBG] AFTER re-init: cache_keys={list(_homography_cache.keys())}\n')
+        if SKEL_DEBUG:
+            with open(r'C:\\Users\\clawd\\skel_debug.txt', 'a') as dbg:
+                dbg.write(f'[LINE-MM-DBG] AFTER re-init: cache_keys={list(_homography_cache.keys())}\n')
     # Transform all lines to mm space
     lines_mm = []
-    with open(r'C:\Users\clawd\skel_debug.txt', 'a') as dbg:
-        dbg.write(f'[LINE-MM] homography_cache keys: {list(_homography_cache.keys())}\n')
+    if SKEL_DEBUG:
+        with open(r'C:\Users\clawd\skel_debug.txt', 'a') as dbg:
+            dbg.write(f'[LINE-MM] homography_cache keys: {list(_homography_cache.keys())}\n')
     for tip in tips_with_lines:
         cam_id = tip.get('camera_id')
         line_px = tip.get('line')
         
         if not cam_id or not line_px:
-            with open(r'C:\Users\clawd\skel_debug.txt', 'a') as dbg:
-                dbg.write(f'[LINE-MM] SKIP: cam_id={cam_id}, has_line={line_px is not None}\n')
+            if SKEL_DEBUG:
+                with open(r'C:\Users\clawd\skel_debug.txt', 'a') as dbg:
+                    dbg.write(f'[LINE-MM] SKIP: cam_id={cam_id}, has_line={line_px is not None}\n')
             continue
         
         line_mm = transform_line_to_mm(cam_id, line_px)
-        with open(r'C:\Users\clawd\skel_debug.txt', 'a') as dbg:
-            dbg.write(f'[LINE-MM] {cam_id}: line_mm={line_mm}, in_cache={cam_id in _homography_cache}\n')
+        if SKEL_DEBUG:
+            with open(r'C:\Users\clawd\skel_debug.txt', 'a') as dbg:
+                dbg.write(f'[LINE-MM] {cam_id}: line_mm={line_mm}, in_cache={cam_id in _homography_cache}\n')
         if line_mm:
             lines_mm.append({
                 'camera_id': cam_id,
@@ -3725,8 +3754,9 @@ def vote_with_line_intersection_mm(tips_with_lines: List[dict]) -> dict:
     
     if len(lines_mm) < 2:
         logger.warning(f"[LINE-MM] Only {len(lines_mm)} lines transformed to mm")
-        with open(r'C:\Users\clawd\skel_debug.txt', 'a') as dbg:
-            dbg.write(f'[LINE-MM] FAIL: only {len(lines_mm)} lines transformed\n')
+        if SKEL_DEBUG:
+            with open(r'C:\Users\clawd\skel_debug.txt', 'a') as dbg:
+                dbg.write(f'[LINE-MM] FAIL: only {len(lines_mm)} lines transformed\n')
         
         # Save debug image even on failure
         try:
@@ -3778,10 +3808,11 @@ def vote_with_line_intersection_mm(tips_with_lines: List[dict]) -> dict:
     logger.info(f"[LINE-MM] Intersection: ({avg_x:.1f}, {avg_y:.1f})mm, spread={spread:.1f}mm")
     
     # Log all pairwise intersections
-    with open(r'C:\Users\clawd\skel_debug.txt', 'a') as dbg:
-        for ix_data in intersections:
-            dbg.write(f"[LINE-MM] {ix_data['cameras'][0]} x {ix_data['cameras'][1]} -> ({ix_data['x_mm']:.1f}, {ix_data['y_mm']:.1f})mm\n")
-        dbg.write(f"[LINE-MM] avg=({avg_x:.1f}, {avg_y:.1f})mm spread={spread:.1f}mm\n")
+    if SKEL_DEBUG:
+        with open(r'C:\Users\clawd\skel_debug.txt', 'a') as dbg:
+            for ix_data in intersections:
+                dbg.write(f"[LINE-MM] {ix_data['cameras'][0]} x {ix_data['cameras'][1]} -> ({ix_data['x_mm']:.1f}, {ix_data['y_mm']:.1f})mm\n")
+            dbg.write(f"[LINE-MM] avg=({avg_x:.1f}, {avg_y:.1f})mm spread={spread:.1f}mm\n")
     
     # Save debug image for ALL cases
     try:
@@ -3792,8 +3823,9 @@ def vote_with_line_intersection_mm(tips_with_lines: List[dict]) -> dict:
     # 50mm spread threshold (relaxed - let scoring determine if valid)
     if spread > 50:
         logger.warning(f"[LINE-MM] Spread too large: {spread:.1f}mm")
-        with open(r'C:\Users\clawd\skel_debug.txt', 'a') as dbg:
-            dbg.write(f"[LINE-MM] REJECTED: spread {spread:.1f}mm > 50mm\n")
+        if SKEL_DEBUG:
+            with open(r'C:\Users\clawd\skel_debug.txt', 'a') as dbg:
+                dbg.write(f"[LINE-MM] REJECTED: spread {spread:.1f}mm > 50mm\n")
         return None
     
     return {
@@ -3958,8 +3990,9 @@ def vote_on_scores(clusters: List[List[dict]]) -> List[DetectedTip]:
         
         # Log cluster contents
         cluster_summary = ", ".join([f"{t.get('camera_id')}={t.get('segment')}x{t.get('multiplier')}" for t in cluster])
-        with open(r"C:\Users\clawd\skel_debug.txt", "a") as dbg:
-            dbg.write(f"[VOTE] Cluster ({len(cluster)} tips): {cluster_summary}\n")
+        if SKEL_DEBUG:
+            with open(r"C:\Users\clawd\skel_debug.txt", "a") as dbg:
+                dbg.write(f"[VOTE] Cluster ({len(cluster)} tips): {cluster_summary}\n")
         
         for tip in cluster:
             key = (tip['segment'], tip['multiplier'])
@@ -4020,8 +4053,9 @@ def vote_on_scores(clusters: List[List[dict]]) -> List[DetectedTip]:
             zone_factor = 1.0
             weight *= zone_factor
             
-            with open(r"C:\Users\clawd\skel_debug.txt", "a") as dbg:
-                dbg.write(f"[VOTE]   {cam_id}: {tip['segment']}x{tip['multiplier']} weight={weight:.3f} (conf={tip['confidence']}, cal_q={cal_quality:.2f}, view_q={view_quality:.2f}, mask_q={mask_quality:.2f}, bnd={boundary_dist})\n")
+            if SKEL_DEBUG:
+                with open(r"C:\Users\clawd\skel_debug.txt", "a") as dbg:
+                    dbg.write(f"[VOTE]   {cam_id}: {tip['segment']}x{tip['multiplier']} weight={weight:.3f} (conf={tip['confidence']}, cal_q={cal_quality:.2f}, view_q={view_quality:.2f}, mask_q={mask_quality:.2f}, bnd={boundary_dist})\n")
             
             votes[key] = votes.get(key, 0.0) + weight
             total_confidence += weight
@@ -4060,10 +4094,11 @@ def vote_on_scores(clusters: List[List[dict]]) -> List[DetectedTip]:
                 logger.info(f"[VOTE]   {seg}x{mult}: {cam_info} total_weight={total_weight:.2f}")
             
             logger.info(f"[VOTE] Initial vote winner: {winning_segment}x{winning_multiplier} (weight={votes[winning_key]:.2f})")
-            with open(r"C:\Users\clawd\skel_debug.txt", "a") as dbg:
-                for (seg, mult), w in sorted(votes.items(), key=lambda x: -x[1]):
-                    dbg.write(f"[VOTE] Tally: {seg}x{mult} = {w:.3f}\n")
-                dbg.write(f"[VOTE] Initial winner: {winning_segment}x{winning_multiplier} (weight={votes[winning_key]:.2f})\n")
+            if SKEL_DEBUG:
+                with open(r"C:\Users\clawd\skel_debug.txt", "a") as dbg:
+                    for (seg, mult), w in sorted(votes.items(), key=lambda x: -x[1]):
+                        dbg.write(f"[VOTE] Tally: {seg}x{mult} = {w:.3f}\n")
+                    dbg.write(f"[VOTE] Initial winner: {winning_segment}x{winning_multiplier} (weight={votes[winning_key]:.2f})\n")
             
             # MAJORITY OVERRIDE: If 2+ cameras agree on the same segment,
             # that segment wins regardless of boundary weighting.
@@ -4081,8 +4116,9 @@ def vote_on_scores(clusters: List[List[dict]]) -> List[DetectedTip]:
                     maj_seg, maj_mult = majority_key
                     maj_cams = [d['camera'] for d in vote_details[majority_key]]
                     logger.warning(f"[VOTE] MAJORITY OVERRIDE: {maj_seg}x{maj_mult} has {max_camera_count} cameras ({maj_cams}) vs weighted winner {winning_segment}x{winning_multiplier}")
-                    with open(r"C:\Users\clawd\skel_debug.txt", "a") as dbg:
-                        dbg.write(f"[VOTE] MAJORITY OVERRIDE: {maj_seg}x{maj_mult} ({max_camera_count} cams) beats {winning_segment}x{winning_multiplier}\n")
+                    if SKEL_DEBUG:
+                        with open(r"C:\Users\clawd\skel_debug.txt", "a") as dbg:
+                            dbg.write(f"[VOTE] MAJORITY OVERRIDE: {maj_seg}x{maj_mult} ({max_camera_count} cams) beats {winning_segment}x{winning_multiplier}\n")
                     winning_key = majority_key
                     winning_segment, winning_multiplier = majority_key
             

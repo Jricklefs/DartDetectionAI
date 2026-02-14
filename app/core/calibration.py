@@ -210,6 +210,7 @@ class EllipseCalibration:
 class YOLOCalibrationDetector:
     """
     Uses YOLO to detect dartboard calibration points.
+    Lazy-loads model on first use for faster startup.
     
     Detects:
     - Class 0: '20' - Segment 20 marker (for orientation)
@@ -223,7 +224,8 @@ class YOLOCalibrationDetector:
     def __init__(self):
         self.model = None
         self.is_initialized = False
-        self._load_model()
+        # Lazy load: model loaded on first detect_calibration_points() call
+        print("[CAL] YOLOCalibrationDetector created (model will lazy-load on first use)")
     
     def _load_model(self):
         """Load the YOLO calibration model."""
@@ -250,6 +252,11 @@ class YOLOCalibrationDetector:
         self.model = None
         self._load_model()
         print(f"[CAL] Reloaded calibration model: {CALIBRATION_MODEL_PATH}")
+    
+    def _ensure_loaded(self):
+        """Load model if not yet loaded (lazy initialization)."""
+        if not self.is_initialized:
+            self._load_model()
     
     def detect_calibration_points(
         self, 
@@ -479,15 +486,28 @@ class DartboardCalibrator:
         self.detector = YOLOCalibrationDetector()
         # Register this detector instance for model reloading
         set_calibration_detector_instance(self.detector)
-        # Pre-load tip detector so first dart detection is fast
-        try:
-            from app.core.detection import DartTipDetector
-            print("Loading tip detector...")
-            self.tip_detector = DartTipDetector()
-            print(f"Tip detector pre-loaded: {self.tip_detector.is_initialized}")
-        except Exception as e:
-            print(f"Warning: Failed to pre-load tip detector: {e}")
-            self.tip_detector = None
+        # Lazy-load tip detector: only needed for YOLO detection mode
+        self._tip_detector = None
+        print("[CAL] DartboardCalibrator created (tip detector will lazy-load on first use)")
+    
+    @property
+    def tip_detector(self):
+        """Lazy-load tip detector on first access."""
+        if self._tip_detector is None:
+            try:
+                from app.core.detection import DartTipDetector
+                print("[CAL] Lazy-loading tip detector...")
+                self._tip_detector = DartTipDetector()
+                print(f"[CAL] Tip detector loaded: {self._tip_detector.is_initialized}")
+            except Exception as e:
+                print(f"[CAL] Warning: Failed to load tip detector: {e}")
+                self._tip_detector = None
+        return self._tip_detector
+    
+    @tip_detector.setter
+    def tip_detector(self, value):
+        """Allow setting tip detector directly (e.g., model switch)."""
+        self._tip_detector = value
     
     def calibrate(
         self, 
